@@ -21,7 +21,7 @@ use sealdb_kv::{LockWait, RowLock, Transaction, TxnHandle};
 use sealdb_meta::{ColumnInfo, TableInfo};
 use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::expressions::ValueExpr;
-use sealdb_parser::ast::{Assignment, ExprNode, Join, UpdateStmt, WithClause};
+use sealdb_parser::ast::{Assignment, ExprNode, Join, JoinType, UpdateStmt, WithClause};
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -343,6 +343,14 @@ impl UpdateExec {
             let left_row = left_i.map(|i| &left_rows[i]);
             let right_row = right_i.map(|i| &right_rows[i]);
             let joined = concat_optional(left_row, right_row, left_width, right_names.len());
+            // A join `ON` without a hash key (the flattened derived-table arm's
+            // predicate) is evaluated here; the hash pairing above already
+            // enforced the equality key.
+            if matches!(join.tp, JoinType::Inner | JoinType::Cross)
+                && !eval_filter(&join.on, &schema, &joined)?
+            {
+                continue;
+            }
             if let Some(filter) = &self.stmt.selection
                 && !eval_filter(filter, &schema, &joined)?
             {

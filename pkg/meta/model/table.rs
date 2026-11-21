@@ -242,6 +242,22 @@ pub struct TableInfo {
     /// TiDB `AUTO_RANDOM_BASE` / `_tidb_rowid` shard seed, unused here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_random_base: Option<i64>,
+    /// TiDB `AFFINITY` table option: `"table"` or `"partition"` when set,
+    /// empty when unset (`AFFINITY='none'` / `AFFINITY=''`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub affinity: String,
+    /// Session-local `CREATE TEMPORARY TABLE` (never persisted): SHOW CREATE
+    /// prints `CREATE TEMPORARY TABLE`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub temporary: bool,
+    /// TiDB global temporary table (`CREATE GLOBAL TEMPORARY TABLE … ON COMMIT
+    /// DELETE ROWS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub on_commit_delete_rows: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Persisted TTL metadata (TiDB `TTLInfo`).
@@ -300,7 +316,16 @@ impl TableInfo {
             pre_split_regions: 0,
             cached_table: false,
             auto_random_base: None,
+            affinity: String::new(),
+            temporary: false,
+            on_commit_delete_rows: false,
         }
+    }
+
+    /// True when the table carries an `AFFINITY` option (partition affinity
+    /// tables refuse partition maintenance DDL).
+    pub fn has_affinity(&self) -> bool {
+        !self.affinity.is_empty()
     }
 
     /// Clustered PRIMARY KEY: integer handle or common handle.

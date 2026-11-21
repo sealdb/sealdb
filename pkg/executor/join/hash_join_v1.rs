@@ -1318,7 +1318,21 @@ pub(crate) fn hash_join_pairs(
     }
     let left_q = qualify_schema(left_schema, &join.left.name);
     let right_q = qualify_schema(right_schema, &join.right.name);
-    let (left_key, right_key) = split_join_eq(&join.on, &join.left.name, &join.right.name)?;
+    // An inner join whose `ON` has no cross-table equality (`ON (a.k = 'x')`
+    // from a flattened derived-table arm) is a filtered cross product: pair
+    // every row and let the caller evaluate the `ON` conjuncts.
+    let (left_key, right_key) = match split_join_eq(&join.on, &join.left.name, &join.right.name) {
+        Ok(keys) => keys,
+        Err(_) if join.tp == JoinType::Inner => {            let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
+            for i in 0..left_rows.len() {
+                for j in 0..right_rows.len() {
+                    out.push((Some(i), Some(j)));
+                }
+            }
+            return Ok(out);
+        }
+        Err(err) => return Err(err),
+    };
     match join.tp {
         JoinType::Inner => probe_inner_pairs(
             left_rows, right_rows, &left_q, &right_q, &left_key, &right_key,

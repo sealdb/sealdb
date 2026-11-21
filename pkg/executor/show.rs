@@ -831,12 +831,29 @@ fn render_create_table(info: &TableInfo) -> String {
         ));
     }
     let mut out = format!(
-        "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET={} COLLATE={}",
+        "CREATE {}TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET={} COLLATE={}",
+        if info.temporary {
+            if info.on_commit_delete_rows {
+                "GLOBAL TEMPORARY "
+            } else {
+                "TEMPORARY "
+            }
+        } else {
+            ""
+        },
         info.name.o(),
         cols.join(",\n"),
         info.charset,
         info.collate
     );
+    if info.temporary && info.on_commit_delete_rows {
+        out.push_str(" ON COMMIT DELETE ROWS");
+    }
+    // TiDB echoes the `AFFINITY` option as a TiDB-only comment directly after
+    // the table options and before `PARTITION BY`.
+    if info.has_affinity() {
+        out.push_str(&format!(" /*T![affinity] AFFINITY='{}' */", info.affinity));
+    }
     // TiDB echoes a cached table as a trailing comment
     // (`… COLLATE=utf8mb4_bin /* CACHED ON */`).
     if info.cached_table {
@@ -870,31 +887,50 @@ fn render_create_table(info: &TableInfo) -> String {
     out
 }
 
+/// HASH/KEY partition key text: a plain column is printed backticked
+/// (`HASH (`a`)`), an expression is printed as stored.
+fn partition_key_expr(expr: &str) -> String {
+    let trimmed = expr.trim();
+    if !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+    {
+        format!("`{trimmed}`")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn render_partition_clause(part: &sealdb_meta::PartitionInfo) -> String {
     use sealdb_meta::PartitionType;
-    let key = if part.columns.len() > 1
-        || (part.tp == PartitionType::Range && !part.columns.is_empty() && part.expr.contains(','))
-    {
+    let key = if part.range_columns {
         let cols = part
             .columns
             .iter()
             .map(|c| format!("`{}`", c.o()))
             .collect::<Vec<_>>()
             .join(",");
-        format!("RANGE COLUMNS({cols})")
-    } else if part.tp == PartitionType::Range && part.columns.len() == 1 {
-        // TiDB RANGE COLUMNS(single) still prints COLUMNS when created as such.
-        // Heuristic: expr equals column name → RANGE COLUMNS(`col`) for COLUMNS form
-        // stored via with_columns.
-        format!("RANGE COLUMNS(`{}`)", part.columns[0].o())
+        let keyword = if part.tp == PartitionType::List {
+            "LIST COLUMNS"
+        } else {
+            "RANGE COLUMNS"
+        };
+        format!("{keyword}({cols})")
     } else {
         match part.tp {
             PartitionType::Range => format!("RANGE (`{}`)", part.expr),
-            PartitionType::Hash => format!("HASH ({})", part.expr),
+            PartitionType::Hash => format!("HASH ({})", partition_key_expr(&part.expr)),
             PartitionType::List => format!("LIST (`{}`)", part.expr),
-            PartitionType::Key => format!("KEY (`{}`)", part.expr),
+            PartitionType::Key => format!("KEY ({})", partition_key_expr(&part.expr)),
         }
     };
+    if part.uniform && matches!(part.tp, PartitionType::Hash | PartitionType::Key) {
+        return format!(
+            "PARTITION BY {key} PARTITIONS {}",
+            part.num.max(part.definitions.len() as u64)
+        );
+    }
     let mut defs = Vec::new();
     for def in &part.definitions {
         let bound = if !def.in_values.is_empty() {
@@ -914,7 +950,7 @@ fn render_partition_clause(part: &sealdb_meta::PartitionInfo) -> String {
         };
         defs.push(format!("PARTITION `{}` {bound}", def.name.o()));
     }
-    format!("PARTITION BY {key}\n({})", defs.join(","))
+    format!("PARTITION BY {key}\n({})", defs.join(",\n "))
 }
 
 fn render_create_view(info: &TableInfo, view: &sealdb_meta::ViewInfo) -> String {

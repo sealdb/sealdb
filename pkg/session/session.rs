@@ -173,6 +173,9 @@ pub struct Session {
     /// non-correlated `IN (SELECT …)` into an inner join with a de-duplicating
     /// aggregation on the subquery side.
     opt_insubq_to_join_and_agg: Mutex<bool>,
+    /// TiDB `tidb_enable_inl_join_inner_multi_pattern` (default ON): an index
+    /// join hint may probe its inner index with more than one join key.
+    inl_join_inner_multi_pattern: Mutex<bool>,
     /// TiDB `tidb_enable_non_prepared_plan_cache` (default OFF): gates
     /// `EXPLAIN FORMAT='plan_cache'` on non-prepared statements.
     non_prepared_plan_cache: Mutex<bool>,
@@ -267,6 +270,7 @@ impl Session {
             opt_agg_push_down: Mutex::new(false),
             ordered_result_mode: Mutex::new(false),
             opt_insubq_to_join_and_agg: Mutex::new(true),
+            inl_join_inner_multi_pattern: Mutex::new(true),
             non_prepared_plan_cache: Mutex::new(false),
             last_plan_from_cache: Mutex::new(false),
             plan_cache_stmts: Mutex::new(HashSet::new()),
@@ -640,9 +644,13 @@ impl Session {
         &self,
         create: &sealdb_parser::ast::ddl::CreateTableStmt,
     ) -> Result<QueryResult> {
-        if create.refer_table.is_some() || create.select.is_some() {
-            return Err(Error::unsupported(
-                "CREATE TEMPORARY TABLE ... LIKE/AS SELECT",
+        if create.select.is_some() {
+            return Err(Error::unsupported("CREATE TEMPORARY TABLE ... AS SELECT"));
+        }
+        if create.affinity.is_some() {
+            return Err(Error::new(
+                sealdb_errno::ERR_AFFINITY,
+                "Can not set AFFINITY on a temporary table.",
             ));
         }
         let current_db = self
@@ -669,8 +677,36 @@ impl Session {
                 format!("Table '{table}' already exists"),
             ));
         }
-        let mut info = sealdb_ddl::build_table_info(create, next_temp_table_id())?;
+        let mut info = if let Some(refer) = &create.refer_table {
+            let is = self.domain.infoschema();
+            let (ref_schema, ref_table) = refer.qualified(&current_db);
+            let refer_info = is.table_by_name(&ref_schema, &ref_table).ok_or_else(|| {
+                Error::new(
+                    sealdb_errno::ERR_NO_SUCH_TABLE,
+                    format!("Table '{ref_schema}.{ref_table}' doesn't exist"),
+                )
+            })?;
+            let mut info = refer_info.clone();
+            info.id = next_temp_table_id();
+            info.name = sealdb_parser::model::CIStr::new(table.clone());
+            for idx in &mut info.indices {
+                idx.table = sealdb_parser::model::CIStr::new(table.clone());
+            }
+            if let Some(part) = &mut info.partition {
+                for def in &mut part.definitions {
+                    def.id = next_temp_table_id();
+                }
+            }
+            // Temporary tables cannot carry AFFINITY (TiDB drops it on LIKE).
+            info.affinity.clear();
+            info
+        } else {
+            sealdb_ddl::build_table_info(create, next_temp_table_id())?
+        };
         info.name = sealdb_parser::model::CIStr::new(table);
+        info.temporary = true;
+        info.on_commit_delete_rows = create.on_commit_delete_rows;
+        info.affinity.clear();
         self.temp_tables
             .lock()
             .expect("session temp tables lock")
@@ -1682,6 +1718,40 @@ impl Session {
                 });
             }
         }
+        // TiDB `ALTER TABLE ... AFFINITY` on a temporary table is rejected before
+        // any catalog lookup: local (8200) vs global (8266) temporary tables.
+        if let Statement::AlterTable(alter) = stmt
+            && alter
+                .specs
+                .iter()
+                .any(|spec| matches!(spec, sealdb_parser::ast::AlterTableSpec::SetAffinity(_)))
+        {
+            let (schema, table) = alter.table.qualified(&current_db);
+            let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+            let is_temp = self
+                .temp_tables
+                .lock()
+                .expect("session temp tables lock")
+                .contains_key(&key);
+            if is_temp {
+                let global = self
+                    .temp_tables_on_commit_delete
+                    .lock()
+                    .expect("session temp tables on commit lock")
+                    .contains(&key);
+                return Err(if global {
+                    Error::new(
+                        sealdb_errno::ERR_AFFINITY,
+                        "Can not set AFFINITY on a temporary table.",
+                    )
+                } else {
+                    Error::new(
+                        sealdb_errno::ERR_UNSUPPORTED_DDL_OPERATION,
+                        "TiDB doesn't support ALTER TABLE for local temporary table",
+                    )
+                });
+            }
+        }
         // TiDB `DROP TABLE` drops a same-named session-local temporary table
         // (it shadows the permanent one); the remaining names keep the
         // persisted DDL path.
@@ -1802,6 +1872,10 @@ impl Session {
         if needs_user_var_subst(&expanded) {
             expanded = subst_user_vars_in_stmt(self, &expanded);
         }
+        // TiDB `init exec`: an uncorrelated scalar subquery is evaluated once
+        // during optimization, so `EXPLAIN` shows its value instead of an
+        // `Apply`.
+        fold_explain_scalar_subqueries(self, &mut expanded, &is, &current_db)?;
         let stmt = &expanded;
         if let Some(result) = try_eval_nextval(self, stmt, &current_db)? {
             drop(mdl_guard);
@@ -1912,6 +1986,10 @@ impl Session {
             .opt_insubq_to_join_and_agg
             .lock()
             .expect("session insubq lock");
+        let inl_join_inner_multi_pattern = *self
+            .inl_join_inner_multi_pattern
+            .lock()
+            .expect("session inl join multi pattern lock");
         let ordered_result_mode = *self
             .ordered_result_mode
             .lock()
@@ -1933,7 +2011,9 @@ impl Session {
                 self.domain.planner_blacklist().unwrap_or_default()
             }
         };
-        let plan = sealdb_planner::with_planner_blacklist(blacklist, || {
+        let plan = sealdb_planner::with_inl_join_inner_multi_pattern(
+            inl_join_inner_multi_pattern,
+            || sealdb_planner::with_planner_blacklist(blacklist, || {
             sealdb_expression::with_current_db(current_db.as_str(), || {
                 sealdb_planner::with_cost_model_version(cost_model_version, || {
                     sealdb_planner::with_agg_push_down(opt_agg_push_down, || {
@@ -2011,7 +2091,7 @@ impl Session {
                     })
                 })
             })
-        })?;
+        }))?;
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
         // MySQL statement atomicity: a failed statement inside an explicit
         // transaction only rolls back its own writes.
@@ -2045,7 +2125,14 @@ impl Session {
             {
                 statement_savepoint = Some(Arc::clone(&txn));
             }
-            ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db, txn)?
+            // Constant VALUES rows are evaluated while the executor is built,
+            // before the execution-time `with_strict_dml` scope below; give the
+            // build the same strict context so errors keep their timing.
+            let build_sql_mode = self.sql_mode.lock().expect("session sql_mode lock").clone();
+            let build_strict = strict_dml_stmt(&build_sql_mode, stmt);
+            sealdb_expression::with_strict_dml(build_strict, || {
+                ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db, txn)
+            })?
         };
         let coll = self
             .collation
@@ -3694,6 +3781,302 @@ fn is_aggregate_func_name(name: &str) -> bool {
     )
 }
 
+/// TiDB evaluates an uncorrelated scalar subquery once while optimizing
+/// (`init exec`) and folds the one-row result into the enclosing predicate, so
+/// `EXPLAIN` prints the constant instead of a per-row `Apply`. Mirror that for
+/// `EXPLAIN SELECT`: run such a subquery on this session and substitute the
+/// value. A single aggregate over one table's own columns has no dependency on
+/// the outer row, so the fold cannot change the query's meaning.
+fn fold_explain_scalar_subqueries(
+    session: &Session,
+    stmt: &mut Statement,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<()> {
+    let Statement::Explain(explain) = stmt else {
+        return Ok(());
+    };
+    // `EXPLAIN ANALYZE` already executes the statement; folding would run the
+    // subquery twice.
+    if explain.analyze {
+        return Ok(());
+    }
+    match explain.stmt.as_mut() {
+        Statement::Select(select) => {
+            fold_scalar_subqueries_in_select(session, select, is, current_db)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn fold_scalar_subqueries_in_select(
+    session: &Session,
+    select: &mut SelectStmt,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<()> {
+    if let Some(selection) = select.selection.as_mut() {
+        fold_scalar_subqueries_in_expr(session, selection, is, current_db)?;
+    }
+    for field in &mut select.fields {
+        fold_scalar_subqueries_in_expr(session, &mut field.expr, is, current_db)?;
+    }
+    for group in &mut select.group_by {
+        fold_scalar_subqueries_in_expr(session, group, is, current_db)?;
+    }
+    if let Some(having) = select.having.as_mut() {
+        fold_scalar_subqueries_in_expr(session, having, is, current_db)?;
+    }
+    for item in &mut select.order_by {
+        fold_scalar_subqueries_in_expr(session, &mut item.expr, is, current_db)?;
+    }
+    for join in &mut select.joins {
+        fold_scalar_subqueries_in_expr(session, &mut join.on, is, current_db)?;
+    }
+    Ok(())
+}
+
+fn fold_scalar_subqueries_in_expr(
+    session: &Session,
+    expr: &mut ExprNode,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<()> {
+    match expr {
+        ExprNode::ScalarSubquery(sub) => {
+            if let Some(value) = eval_uncorrelated_scalar(session, sub, is, current_db)? {
+                *expr =
+                    ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr { datum: value });
+                return Ok(());
+            }
+            fold_scalar_subqueries_in_result_set(session, &mut sub.query, is, current_db)
+        }
+        ExprNode::InSubquery(s) => {
+            fold_scalar_subqueries_in_expr(session, &mut s.expr, is, current_db)?;
+            fold_scalar_subqueries_in_result_set(session, &mut s.query, is, current_db)
+        }
+        ExprNode::Exists(e) => {
+            fold_scalar_subqueries_in_result_set(session, &mut e.query, is, current_db)
+        }
+        ExprNode::QuantifiedCmp(q) => {
+            fold_scalar_subqueries_in_expr(session, &mut q.expr, is, current_db)?;
+            fold_scalar_subqueries_in_result_set(session, &mut q.query, is, current_db)
+        }
+        ExprNode::Binary(b) => {
+            fold_scalar_subqueries_in_expr(session, &mut b.left, is, current_db)?;
+            fold_scalar_subqueries_in_expr(session, &mut b.right, is, current_db)
+        }
+        ExprNode::Unary(u) => fold_scalar_subqueries_in_expr(session, &mut u.expr, is, current_db),
+        ExprNode::Func(f) => {
+            for arg in &mut f.args {
+                fold_scalar_subqueries_in_expr(session, arg, is, current_db)?;
+            }
+            Ok(())
+        }
+        ExprNode::Cast(c) => fold_scalar_subqueries_in_expr(session, &mut c.expr, is, current_db),
+        ExprNode::InList(i) => {
+            fold_scalar_subqueries_in_expr(session, &mut i.expr, is, current_db)?;
+            for item in &mut i.list {
+                fold_scalar_subqueries_in_expr(session, item, is, current_db)?;
+            }
+            Ok(())
+        }
+        ExprNode::Between(b) => {
+            fold_scalar_subqueries_in_expr(session, &mut b.expr, is, current_db)?;
+            fold_scalar_subqueries_in_expr(session, &mut b.low, is, current_db)?;
+            fold_scalar_subqueries_in_expr(session, &mut b.high, is, current_db)
+        }
+        ExprNode::Like(l) => {
+            fold_scalar_subqueries_in_expr(session, &mut l.expr, is, current_db)?;
+            fold_scalar_subqueries_in_expr(session, &mut l.pattern, is, current_db)
+        }
+        ExprNode::IsNull(i) => fold_scalar_subqueries_in_expr(session, &mut i.expr, is, current_db),
+        ExprNode::Case(c) => {
+            if let Some(operand) = c.operand.as_mut() {
+                fold_scalar_subqueries_in_expr(session, operand, is, current_db)?;
+            }
+            for (when, then) in &mut c.when_then {
+                fold_scalar_subqueries_in_expr(session, when, is, current_db)?;
+                fold_scalar_subqueries_in_expr(session, then, is, current_db)?;
+            }
+            if let Some(branch) = c.else_expr.as_mut() {
+                fold_scalar_subqueries_in_expr(session, branch, is, current_db)?;
+            }
+            Ok(())
+        }
+        ExprNode::Window(w) => {
+            for arg in &mut w.args {
+                fold_scalar_subqueries_in_expr(session, arg, is, current_db)?;
+            }
+            Ok(())
+        }
+        ExprNode::Row(r) => {
+            for item in &mut r.exprs {
+                fold_scalar_subqueries_in_expr(session, item, is, current_db)?;
+            }
+            Ok(())
+        }
+        ExprNode::Column(_) | ExprNode::Value(_) => Ok(()),
+    }
+}
+
+fn fold_scalar_subqueries_in_result_set(
+    session: &Session,
+    query: &mut sealdb_parser::ast::ResultSetNode,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<()> {
+    match query {
+        sealdb_parser::ast::ResultSetNode::Select(select) => {
+            fold_scalar_subqueries_in_select(session, select, is, current_db)
+        }
+        sealdb_parser::ast::ResultSetNode::SetOpr(set) => {
+            fold_scalar_subqueries_in_select(session, &mut set.first, is, current_db)?;
+            for (_, select) in &mut set.rest {
+                fold_scalar_subqueries_in_select(session, select, is, current_db)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Evaluate `(SELECT agg(col) FROM t …)` when the subquery reads only `t`'s own
+/// columns: the value is independent of the outer row, exactly what TiDB's
+/// `init exec` computes once during optimization.
+fn eval_uncorrelated_scalar(
+    session: &Session,
+    sub: &sealdb_parser::ast::expressions::ScalarSubqueryExpr,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<Option<sealdb_types::Datum>> {
+    let sealdb_parser::ast::ResultSetNode::Select(inner) = sub.query.as_ref() else {
+        return Ok(None);
+    };
+    if inner.with.is_some()
+        || inner.from_item.is_some()
+        || !inner.joins.is_empty()
+        || !inner.group_by.is_empty()
+        || inner.having.is_some()
+        || inner.distinct
+        || inner.limit.is_some()
+        || inner.offset.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(from) = inner.from.as_ref() else {
+        return Ok(None);
+    };
+    let [field] = inner.fields.as_slice() else {
+        return Ok(None);
+    };
+    let ExprNode::Func(func) = &field.expr else {
+        return Ok(None);
+    };
+    if !is_aggregate_func_name(&func.name) || func.distinct {
+        return Ok(None);
+    }
+    let (db, table) = from.qualified(current_db);
+    let Some(info) = is.table_by_name(&db, &table) else {
+        return Ok(None);
+    };
+    if !expr_columns_local(&field.expr, from, info) {
+        return Ok(None);
+    }
+    if let Some(selection) = &inner.selection
+        && !expr_columns_local(selection, from, info)
+    {
+        return Ok(None);
+    }
+    let sql = restore_sql(&Statement::Select(inner.clone()));
+    let result = session.execute_stmt(&sql)?;
+    let value = result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .cloned()
+        .unwrap_or(sealdb_types::Datum::Null);
+    // Mark the folded temporal value so `EXPLAIN` prints it in the subquery's
+    // own form (`2019-04-29 11:56:12`) instead of padding a literal's fraction.
+    Ok(Some(match value {
+        sealdb_types::Datum::Time(mut t) => {
+            t.fsp = sealdb_types::time::FOLDED_SUBQUERY_FSP;
+            sealdb_types::Datum::Time(t)
+        }
+        other => other,
+    }))
+}
+
+/// Every column read by `expr` belongs to `from`'s own table (unqualified
+/// names must exist in its schema). Nested subqueries bail out: their columns
+/// resolve in their own scope.
+fn expr_columns_local(
+    expr: &ExprNode,
+    from: &sealdb_parser::ast::ddl::TableName,
+    info: &sealdb_meta::TableInfo,
+) -> bool {
+    match expr {
+        ExprNode::Column(col) => {
+            let alias = &from.name;
+            let base = from.resolve_name();
+            match col.table.as_deref() {
+                Some(table) => {
+                    table.eq_ignore_ascii_case(alias) || table.eq_ignore_ascii_case(base)
+                }
+                None => {
+                    col.schema.is_none()
+                        && info
+                            .columns
+                            .iter()
+                            .any(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+                }
+            }
+        }
+        ExprNode::Binary(b) => {
+            expr_columns_local(&b.left, from, info) && expr_columns_local(&b.right, from, info)
+        }
+        ExprNode::Unary(u) => expr_columns_local(&u.expr, from, info),
+        ExprNode::Func(f) => f.args.iter().all(|arg| expr_columns_local(arg, from, info)),
+        ExprNode::Cast(c) => expr_columns_local(&c.expr, from, info),
+        ExprNode::InList(i) => {
+            expr_columns_local(&i.expr, from, info)
+                && i.list
+                    .iter()
+                    .all(|item| expr_columns_local(item, from, info))
+        }
+        ExprNode::Between(b) => {
+            expr_columns_local(&b.expr, from, info)
+                && expr_columns_local(&b.low, from, info)
+                && expr_columns_local(&b.high, from, info)
+        }
+        ExprNode::Like(l) => {
+            expr_columns_local(&l.expr, from, info) && expr_columns_local(&l.pattern, from, info)
+        }
+        ExprNode::IsNull(i) => expr_columns_local(&i.expr, from, info),
+        ExprNode::Case(c) => {
+            c.operand
+                .as_ref()
+                .is_none_or(|e| expr_columns_local(e, from, info))
+                && c.when_then.iter().all(|(when, then)| {
+                    expr_columns_local(when, from, info) && expr_columns_local(then, from, info)
+                })
+                && c.else_expr
+                    .as_ref()
+                    .is_none_or(|e| expr_columns_local(e, from, info))
+        }
+        ExprNode::Window(w) => w.args.iter().all(|arg| expr_columns_local(arg, from, info)),
+        ExprNode::Row(r) => r
+            .exprs
+            .iter()
+            .all(|item| expr_columns_local(item, from, info)),
+        ExprNode::Value(_) => true,
+        // A subquery, EXISTS, or quantified comparison opens its own scope.
+        ExprNode::Exists(_)
+        | ExprNode::InSubquery(_)
+        | ExprNode::ScalarSubquery(_)
+        | ExprNode::QuantifiedCmp(_) => false,
+    }
+}
+
 /// Record DML delta and run ANALYZE when modify/count exceeds the ratio
 /// (TiDB auto-analyze refresher, synchronous for MemStorage tests).
 fn maybe_auto_analyze(session: &Session, stmt: &Statement) -> Result<()> {
@@ -4381,7 +4764,10 @@ fn select_has_session_var(select: &sealdb_parser::ast::SelectStmt) -> bool {
         || select.selection.as_ref().is_some_and(expr_has_session_var)
         || select.group_by.iter().any(expr_has_session_var)
         || select.having.as_ref().is_some_and(expr_has_session_var)
-        || select.order_by.iter().any(|b| expr_has_session_var(&b.expr))
+        || select
+            .order_by
+            .iter()
+            .any(|b| expr_has_session_var(&b.expr))
         || select.joins.iter().any(|j| expr_has_session_var(&j.on))
         || select.with.as_ref().is_some_and(|with| {
             with.ctes.iter().any(|cte| {
@@ -4487,8 +4873,7 @@ fn subst_select_user_vars(session: &Session, select: &mut sealdb_parser::ast::Se
     for field in &mut select.fields {
         // Preserve TiDB display names (`@@autocommit`, `@b + "123"`) when
         // substituting vars to Values for evaluation.
-        if field.as_name.as_ref().is_none_or(|s| s.is_empty())
-            && expr_has_session_var(&field.expr)
+        if field.as_name.as_ref().is_none_or(|s| s.is_empty()) && expr_has_session_var(&field.expr)
         {
             field.as_name = Some(session_var_field_name(&field.expr));
         }
@@ -4725,6 +5110,28 @@ fn subst_user_vars_in_expr(session: &Session, expr: &ExprNode) -> ExprNode {
 /// (`ResetUpdateStmtCtx` / insert path).
 /// Strict DML/DDL (`STRICT_TRANS_TABLES` / `STRICT_ALL_TABLES`) raises
 /// numeric overflow as 1690; SELECT clamps with a warning.
+/// MySQL `TRADITIONAL` is an alias for a fixed set of strict modes; TiDB
+/// expands it on `SET sql_mode` (so `@@sql_mode` and the strict checks see
+/// the underlying flags, not the alias word).
+fn expand_sql_mode_alias(mode: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for token in mode.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if token.eq_ignore_ascii_case("TRADITIONAL") {
+            parts.extend([
+                "STRICT_TRANS_TABLES",
+                "STRICT_ALL_TABLES",
+                "NO_ZERO_IN_DATE",
+                "NO_ZERO_DATE",
+                "ERROR_FOR_DIVISION_BY_ZERO",
+                "NO_ENGINE_SUBSTITUTION",
+            ]);
+        } else {
+            parts.push(token);
+        }
+    }
+    parts.join(",")
+}
+
 fn strict_dml_stmt(sql_mode: &str, stmt: &sealdb_parser::ast::Statement) -> bool {
     let flag = |name: &str| {
         sql_mode
@@ -4870,6 +5277,20 @@ fn set_value_from_select(session: &Session, raw: &str) -> Option<Result<String>>
 /// else keeps the raw text (stripped of quoting) for the per-variable parsers.
 fn set_assignment_value(session: &Session, raw: &str) -> String {
     let text = raw.trim();
+    // A user variable (`@v`) holds a value, not the raw text; `SET
+    // @@sql_mode=@old_mode` must see the stored value.
+    if is_user_var_name(text) {
+        let key = user_var_key(text);
+        if let Some(datum) = session
+            .user_vars
+            .lock()
+            .expect("session user vars lock")
+            .get(&key)
+            .cloned()
+        {
+            return literal_field_name(&datum);
+        }
+    }
     if let Some(rest) = text.strip_prefix("@@") {
         let rest = rest.trim_start_matches('@');
         let (global, name) = match rest.split_once('.') {
@@ -5050,7 +5471,7 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                 let mode = if value.eq_ignore_ascii_case("DEFAULT") {
                     session.domain.global_vars().sql_mode
                 } else {
-                    value
+                    expand_sql_mode_alias(&value)
                 };
                 *session.sql_mode.lock().expect("session sql_mode lock") = mode;
             }
@@ -5393,6 +5814,18 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .opt_insubq_to_join_and_agg
                     .lock()
                     .expect("session insubq lock") = on;
+            }
+            // Index-join hint gate for multi-key inner probes (TiDB default ON).
+            "tidb_enable_inl_join_inner_multi_pattern" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    true
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .inl_join_inner_multi_pattern
+                    .lock()
+                    .expect("session inl join multi pattern lock") = on;
             }
             // Non-prepared plan cache gate (TiDB default OFF). Turning it off
             // also drops the statements already cached for this session.
@@ -5777,7 +6210,9 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
             }
         }
         "sql_mode" => {
-            session.domain.set_global_sql_mode(value.to_string());
+            session
+                .domain
+                .set_global_sql_mode(expand_sql_mode_alias(&value));
         }
         "tidb_enable_auto_analyze" => {
             let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
@@ -6164,15 +6599,10 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
             .clone(),
         // `@@identity` / `@@last_insert_id` report LAST_INSERT_ID() (0 before
         // the first insert).
-        "identity" | "last_insert_id" => {
-            sealdb_expression::current_last_insert_id().to_string()
+        "identity" | "last_insert_id" => sealdb_expression::current_last_insert_id().to_string(),
+        "time_zone" => {
+            display_time_zone(&session.time_zone.lock().expect("session time_zone lock"))
         }
-        "time_zone" => display_time_zone(
-            &session
-                .time_zone
-                .lock()
-                .expect("session time_zone lock"),
-        ),
         "collation_connection" => session
             .collation
             .lock()
@@ -6265,6 +6695,17 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
                 .opt_insubq_to_join_and_agg
                 .lock()
                 .expect("session insubq lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        "tidb_enable_inl_join_inner_multi_pattern" => {
+            if *session
+                .inl_join_inner_multi_pattern
+                .lock()
+                .expect("session inl join multi pattern lock")
             {
                 "1".into()
             } else {
@@ -8098,11 +8539,29 @@ fn view_arm_invalid_scoped(
         .chain(select.joins.iter().map(|join| &join.on))
         .collect();
     for expr in exprs {
-        if !expr_columns_exist(expr, &sources, is, current_db) {
+        if !expr_columns_exist(expr, &sources, is, current_db) && !is_output_alias_ref(expr, select)
+        {
             return true;
         }
     }
     false
+}
+
+/// True when the expression is a bare reference to a `SELECT` output alias
+/// (`ORDER BY c_0` for `… AS c_0`), which is legal outside the FROM scope.
+fn is_output_alias_ref(expr: &ExprNode, select: &SelectStmt) -> bool {
+    let ExprNode::Column(col) = expr else {
+        return false;
+    };
+    if col.table.is_some() || col.schema.is_some() {
+        return false;
+    }
+    select.fields.iter().any(|field| {
+        field
+            .as_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&col.name))
+    })
 }
 
 fn expr_columns_exist(
@@ -8833,6 +9292,13 @@ fn map_statement_tables(stmt: &mut Statement, map: &mut dyn FnMut(&mut TableName
             }
         }
         Statement::Explain(explain) => map_statement_tables(&mut explain.stmt, map),
+        Statement::Show(show) => {
+            if matches!(show.kind, sealdb_parser::ast::ShowStmtKind::CreateTable)
+                && let Some(table) = show.table.as_mut()
+            {
+                map(table);
+            }
+        }
         _ => {}
     }
 }

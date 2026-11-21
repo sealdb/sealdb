@@ -169,9 +169,10 @@ pub fn mysql_numeric_prefix(text: &str) -> f64 {
         let mut probe = end + 1;
         while probe < bytes.len() && bytes[probe].is_ascii_digit() {
             probe += 1;
-            seen_digit = true;
         }
-        if seen_digit {
+        // A trailing dot without digits is not part of the numeric prefix
+        // (`"-2.+2"` is -2, like MySQL's leading-integer coercion).
+        if probe > end + 1 {
             end = probe;
         }
     }
@@ -452,16 +453,15 @@ impl Datum {
                         Datum::U64(v) => Ok(Datum::U64(*v)),
                         // MySQL/TiDB: CAST(negative AS UNSIGNED) wraps (e.g. -1 → u64::MAX).
                         Datum::I64(v) => Ok(Datum::U64(*v as u64)),
+                        // TiDB rounds the fraction away from zero (`1.5` → 2)
+                        // and clamps a negative decimal to 0 instead of
+                        // failing or wrapping.
                         Datum::Decimal(d) => {
-                            let s = d.to_string();
-                            if s.starts_with('-') {
-                                return Err(Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow"));
+                            let rounded = d.with_frac(0).to_string();
+                            if rounded.starts_with('-') {
+                                return Ok(Datum::U64(0));
                             }
-                            let int_part = s.split('.').next().unwrap_or("0");
-                            int_part
-                                .parse::<u64>()
-                                .map(Datum::U64)
-                                .map_err(|_| Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow"))
+                            Ok(Datum::U64(rounded.parse::<u64>().unwrap_or(u64::MAX)))
                         }
                         other => {
                             let v = other.as_i64()?;
@@ -472,7 +472,24 @@ impl Datum {
                         }
                     }
                 } else {
-                    Ok(Datum::I64(self.as_i64()?))
+                    match self {
+                        // TiDB `MyDecimal.ToInt` rounds half away from zero
+                        // (`CAST(-1.5 AS SIGNED)` is -2) and clamps an
+                        // out-of-range magnitude to the bound.
+                        Datum::Decimal(d) => {
+                            let rounded = d.with_frac(0).to_string();
+                            Ok(Datum::I64(
+                                rounded.parse::<i64>().unwrap_or_else(|_| {
+                                    if rounded.starts_with('-') {
+                                        i64::MIN
+                                    } else {
+                                        i64::MAX
+                                    }
+                                }),
+                            ))
+                        }
+                        other => Ok(Datum::I64(other.as_i64()?)),
+                    }
                 }
             }
             EvalType::Real => {

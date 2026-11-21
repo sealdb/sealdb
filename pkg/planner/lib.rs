@@ -14,6 +14,6 @@ pub use core::{
     normalize_bit_constants, normalize_comparison_literals, normalize_enum_constants,
     normalize_expr_name, normalize_prep_cache_key, stmt_has_natural_join, using_dropped_columns,
     with_agg_push_down, with_cost_model_version, with_dirty_tables, with_explicit_txn,
-    with_foreign_key_checks, with_hashagg_concurrency, with_insubq_to_join_and_agg,
-    with_planner_blacklist, with_stable_result_mode,
+    with_foreign_key_checks, with_hashagg_concurrency, with_inl_join_inner_multi_pattern,
+    with_insubq_to_join_and_agg, with_planner_blacklist, with_stable_result_mode,
 };

@@ -172,6 +172,7 @@ fn explain_scalar_expr(table: &str, expr: &ExprNode) -> String {
         }
         ExprNode::Unary(u) => match u.op {
             Op::UnaryMinus => format!("unaryminus({})", explain_scalar_expr(table, &u.expr)),
+            Op::BitNeg => format!("bitneg({})", explain_scalar_expr(table, &u.expr)),
             Op::Not | Op::Not2 => format!("not({})", explain_scalar_expr(table, &u.expr)),
             _ => expr.restore_string(),
         },

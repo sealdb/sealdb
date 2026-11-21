@@ -1,6 +1,6 @@
 use crate::create_table::{
-    build_table_info_with_defaults, build_table_info_with_like, columns_from_select,
-    referenced_by_foreign_key, validate_ttl,
+    affinity_setting, build_table_info_with_defaults, build_table_info_with_like,
+    columns_from_select, referenced_by_foreign_key, validate_ttl,
 };
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_TABLE, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS,
@@ -81,6 +81,9 @@ pub fn create_table(
         if let Some(spec) = &built.partition {
             crate::partition::attach_partitions(meta, &mut info, spec)?;
         }
+        if let Some(raw) = &built.affinity {
+            info.affinity = affinity_setting(raw, false, info.partition.is_some())?;
+        }
         info
     };
     meta.create_table_or_view(db.id, &info)?;
@@ -118,7 +121,16 @@ pub fn drop_table(
                         format!("'{schema}.{table}' is not VIEW"),
                     ));
                 }
+                // TiDB resolves `DROP TABLE` against base tables only; a view
+                // name is an unknown table (1051), suppressed by IF EXISTS.
                 if !stmt.is_view && tbl.is_view() {
+                    if stmt.if_exists {
+                        sealdb_expression::note_warning(
+                            ERR_BAD_TABLE,
+                            format!("Unknown table '{schema}.{table}'"),
+                        );
+                        continue;
+                    }
                     return Err(Error::new(
                         ERR_BAD_TABLE,
                         format!("Unknown table '{schema}.{table}'"),

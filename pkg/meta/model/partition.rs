@@ -75,6 +75,14 @@ pub struct PartitionInfo {
     pub definitions: Vec<PartitionDefinition>,
     #[serde(default)]
     pub num: u64,
+    /// HASH/KEY partitions declared with `PARTITIONS n` (SHOW CREATE prints the
+    /// `PARTITIONS n` shorthand instead of the partition definitions).
+    #[serde(default)]
+    pub uniform: bool,
+    /// `RANGE COLUMNS(...)` / `LIST COLUMNS(...)` form (SHOW CREATE prints
+    /// `RANGE COLUMNS(...)` instead of `RANGE (...)`).
+    #[serde(default)]
+    pub range_columns: bool,
     pub state: SchemaState,
 }
 
@@ -93,6 +101,8 @@ impl PartitionInfo {
             enable: true,
             definitions: defs,
             num,
+            uniform: false,
+            range_columns: false,
             state: STATE_PUBLIC,
         }
     }

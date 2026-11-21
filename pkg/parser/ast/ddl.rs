@@ -465,6 +465,8 @@ pub struct PartitionOption {
     pub columns: Vec<String>,
     /// Non-column partition key such as `id % 4` or `id + 1`.
     pub expr: Option<String>,
+    /// `RANGE COLUMNS(...)` / `LIST COLUMNS(...)` form (rendered with COLUMNS).
+    pub range_columns: bool,
     pub defs: Vec<PartitionDef>,
     pub num: u64,
     /// TiDB accepts `SUBPARTITION BY` under RANGE/LIST then strips it; true when
@@ -476,9 +478,10 @@ impl PartitionOption {
     /// Render the clause after `PARTITION BY `.
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         match self.tp {
-            PartitionType::Range if self.columns.len() > 1 => ctx.write_str("RANGE COLUMNS"),
+            PartitionType::Range if self.range_columns => ctx.write_str("RANGE COLUMNS"),
             PartitionType::Range => ctx.write_str("RANGE"),
             PartitionType::Hash => ctx.write_str("HASH"),
+            PartitionType::List if self.range_columns => ctx.write_str("LIST COLUMNS"),
             PartitionType::List => ctx.write_str("LIST"),
             PartitionType::Key => ctx.write_str("KEY"),
         }
@@ -575,6 +578,8 @@ pub struct CreateTableStmt {
     pub partition: Option<PartitionOption>,
     /// TiDB `TTL = …` table option.
     pub ttl: Option<TtlInfo>,
+    /// TiDB `AFFINITY [=] '<table|partition|none|>'` table option.
+    pub affinity: Option<String>,
     /// `FOREIGN KEY` constraints in definition order (TiDB `TableInfo.ForeignKeys`).
     pub foreign_keys: Vec<ForeignKeyDef>,
     /// Table-level `DEFAULT CHARSET = <name>` option.
@@ -618,6 +623,11 @@ impl CreateTableStmt {
                 index.restore(ctx)?;
             }
             ctx.write_str(")");
+        }
+        if let Some(affinity) = &self.affinity {
+            ctx.write_str(" /*T![affinity] AFFINITY='");
+            ctx.write_str(affinity);
+            ctx.write_str("' */");
         }
         if let Some(part) = &self.partition {
             ctx.write_str(" PARTITION BY ");
@@ -1006,6 +1016,10 @@ pub enum AlterTableSpec {
         if_exists: bool,
         names: Vec<String>,
     },
+    /// `TRUNCATE PARTITION p0 [, p1 ...]`.
+    TruncatePartition {
+        names: Vec<String>,
+    },
     /// `EXCHANGE PARTITION p WITH TABLE t`.
     ExchangePartition {
         partition: String,
@@ -1019,6 +1033,14 @@ pub enum AlterTableSpec {
         enable: Option<bool>,
         job_interval: Option<String>,
     },
+    /// `AFFINITY [=] '<table|partition|none|>'` table option.
+    SetAffinity(String),
+    /// `REMOVE PARTITIONING`.
+    RemovePartitioning,
+    /// `REORGANIZE PARTITION ... INTO (...)` (partitioned tables only).
+    ReorganizePartition,
+    /// `COALESCE PARTITION n`.
+    CoalescePartition(u64),
     /// `REMOVE TTL`.
     RemoveTtl,
     /// `ALTER [COLUMN] col SET DEFAULT <expr>` / `ALTER [COLUMN] col DROP DEFAULT`.
@@ -1283,6 +1305,16 @@ impl AlterTableSpec {
                 }
                 Ok(())
             }
+            AlterTableSpec::TruncatePartition { names } => {
+                ctx.write_str("TRUNCATE PARTITION ");
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_name(name);
+                }
+                Ok(())
+            }
             AlterTableSpec::ExchangePartition { partition, table } => {
                 ctx.write_str("EXCHANGE PARTITION ");
                 ctx.write_name(partition);
@@ -1318,6 +1350,25 @@ impl AlterTableSpec {
             }
             AlterTableSpec::RemoveTtl => {
                 ctx.write_str("REMOVE TTL");
+                Ok(())
+            }
+            AlterTableSpec::SetAffinity(value) => {
+                ctx.write_str("AFFINITY = '");
+                ctx.write_str(value);
+                ctx.write_str("'");
+                Ok(())
+            }
+            AlterTableSpec::RemovePartitioning => {
+                ctx.write_str("REMOVE PARTITIONING");
+                Ok(())
+            }
+            AlterTableSpec::ReorganizePartition => {
+                ctx.write_str("REORGANIZE PARTITION");
+                Ok(())
+            }
+            AlterTableSpec::CoalescePartition(num) => {
+                ctx.write_str("COALESCE PARTITION ");
+                ctx.write_str(&num.to_string());
                 Ok(())
             }
             AlterTableSpec::AddForeignKey(fk) => {

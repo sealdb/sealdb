@@ -2616,6 +2616,23 @@ fn walk_with_parent(
     deferred: &mut Vec<PhysicalPlan>,
     apply_factor: f64,
 ) {
+    // The star-order projection only reverses the executor's probe ++ build
+    // columns back to FROM order; TiDB's join schema already has that order, so
+    // EXPLAIN renders the child directly.
+    if let PhysicalPlan::StarOrderProjection { child, .. } = plan {
+        return walk_with_parent(
+            child,
+            parent,
+            depth,
+            last,
+            next_id,
+            rows,
+            under_order_projection,
+            spine,
+            deferred,
+            apply_factor,
+        );
+    }
     if let PhysicalPlan::CTE {
         seed, inline: true, ..
     } = plan
@@ -6759,10 +6776,17 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
         ExprNode::Value(ValueExpr {
             datum: Datum::Time(t),
         }) => {
-            // TiDB `Constant.ExplainInfo` prints temporal values with the
-            // full microsecond fraction (`2013-11-01 00:00:00.000000`).
+            // TiDB `Constant.ExplainInfo` prints a temporal literal with the
+            // full microsecond fraction (`2013-11-01 00:00:00.000000`). A
+            // value folded from an uncorrelated scalar subquery (`init exec`,
+            // see `session::fold_explain_scalar_subqueries`) keeps the
+            // subquery's own text form instead.
             let mut t = *t;
-            t.fsp = 6;
+            t.fsp = if t.fsp == sealdb_types::time::FOLDED_SUBQUERY_FSP {
+                0
+            } else {
+                6
+            };
             t.to_string()
         }
         ExprNode::Value(ValueExpr {
@@ -6898,6 +6922,32 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
         // (`not(isnull(minus(t.c_int, 1)))`).
         ExprNode::Unary(u) if u.op == Op::Not => {
             format!("not({})", explain_scalar_expr(&u.expr, table))
+        }
+        // TiDB has no `Case` scalar-function signature; it rewrites the
+        // expression into the `case(cond, then, …[, else])` builtin (a simple
+        // `CASE x WHEN v` becomes `eq(x, v)` conditions). EXPLAIN prints that
+        // function form, never the `CASE WHEN … END` SQL text.
+        ExprNode::Case(case) => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(operand) = &case.operand {
+                args.push(explain_scalar_expr(operand, table));
+            }
+            for (when, then) in &case.when_then {
+                let cond = match &case.operand {
+                    Some(operand) => format!(
+                        "eq({}, {})",
+                        explain_scalar_expr(operand, table),
+                        explain_scalar_expr(when, table)
+                    ),
+                    None => explain_scalar_expr(when, table),
+                };
+                args.push(cond);
+                args.push(explain_scalar_expr(then, table));
+            }
+            if let Some(else_expr) = &case.else_expr {
+                args.push(explain_scalar_expr(else_expr, table));
+            }
+            format!("case({})", args.join(", "))
         }
         other => other.restore_string(),
     }
@@ -7217,9 +7267,9 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         PhysicalPlan::NullAwareAntiJoin { probe, build, .. } => {
             vec![build.as_ref(), probe.as_ref()]
         }
-        PhysicalPlan::RowProjection { child, .. } | PhysicalPlan::KeyProjection { child, .. } => {
-            vec![child.as_ref()]
-        }
+        PhysicalPlan::RowProjection { child, .. }
+        | PhysicalPlan::KeyProjection { child, .. }
+        | PhysicalPlan::StarOrderProjection { child, .. } => vec![child.as_ref()],
         PhysicalPlan::Union { children, .. } => children.iter().map(|c| c.as_ref()).collect(),
         PhysicalPlan::DistinctUnion { child, .. } => vec![child.as_ref()],
         PhysicalPlan::PartitionUnion { children } => children.iter().collect(),
@@ -7239,6 +7289,10 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             ("MaxOneRow".to_string(), String::new(), String::new())
         }
         PhysicalPlan::Projection { exprs, .. } => {
+            ("Projection".to_string(), String::new(), exprs.join(", "))
+        }
+        // Elided by `walk_with_parent`; this arm keeps the match exhaustive.
+        PhysicalPlan::StarOrderProjection { exprs, .. } => {
             ("Projection".to_string(), String::new(), exprs.join(", "))
         }
         PhysicalPlan::SelectLock { info, .. } => {
@@ -7293,6 +7347,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 || cop_projection_pending().is_some()
             {
                 "data:Projection".to_string()
+            } else if range_scan
+                .as_deref()
+                .is_some_and(|raw| split_range_scan(raw).selection.is_some())
+            {
+                // A cop `Selection` above the range is the reader's cop root.
+                "data:Selection".to_string()
             } else if range_scan.is_some() || range_pushed(pushed.as_ref()).is_some() {
                 "data:TableRangeScan".to_string()
             } else if cop_proj_sel_pushed(pushed.as_ref()).is_some() {
@@ -8064,21 +8124,31 @@ fn prange_count(row_count: f64, r: &PRange) -> f64 {
 /// only carries integer bounds, so those predicates would otherwise fall back
 /// to the generic 0.8 `selectionFactor` (`name > 'a'` → 3333.33, not 8000).
 fn datum_range_est(conjuncts: &[sealdb_parser::ast::ExprNode], row_count: f64) -> Option<f64> {
-    let [conjunct] = conjuncts else {
-        return None;
-    };
-    // Derived outputs (`Column#5` from an aggregate) carry no column stats.
-    let (column, _, value) = conjunct.column_cmp_const()?;
-    if column.starts_with("Column#") {
+    // At least one conjunct must be a non-integer column range; integer
+    // ranges are already modelled by `pseudo_range_est`. Additional
+    // conjuncts (a range's `not(isnull)` null rejection, a second bound)
+    // merge into the same column's pseudo range.
+    let mut ranged = false;
+    for conjunct in conjuncts {
+        let Some((column, _, value)) = conjunct.column_cmp_const() else {
+            continue;
+        };
+        // Derived outputs (`Column#5` from an aggregate) carry no column stats.
+        if column.starts_with("Column#") {
+            return None;
+        }
+        if !matches!(
+            value,
+            sealdb_types::Datum::I64(_) | sealdb_types::Datum::U64(_)
+        ) {
+            ranged = true;
+        }
+    }
+    if !ranged {
         return None;
     }
-    if matches!(
-        value,
-        sealdb_types::Datum::I64(_) | sealdb_types::Datum::U64(_)
-    ) {
-        return None;
-    }
-    sealdb_statistics::pseudo::selectivity(conjuncts, row_count, None)
+    let sel = sealdb_statistics::pseudo::selectivity(conjuncts, row_count, None)?;
+    Some(sel * row_count)
 }
 
 /// `OR` arms over string bounds whose range is empty contribute no rows:
@@ -8313,6 +8383,38 @@ fn ifnull_isnull_union_selectivity(filter: &sealdb_parser::ast::ExprNode) -> Opt
 }
 
 fn conjunct_list_selectivity(conjuncts: &[sealdb_parser::ast::ExprNode]) -> Option<f64> {
+    // `x IS NULL AND NOT (x IS NULL)` is unsatisfiable: TiDB sizes the cop
+    // `Selection` (and the reader above it) at zero, not at the product of the
+    // null and non-null rates.
+    let mut null_cols: Vec<String> = Vec::new();
+    let mut not_null_cols: Vec<String> = Vec::new();
+    for conjunct in conjuncts {
+        match conjunct {
+            sealdb_parser::ast::expressions::ExprNode::IsNull(is_null) if !is_null.not => {
+                null_cols.push(is_null.expr.expr_key());
+            }
+            sealdb_parser::ast::expressions::ExprNode::Unary(unary)
+                if unary.op == sealdb_parser::opcode::Op::Not
+                    && matches!(
+                        unary.expr.as_ref(),
+                        sealdb_parser::ast::expressions::ExprNode::IsNull(inner) if !inner.not
+                    ) =>
+            {
+                if let sealdb_parser::ast::expressions::ExprNode::IsNull(inner) =
+                    unary.expr.as_ref()
+                {
+                    not_null_cols.push(inner.expr.expr_key());
+                }
+            }
+            _ => {}
+        }
+    }
+    if null_cols
+        .iter()
+        .any(|column| not_null_cols.iter().any(|other| other == column))
+    {
+        return Some(0.0);
+    }
     let mut sel = 1.0;
     for conjunct in conjuncts {
         sel *= conjunct_selectivity(conjunct)?;
@@ -8365,6 +8467,26 @@ pub(crate) fn set_filter_est(plan: &PhysicalPlan, est: f64) -> Option<PhysicalPl
 }
 
 pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
+    let out = est_rows_inner(plan);
+    if std::env::var("SEALDB_DEBUG_EST").is_ok()
+        && let PhysicalPlan::TableReader {
+            table,
+            row_count,
+            filter_est,
+            pushed,
+            range_scan,
+            ..
+        } = plan
+    {
+        eprintln!(
+            "EST table={table} rows={row_count} filter_est={filter_est:?} range={range_scan:?} pushed={:?} => {out}",
+            pushed.as_ref().map(|p| p.restore_string())
+        );
+    }
+    out
+}
+
+fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
     match plan {
         PhysicalPlan::TableDual { row_count } => *row_count as f64,
         PhysicalPlan::PointGet { .. } => 1.0,
@@ -8866,6 +8988,7 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             ..
         } => *est,
         PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::StarOrderProjection { child, .. }
         | PhysicalPlan::Sort { child, .. }
         | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child, .. }

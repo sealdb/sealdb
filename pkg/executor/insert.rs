@@ -1590,7 +1590,9 @@ pub(crate) fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Resul
         && let Datum::Bytes(bytes) = v
         && let Some(t) = relaxed_temporal(&String::from_utf8_lossy(bytes), col.field_type.tp)
         && (sealdb_expression::sql_mode_flag("ALLOW_INVALID_DATES")
-            || ((t.month == 0 || t.day == 0) && !strict_sql_mode()))
+            || ((t.month == 0 || t.day == 0)
+                && !sealdb_expression::sql_mode_flag("NO_ZERO_IN_DATE"))
+            || (t.year == 0 && !sealdb_expression::sql_mode_flag("NO_ZERO_DATE")))
     {
         return Ok(Datum::Time(t));
     }
@@ -1663,6 +1665,36 @@ pub(crate) fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Resul
             return Err(err);
         }
     };
+    // TiDB `handleZeroDatetime`: parsing accepts a zero month/day, but the
+    // `NO_ZERO_IN_DATE` / `NO_ZERO_DATE` policy decides whether the row can be
+    // written. Strict mode rejects the value with 1292; otherwise it is stored
+    // as the zero date with a 1292 warning.
+    if matches!(col.field_type.tp, TYPE_DATE | TYPE_DATETIME | sealdb_types::TYPE_TIMESTAMP)
+        && matches!(v, Datum::Bytes(_))
+        && let Datum::Time(t) = out
+    {
+        let zero_date = t.year == 0 && t.month == 0 && t.day == 0;
+        let zero_in_date = !zero_date && (t.month == 0 || t.day == 0);
+        let rejected = if col.field_type.tp == sealdb_types::TYPE_TIMESTAMP {
+            // A TIMESTAMP can never hold an invalid calendar date.
+            zero_in_date
+        } else {
+            (zero_in_date && sealdb_expression::sql_mode_flag("NO_ZERO_IN_DATE"))
+                || (zero_date && sealdb_expression::sql_mode_flag("NO_ZERO_DATE"))
+        };
+        if rejected {
+            let err = temporal_column_error(
+                v,
+                col,
+                Error::new(ERR_TRUNCATED_WRONG_VALUE, String::new()),
+            );
+            if strict_sql_mode() {
+                return Err(err);
+            }
+            sealdb_expression::note_warning(err.code, err.message.clone());
+            return Ok(implicit_zero(&col.field_type));
+        }
+    }
     // TIMESTAMP columns store UTC; session wall clock → UTC on write. A wall
     // clock outside 1970-01-01 00:00:01 .. 2038-01-19 03:14:07 becomes the zero
     // timestamp (1292 warning) outside strict mode and fails with 1292 in it.

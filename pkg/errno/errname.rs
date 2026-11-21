@@ -132,6 +132,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_TTL_TEMPORARY_TABLE => "ErrTTLTemporaryTable",
         errcode::ERR_TTL_FK_REFERENCED => "ErrTTLFKReferenced",
         errcode::ERR_OPT_ON_TEMPORARY_TABLE => "ErrOptOnTemporaryTable",
+        errcode::ERR_AFFINITY => "ErrAffinity",
         errcode::ERR_MEMORY_EXCEEDED => "ErrMemoryExceedForQuery",
         _ => "ErrUnknown",
     }
@@ -185,6 +186,7 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_TRUNCATED_WRONG_VALUE => "22007",
         errcode::ERR_ILLEGAL_VALUE_FOR_TYPE => "22007",
         errcode::ERR_DIVISION_BY_ZERO => "22012",
+        errcode::ERR_DATETIME_FUNCTION_OVERFLOW => "22008",
         errcode::ERR_INVALID_JSON_TEXT | errcode::ERR_INVALID_JSON_TEXT_IN_PARAM => "22032",
         errcode::ERR_SUBQUERY_NO_1_ROW => "21000",
         errcode::ERR_OPERAND_COLUMNS => "21000",

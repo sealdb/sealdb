@@ -472,10 +472,20 @@ fn tables(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
             bytes(pk_type),
             Datum::Null,
             bytes("Normal"),
-            Datum::Null,
+            table_affinity_datum(table),
         ]);
     });
     (schema, rows)
+}
+
+/// `information_schema.tables/partitions.TIDB_AFFINITY`: the stored option or
+/// NULL when the table has none.
+fn table_affinity_datum(table: &TableInfo) -> Datum {
+    if table.has_affinity() {
+        Datum::Bytes(table.affinity.clone().into_bytes())
+    } else {
+        Datum::Null
+    }
 }
 
 fn columns(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
@@ -766,7 +776,46 @@ fn partitions(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
     ];
     let mut rows = Vec::new();
     for_each_table(is, |db, table| {
+        let affinity = table_affinity_datum(table);
         let Some(part) = &table.partition else {
+            // MySQL/TiDB list one row for a non-partitioned table (or view)
+            // with the partition columns NULL.
+            let (row_count, avg_row_length, data_length, index_length) = if table.is_view() {
+                (0, 0, 0, 0)
+            } else {
+                let table_stats = is.stats().and_then(|h| h.table(db, table.name.o()));
+                estimate_row_lengths(table, table_stats.as_ref())
+            };
+            rows.push(vec![
+                bytes("def"),
+                bytes(db),
+                bytes(table.name.o()),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::I64(row_count as i64),
+                Datum::I64(avg_row_length as i64),
+                Datum::I64(data_length as i64),
+                Datum::Null,
+                Datum::I64(index_length as i64),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                bytes(""),
+                Datum::Null,
+                Datum::Null,
+                Datum::I64(table.id),
+                Datum::Null,
+                affinity,
+            ]);
             return;
         };
         let method = match part.tp {
@@ -823,7 +872,7 @@ fn partitions(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                 Datum::Null,
                 Datum::I64(def.id),
                 Datum::Null,
-                Datum::Null,
+                table_affinity_datum(table),
             ]);
         }
     });

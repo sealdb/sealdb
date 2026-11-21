@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-20（green 115 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-21（green 118 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -27,7 +27,7 @@
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` / `executor/point_get` / `executor/batch_point_get` / `explain_shard_index` / `explain_easy_stats` green；9 套件 `in_progress` |
-| R4–R7 | plan_cache / session / ddl / CBO | `pending` | R6 `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/fail_db` / `infoschema/v2` green；R7 `planner/cardinality/trace` / `util/admin` / globalindex 若干 green；其余依赖前波 |
+| R4–R7 | plan_cache / session / ddl / CBO | `pending` | R6 `ddl/affinity` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/fail_db` / `infoschema/v2` green；R7 `planner/cardinality/trace` / `util/admin` / globalindex 若干 green；其余依赖前波 |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
 实现纪律：[parity-discipline.md](./parity-discipline.md) — 失败用例 → TiDB 同名包/文件 → SealDB 同路径一比一；生产级清单勾满才升 `green`；禁止改权威 `r/*.result`。
@@ -3319,6 +3319,122 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 | D7 | 源码不含来源标记 | 追溯依赖 manifest | 强制更新 `project/parity/status.json` |
 
 ---
+
+### 2026-11-21（`executor/index_advise` 转正：inner multi-pattern IndexJoin + 范围扫描谓词下沉）
+
+- **Phase**: R7
+- **完成**:
+  - `IndexJoin` 内表形态对齐 TiDB `constructInnerIndexScan`：`tidb_enable_inl_join_inner_multi_pattern`
+    打开时，内表在 `IndexRangeScan` 之上保留派生 `Projection`/`Selection`（
+    多 pattern 下探针键仍由 `inl_join` hint 的 index join 决定），关闭时回到单 pattern 的
+    纯 `IndexReader(index:Selection)` 形态；`inl_join` hint 作用在派生表外侧
+    （`t2 b, (select … from t1) a`）时不再丢失探针索引。
+  - DML 多表 `UPDATE … /*+ inl_join(a) */ … SET`：`Update` 子计划内 IndexJoin 的
+    `equal cond` 列序、`outer key`/`inner key` 前缀与 TiDB 一致，`TableReader(Build)`
+    侧 `Selection` 与 `IndexReader(Probe)` 侧 `index:Selection` 分层正确。
+  - `TableRangeScan` 谓词下沉补齐 `CONSUMED:` 标记：范围扫描已编码进 scan range 的
+    选择条件（`_tidb_rowid > 0`、聚集主键 `between … and …`、索引 `eq` 边界）不再
+    被后续 pushdown 波次重复包装成 residual `Selection`；后到的 join 派生/非空拒绝
+    谓词才折叠为 cop `Selection`。堆表 handle 解析修正为 `_tidb_rowid`，不再误取
+    第一个整型列。
+  - `INLJ` 探针侧空值拒绝仅对可空探针键生效：参与索引 seek 的键生成
+    `build_filters`（`Selection(Build)`），其余留在 `probe_preds`，`explain_join_stats`
+    形状因此保持与 TiDB 一致。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s both -t executor/index_advise`
+    → `PASS: memory=1 tikv=1`（双引擎）
+  - 全量 memory gate：`PASS: memory=126 tikv=0 skipped=128`（118 green + 8 local）
+  - 全量 TiKV gate：`PASS: memory=0 tikv=124 skipped=130`（首次跑通，4 分 32 秒）
+  - 受影响的既有 green 套件（`explain_easy`、`explain_join_stats`、`clustered_index`、
+    `explain_stats`、`explain_easy_stats`）在全量 gate 中复跑通过。
+- **附带修复**:
+  - 本地 TiKV 全量 gate 卡死的根因定位为 store 膨胀到 51 GB（tombstone 与失效
+    region 引发持续 `skip invalid split key`），清空 `/tmp/sealdb-pd-tikv` 重启全新
+    单节点集群后全量 gate 从「30+ 分钟无输出」降到 4 分半；已写入 status-report。
+- **下一步**:
+  - 继续 R7 `executor/index_lookup_*`（`index_lookup_join` /
+    `index_lookup_merge_join` / `index_lookup_pushdown`）与 `planner/core/indexjoin`。
+
+### 2026-11-21（`ddl/affinity` 转正：`AFFINITY` 选项、分区运维拦截与 `SHOW CREATE` 形状）
+
+- **Phase**: R6
+- **完成**:
+  - `TableInfo` 新增 `affinity` / `temporary` / `on_commit_delete_rows`，`CREATE TABLE`
+    与 `ALTER TABLE … AFFINITY` 共用同一校验：`table` / `partition` / `none` / `''`
+    统一存小写，非法值报 `8266 Invalid AFFINITY '<raw>'`，临时表拒绝设置、视图按
+    `1347 is not BASE TABLE` 处理；非分区表不能 `AFFINITY='partition'`，分区表不能
+    `AFFINITY='table'`。
+  - `/*T![affinity] AFFINITY='…' */` 注释语法与表选项双通道解析；`CREATE TEMPORARY
+    TABLE … LIKE` 清空 affinity，`SHOW CREATE TABLE` 对本地/全局临时表输出
+    `CREATE TEMPORARY TABLE` / `CREATE GLOBAL TEMPORARY TABLE … ON COMMIT DELETE ROWS`。
+  - 带 affinity 的表在 `ADD/DROP/REORGANIZE/REMOVE/COALESCE/EXCHANGE PARTITION` 上报
+    `8200 Unsupported <OP> of a table with AFFINITY option`；`TRUNCATE PARTITION` 与
+    `TRUNCATE TABLE` 允许执行且保留 affinity。
+  - `SHOW CREATE TABLE` 在 engine/charset 之后、`PARTITION BY` 之前回显
+    `/*T![affinity] AFFINITY='…' */`；`information_schema.tables.TIDB_AFFINITY` 与
+    `information_schema.partitions.TIDB_AFFINITY` 同步，非分区表在 `partitions` 中
+    补一行 `PARTITION_NAME = NULL`。
+  - 分区子句渲染对齐 TiDB：`RANGE COLUMNS` / `LIST COLUMNS` 由语法形态（而非列数
+    启发式）决定，普通 RANGE 不再误印 `COLUMNS`；多分区定义按 `,\n ` 换行缩进，
+    `PARTITIONS n` 的 HASH/KEY 继续输出简写。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory --status pending -t ddl/affinity`
+    → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -s tikv --status pending -t ddl/affinity`
+    → `PASS: tikv=1`（双引擎）
+  - 全量 green+local gate：`PASS: memory=125 tikv=0 skipped=129`
+    （117 green + 8 local）
+  - 分区/`SHOW` 相关既有 green 套件（`show`、`partition`、
+    `executor/partition/{issues,partition_boundaries,partition_with_expression,table,write}`、
+    `ddl/exchange_partition_global_index`）全部复跑通过。
+- **附带修复**:
+  - 待办普查发现 `executor/issues` 在 `WEIGHT_STRING('ab' AS
+    BINARY(1000000000000000000))` 上直接 abort（尝试分配 1e18 字节）。按 TiDB
+    `cast_as_binary()` / `weight_string()` 语义改为超出 `max_allowed_packet`
+    时返回 `NULL` + `Warning 1301 … - truncated`，不再分配；该套件现已能跑到
+    真实语义差异（`1815` 子查询深度）而不是崩溃。
+- **下一步**:
+  - 继续 R6 `ddl/*` 长尾（`ddl/partition`、`ddl/db_partition`、`ddl/reorg_partition`）
+    与 R7 `executor/show`。
+
+### 2026-11-20（`expression/time` 转正：`TIME` 编码、`fsp` 传播、复合 `INTERVAL` 与新标量函数）
+
+- **Phase**: R7
+- **完成**:
+  - `TIME` 的持久化编码改为 duration 语义：`to_packed_u64` 用最高位标记
+    duration、次高位做符号位、留 10 bit 给 `0..=838` 的小时，修复
+    `-800:10:10.00000` 等大时/负值经行格式落盘再读回被截成
+    `-00:10:10.00000` 的问题。
+  - `GREATEST`/`LEAST` 在 duration 参数上继承参数间最大 `fsp`，
+    `greatest(c_time, cast('10:01:01' as time))` 输出
+    `10:01:01.00000`。
+  - 复合单位 `INTERVAL`（`HOUR_MINUTE`、`DAY_SECOND`、
+    `SECOND_MICROSECOND` 等 11 种）在 parser bridge 重写为
+    `__sealdb_interval_composite(<value>, '<UNIT>') MICROSECOND`，
+    由 `lower_interval_parts` 还原真实单位；重写器按整字符复制引号内容，
+    避免非 ASCII 字面量被逐字节 `as char` 弄成乱码（`explain_easy` 回归）。
+  - 补齐 time 语料所需标量函数：`ADDTIME`/`SUBTIME`、`DAYOFWEEK`/
+    `DAYNAME`/`MONTHNAME`、`TIMESTAMPDIFF`/`TIMESTAMPADD`、
+    `SIGN`/`SQRT`/`POW`/`EXP`/`LN`/`LOG*`/`PI`/`RAND`/`MOD`/`NULLIF`
+    与一元 `+`/`-` 的 decimal 语义。
+  - `MyDecimal` 的 `Ord` 改为符号 + 数字串比较（按整数/小数位宽对齐），
+    不再经 `f64`，`-9223372036854775809.00` 与 `-…808.00` 排序稳定；
+    `CAST(decimal AS SIGNED/UNSIGNED)` 用 `with_frac(0)` 半离零舍入并按
+    `i64`/`u64` 边界 clamp，不再抛 `Error 1292: decimal overflow`。
+  - `EXPLAIN` 阶段的非相关标量聚合子查询按 TiDB `init exec` 折叠为常量
+    （`fold_explain_scalar_subqueries`），`where b = (select max(b) from t)`
+    输出 `Selection eq(col, <val>)` 而非 `Apply`；折叠得到的 temporal
+    常量用 `FOLDED_SUBQUERY_FSP` 标记，说明器按子查询原样打印而不补零。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t expression/time`
+    → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -s both -t expression/time`
+    → `PASS: memory=1 tikv=1`（双引擎）
+  - 全量 green+local gate：`PASS: memory=124 tikv=0 skipped=130`
+    （116 green + 8 local）
+- **下一步**:
+  - 继续 R7 长尾：`expression/builtin`、`expression/issues`、
+    `expression/json`、`expression/multi_valued_index`。
 
 ### 2026-11-15（`expression/vitess_hash` 转正：表达式索引的 Sort/投影与索引宽度代价）
 
