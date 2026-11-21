@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 115,
+      "green": 118,
       "in_progress": 9,
       "local": 8,
-      "pending": 120
+      "pending": 117
     },
     "by_wave": {
       "D": 2,
@@ -176,7 +176,7 @@
     {
       "name": "ddl/affinity",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/affinity.test",
       "result": "r/ddl/affinity.result",
       "has_result": true,
@@ -726,7 +726,7 @@
     {
       "name": "executor/index_advise",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/index_advise.test",
       "result": "r/executor/index_advise.result",
       "has_result": true,
@@ -1362,7 +1362,7 @@
     {
       "name": "expression/time",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/expression/time.test",
       "result": "r/expression/time.result",
       "has_result": true,

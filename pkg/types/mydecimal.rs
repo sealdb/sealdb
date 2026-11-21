@@ -390,15 +390,42 @@ impl PartialOrd for MyDecimal {
 
 impl Ord for MyDecimal {
     fn cmp(&self, other: &Self) -> Ordering {
-        match (self.to_f64(), other.to_f64()) {
-            (Ok(a), Ok(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-            _ => self.to_string().cmp(&other.to_string()),
+        // Compare digit strings: `DECIMAL(65,2)` values past 2^53 (`±92233…`)
+        // are distinct but equal as `f64`.
+        let (self_neg, a) = split_decimal_sign(&self.to_string());
+        let (other_neg, b) = split_decimal_sign(&other.to_string());
+        match (self_neg, other_neg) {
+            (false, true) => Ordering::Greater,
+            (true, false) => Ordering::Less,
+            (false, false) => decimal_abs_cmp(&a, &b),
+            (true, true) => decimal_abs_cmp(&a, &b).reverse(),
         }
     }
 }
 
+/// `("-12.30")` → `(true, "12.30")`.
+fn split_decimal_sign(text: &str) -> (bool, String) {
+    match text.strip_prefix('-') {
+        Some(rest) => (true, rest.to_string()),
+        None => (false, text.trim_start_matches('+').to_string()),
+    }
+}
+
+/// Magnitude comparison of `"12.30"` forms: integer digit runs first, then the
+/// fractions zero-padded to a common width.
+fn decimal_abs_cmp(a: &str, b: &str) -> Ordering {
+    let (a_int, a_frac) = a.split_once('.').unwrap_or((a, ""));
+    let (b_int, b_frac) = b.split_once('.').unwrap_or((b, ""));
+    ucmp(a_int, b_int).then_with(|| {
+        let width = a_frac.len().max(b_frac.len());
+        let a_frac = format!("{a_frac:0<width$}");
+        let b_frac = format!("{b_frac:0<width$}");
+        a_frac.cmp(&b_frac)
+    })
+}
+
 /// MySQL's maximum `DECIMAL` scale.
-const MAX_DECIMAL_SCALE: usize = 30;
+pub const MAX_DECIMAL_SCALE: usize = 30;
 
 fn strip_leading_zeros(s: &str) -> String {
     let trimmed = s.trim_start_matches('0');

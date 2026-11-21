@@ -47,7 +47,8 @@ impl ExecutorBuilder {
                 current_db.to_string(),
                 true,
             ))),
-            PhysicalPlan::Projection { exprs, child, .. } => {
+            PhysicalPlan::Projection { exprs, child, .. }
+            | PhysicalPlan::StarOrderProjection { exprs, child } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("projection without select"))?;
@@ -1998,7 +1999,9 @@ fn resolve_collation_exprs(
 fn contains_collation(expr: &ExprNode) -> bool {
     match expr {
         ExprNode::Func(func) => {
-            func.name.eq_ignore_ascii_case("collation") || func.args.iter().any(contains_collation)
+            func.name.eq_ignore_ascii_case("collation")
+                || func.name.eq_ignore_ascii_case("weight_string")
+                || func.args.iter().any(contains_collation)
         }
         ExprNode::Cast(cast) => contains_collation(&cast.expr),
         ExprNode::Binary(binary) => {
@@ -2025,6 +2028,20 @@ fn fold_collation(expr: ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Resu
                 .into_iter()
                 .map(|arg| fold_collation(arg, info))
                 .collect::<Result<Vec<_>>>()?;
+            // `WEIGHT_STRING(expr[, 'CHAR'|'BINARY', n])` needs the argument's
+            // static collation, which is only known here: pass it as a trailing
+            // literal so the evaluator can build the key.
+            if func.name.eq_ignore_ascii_case("weight_string")
+                && !func.args.is_empty()
+                && matches!(func.args.len(), 1 | 3)
+            {
+                let collation = expr_collation(&func.args[0], info)?.collation;
+                func.args.push(ExprNode::Value(
+                    sealdb_parser::ast::expressions::ValueExpr {
+                        datum: sealdb_types::Datum::Bytes(collation.into_bytes()),
+                    },
+                ));
+            }
             Ok(ExprNode::Func(func))
         }
         ExprNode::Cast(mut cast) => {
@@ -2146,7 +2163,23 @@ fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Res
                 .map(|arg| expr_collation(arg, info))
                 .transpose()?
                 .unwrap_or_else(CollationInfo::ignorable);
-            out.charset = charset_of_collation(&collation);
+            let target = charset_of_collation(&collation);
+            // TiDB `ErrCollationCharsetMismatch` (1253): an explicit collation
+            // must belong to the operand's character set.
+            if !out.charset.is_empty()
+                && out.charset != "binary"
+                && !target.is_empty()
+                && target != out.charset
+            {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_COLLATION_CHARSET_MISMATCH,
+                    format!(
+                        "COLLATION '{collation}' is not valid for CHARACTER SET '{}'",
+                        out.charset
+                    ),
+                ));
+            }
+            out.charset = target;
             out.collation = collation;
             out.coercibility = COERCIBILITY_EXPLICIT;
             Ok(out)

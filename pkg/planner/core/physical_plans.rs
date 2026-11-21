@@ -128,6 +128,15 @@ pub enum PhysicalPlan {
         est_rows: Option<f64>,
         child: Box<PhysicalPlan>,
     },
+    /// Real projection that only restores the `SELECT *` column order a
+    /// HashJoin build/probe swap reversed. TiDB's join schema keeps the
+    /// logical (FROM) order, so its EXPLAIN has no Projection here; SealDB's
+    /// join executor emits probe ++ build, so the reorder must stay for
+    /// execution while EXPLAIN renders the child directly.
+    StarOrderProjection {
+        exprs: Vec<String>,
+        child: Box<PhysicalPlan>,
+    },
     DDL {
         kind: DdlKind,
     },
@@ -593,6 +602,11 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::TableDual { row_count } => format!("TableDual_{row_count}"),
             PhysicalPlan::Projection { exprs, child, .. } => {
+                format!("Projection({}) -> {}", exprs.join(","), child.explain())
+            }
+            // Elided from EXPLAIN (see the variant docs), but shown in the
+            // compact internal rendering so plan logs stay faithful.
+            PhysicalPlan::StarOrderProjection { exprs, child } => {
                 format!("Projection({}) -> {}", exprs.join(","), child.explain())
             }
             PhysicalPlan::DDL { kind } => format!("DDL_{kind:?}"),

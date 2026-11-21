@@ -108,6 +108,10 @@ pub fn attach_partitions(
     };
     let label = spec.expr.clone().unwrap_or_else(|| spec.column.clone());
     let mut part = PartitionInfo::new(tp, label, defs);
+    // `PARTITION BY HASH/KEY (…) PARTITIONS n`: SHOW CREATE keeps the shorthand.
+    part.uniform = matches!(tp, PartitionType::Hash | PartitionType::Key) && spec.defs.is_empty();
+    part.range_columns =
+        spec.range_columns && matches!(tp, PartitionType::Range | PartitionType::List);
     if let Some(expr) = &spec.expr {
         // TiDB stores expression keys in `expr` with an empty column list.
         part = part.with_expr_key(expr.clone());
@@ -242,6 +246,44 @@ pub fn drop_partitions(
     meta.gen_schema_version()?;
     drop_partition_keys(storage, &dropped_ids)?;
     Ok(())
+}
+
+/// `ALTER TABLE t TRUNCATE PARTITION p[, ...]`: drop every row owned by the
+/// named partitions while keeping the partition definitions and metadata.
+pub fn truncate_partitions(
+    is: &InfoSchema,
+    table: &TableName,
+    names: &[String],
+    current_db: &str,
+    storage: &dyn Storage,
+) -> Result<()> {
+    let (schema, name) = resolve_name(table, current_db)?;
+    let info = is.table_by_name(&schema, &name).cloned().ok_or_else(|| {
+        Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{name}' doesn't exist"),
+        )
+    })?;
+    let Some(part) = info.partition.as_ref() else {
+        return Err(Error::unsupported(
+            "TRUNCATE PARTITION on non-partitioned table",
+        ));
+    };
+    let mut ids = Vec::new();
+    for pname in names {
+        let Some(def) = part
+            .definitions
+            .iter()
+            .find(|d| d.name.o().eq_ignore_ascii_case(pname))
+        else {
+            return Err(Error::new(
+                ERR_CANT_DROP_FIELD_OR_KEY,
+                format!("Unknown partition '{pname}'"),
+            ));
+        };
+        ids.push(def.id);
+    }
+    drop_partition_keys(storage, &ids)
 }
 
 /// `ALTER TABLE t EXCHANGE PARTITION p WITH TABLE t1`. Each partition and

@@ -264,6 +264,11 @@ thread_local! {
     static STRICT_DML: Cell<bool> = const { Cell::new(false) };
 }
 
+thread_local! {
+    /// `RAND([seed])` generator state: `(last seed, LCG state)`.
+    static RAND_STATE: Cell<(i64, u64)> = const { Cell::new((0, 0)) };
+}
+
 pub fn with_strict_dml<T>(strict: bool, f: impl FnOnce() -> T) -> T {
     STRICT_DML.with(|cell| {
         let prev = cell.get();
@@ -890,6 +895,26 @@ fn split_qualified(name: &str) -> (Option<&str>, &str) {
 }
 
 fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    // `datetime +/- INTERVAL n unit` (and the commutative `INTERVAL + datetime`):
+    // the parser keeps the interval as a synthetic two-argument call, so the
+    // date arithmetic happens here before the interval operand is evaluated.
+    if matches!(expr.op, Op::Plus | Op::Minus) {
+        if let Some((amount, unit)) = interval_parts(&expr.right) {
+            return eval_interval_date(
+                &expr.left,
+                amount,
+                &unit,
+                matches!(expr.op, Op::Minus),
+                schema,
+                row,
+            );
+        }
+        if matches!(expr.op, Op::Plus)
+            && let Some((amount, unit)) = interval_parts(&expr.left)
+        {
+            return eval_interval_date(&expr.right, amount, &unit, false, schema, row);
+        }
+    }
     // Row constructors compare lexicographically: `(a, b) = (c, d)`.
     if matches!(expr.left.as_ref(), ExprNode::Row(_))
         || matches!(expr.right.as_ref(), ExprNode::Row(_))
@@ -930,7 +955,27 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
         return Ok(out);
     }
     match expr.op {
-        Op::Plus => num_bin(&left, &right, |a, b| Ok(a + b), |a, b| Ok(a + b)),
+        Op::Plus => {
+            if is_plain_int(&left) && is_plain_int(&right) {
+                if matches!(left, Datum::U64(_)) || matches!(right, Datum::U64(_)) {
+                    unsigned_plus(&expr.left, &left, &expr.right, &right)
+                } else {
+                    let sum = datum_as_i128(&left)? + datum_as_i128(&right)?;
+                    if sum < i64::MIN as i128 || sum > i64::MAX as i128 {
+                        return Err(bigint_range_error(
+                            &expr.left,
+                            &left,
+                            '+',
+                            &expr.right,
+                            &right,
+                        ));
+                    }
+                    Ok(Datum::I64(sum as i64))
+                }
+            } else {
+                num_bin(&left, &right, |a, b| Ok(a + b), |a, b| Ok(a + b))
+            }
+        }
         Op::Minus => {
             // TiDB: either operand UNSIGNED → unsigned result unless
             // sql_mode NO_UNSIGNED_SUBTRACTION (then signed).
@@ -951,8 +996,8 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
                     if diff < i64::MIN as i128 || diff > i64::MAX as i128 {
                         let label = format!(
                             "({} - {})",
-                            minus_operand_label(&expr.left, &left),
-                            minus_operand_label(&expr.right, &right)
+                            decimal_operand_label(&expr.left, &left),
+                            decimal_operand_label(&expr.right, &right)
                         );
                         Err(Error::new(
                             ERR_DATA_OUT_OF_RANGE,
@@ -964,12 +1009,84 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
                 }
             }
         }
-        Op::Mul => num_bin(&left, &right, |a, b| Ok(a * b), |a, b| Ok(a * b)),
+        Op::Mul => {
+            if is_plain_int(&left) && is_plain_int(&right) {
+                if matches!(left, Datum::U64(_)) || matches!(right, Datum::U64(_)) {
+                    let l = datum_as_u64_wrapping(&left)?;
+                    let r = datum_as_u64_wrapping(&right)?;
+                    match l.checked_mul(r) {
+                        Some(v) => Ok(Datum::U64(v)),
+                        None => Err(Error::new(
+                            ERR_DATA_OUT_OF_RANGE,
+                            format!(
+                                "BIGINT UNSIGNED value is out of range in '({} * {})'",
+                                decimal_operand_label(&expr.left, &left),
+                                decimal_operand_label(&expr.right, &right)
+                            ),
+                        )),
+                    }
+                } else {
+                    let product = datum_as_i128(&left)? * datum_as_i128(&right)?;
+                    if product < i64::MIN as i128 || product > i64::MAX as i128 {
+                        return Err(bigint_range_error(
+                            &expr.left,
+                            &left,
+                            '*',
+                            &expr.right,
+                            &right,
+                        ));
+                    }
+                    Ok(Datum::I64(product as i64))
+                }
+            } else {
+                // A DOUBLE operand computes in real: an infinite product is
+                // TiDB's 1690 `DOUBLE value is out of range`.
+                let a = string_lenient_f64(&left)?;
+                let b = string_lenient_f64(&right)?;
+                let product = a * b;
+                if product.is_infinite() {
+                    return Err(Error::new(
+                        ERR_DATA_OUT_OF_RANGE,
+                        format!(
+                            "DOUBLE value is out of range in '({} * {})'",
+                            go_float_label(a),
+                            go_float_label(b)
+                        ),
+                    ));
+                }
+                Ok(Datum::F64(product))
+            }
+        }
         Op::Div => {
             if is_zero_divisor(&right)? {
                 return div_by_zero();
             }
-            num_bin(&left, &right, |a, b| Ok(a / b), |a, b| Ok(a / b))
+            let exact = |d: &Datum| {
+                matches!(
+                    d,
+                    Datum::Decimal(_) | Datum::I64(_) | Datum::U64(_) | Datum::Year(_)
+                )
+            };
+            if exact(&left) && exact(&right) {
+                // MySQL `/` is exact DECIMAL division: `6/4` is 1.5000.
+                return Ok(eval_decimal_binary(Op::Div, &left, &right)?.unwrap_or(Datum::Null));
+            }
+            if matches!(left, Datum::F64(_) | Datum::Bytes(_))
+                || matches!(right, Datum::F64(_) | Datum::Bytes(_))
+            {
+                return Ok(Datum::F64(
+                    string_lenient_f64(&left)? / string_lenient_f64(&right)?,
+                ));
+            }
+            let divisor = string_lenient_i64(&right)?;
+            if divisor == 0 {
+                // A non-integer divisor (`0.5`) still divides in real instead
+                // of panicking on an integer divide by zero.
+                return Ok(Datum::F64(
+                    string_lenient_f64(&left)? / string_lenient_f64(&right)?,
+                ));
+            }
+            Ok(Datum::I64(string_lenient_i64(&left)? / divisor))
         }
         Op::IntDiv => {
             // MySQL `DIV`: integer division truncating toward zero; both
@@ -979,13 +1096,31 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             }
             let li = datum_as_i128(&left)?;
             let ri = datum_as_i128(&right)?;
+            // The divisor truncates to an integer here: `x DIV 0.4` is still a
+            // division by zero, not a panic.
+            if ri == 0 {
+                return Ok(Datum::Null);
+            }
             Ok(Datum::I64((li / ri) as i64))
         }
         Op::Mod => {
             if is_zero_divisor(&right)? {
                 return div_by_zero();
             }
-            num_bin(&left, &right, |a, b| Ok(a % b), |a, b| Ok(a % b))
+            // `x % y` follows `/`: real when an operand is real, exact
+            // otherwise.
+            if matches!(left, Datum::F64(_) | Datum::Bytes(_))
+                || matches!(right, Datum::F64(_) | Datum::Bytes(_))
+            {
+                return Ok(Datum::F64(
+                    string_lenient_f64(&left)? % string_lenient_f64(&right)?,
+                ));
+            }
+            let ri = datum_as_i128(&right)?;
+            if ri == 0 {
+                return div_by_zero();
+            }
+            Ok(Datum::I64((datum_as_i128(&left)? % ri) as i64))
         }
         Op::Eq => Ok(bool_datum(
             compare_datums_for_op(&left, &right, Op::Eq)?.is_eq(),
@@ -1098,15 +1233,16 @@ fn eval_unary(expr: &UnaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Da
             // `-9223372036854775808` parses as UnaryMinus(U64(2^63)).
             Datum::U64(v) if v == 1u64 << 63 => Ok(Datum::I64(i64::MIN)),
             Datum::U64(v) if v <= i64::MAX as u64 => Ok(Datum::I64(-(v as i64))),
-            Datum::U64(v) => Err(Error::new(
-                ERR_DATA_OUT_OF_RANGE,
-                format!("BIGINT UNSIGNED value is out of range in '(-{v})'"),
-            )),
+            // TiDB infers DECIMAL for a negated unsigned constant that does not
+            // fit the signed range (`-9223372036854775809`).
+            Datum::U64(v) => MyDecimal::parse(&format!("-{v}")).map(Datum::Decimal),
             Datum::F64(v) => Ok(Datum::F64(-v)),
             Datum::Decimal(d) => Ok(Datum::Decimal(d.negated())),
             other => Ok(Datum::I64(-other.as_i64()?)),
         },
         Op::Not | Op::Not2 => Ok(bool_datum(!truthy(&inner).unwrap_or(false))),
+        // MySQL `~x`: bitwise complement, typed `bigint unsigned`.
+        Op::BitNeg => Ok(Datum::U64(!(inner.as_i64()? as u64))),
         Op::Plus => Ok(inner),
         _ => Err(Error::unsupported(format!("unary {}", expr.op.restore()))),
     }
@@ -1334,6 +1470,15 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             Ok(user_var_assign(&name, value))
         }
         "VALUES" => Ok(Datum::Null),
+        // `DATABASE()` / `SCHEMA()`: the session's current database.
+        "DATABASE" | "SCHEMA" => {
+            let db = current_db_name();
+            Ok(if db.is_empty() {
+                Datum::Null
+            } else {
+                Datum::Bytes(db.into_bytes())
+            })
+        }
         "UUID" => Ok(Datum::Bytes(new_uuid().into_bytes())),
         // `LAST_INSERT_ID()` reads the session value; the one-argument form
         // sets it and returns the argument (MySQL semantics).
@@ -1512,10 +1657,19 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             let want_greatest = func.name.eq_ignore_ascii_case("GREATEST");
             let mut best: Option<Datum> = None;
+            // TiDB's duration result type keeps the widest fractional
+            // precision of its arguments (`greatest(time(5), cast(… as time))`
+            // prints five digits even when the chosen value is exact).
+            let mut time_fsp = 0i8;
             for arg in &func.args {
                 let v = eval_expr_with_row(arg, schema, row)?;
                 if v.is_null() {
                     return Ok(Datum::Null);
+                }
+                if let Datum::Time(t) = &v
+                    && t.tp == sealdb_types::time::TimeType::Time
+                {
+                    time_fsp = time_fsp.max(t.fsp.max(0));
                 }
                 best = Some(match best {
                     None => v,
@@ -1531,7 +1685,13 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                     }
                 });
             }
-            Ok(best.unwrap_or(Datum::Null))
+            match best {
+                Some(Datum::Time(mut t)) if t.tp == sealdb_types::time::TimeType::Time => {
+                    t.fsp = t.fsp.max(time_fsp);
+                    Ok(Datum::Time(t))
+                }
+                other => Ok(other.unwrap_or(Datum::Null)),
+            }
         }
         // TiDB `tidb_shard(x)` (shard index helper): the DES/null-key hash of
         // the argument modulo 256 buckets. Used by
@@ -1956,12 +2116,15 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         }
         "DATE_ADD" | "ADDDATE" => eval_date_add_sub(func, schema, row, false),
         "DATE_SUB" | "SUBDATE" => eval_date_add_sub(func, schema, row, true),
+        "STR_TO_DATE" => eval_str_to_date(func, schema, row),
         "JSON_EXTRACT" | "JSON_EXTRACT_SCALAR" => eval_json_extract(func, schema, row),
         "JSON_SET" => eval_json_set(func, schema, row),
         "JSON_UNQUOTE" => eval_json_unquote(func, schema, row),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
         "TIMESTAMPDIFF" => eval_timestamp_diff(func, schema, row),
         "TIMEDIFF" => eval_time_diff(func, schema, row),
+        "ADDTIME" => eval_add_sub_time(func, schema, row, false),
+        "SUBTIME" => eval_add_sub_time(func, schema, row, true),
         "UNIX_TIMESTAMP" => eval_unix_timestamp(func, schema, row),
         // MySQL `SLEEP(n)`: block `n` seconds and return 0.
         "SLEEP" => {
@@ -2000,6 +2163,9 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "MINUTE" => eval_date_part(func, schema, row, |t| i64::from(t.minute)),
         "SECOND" => eval_date_part(func, schema, row, |t| i64::from(t.second)),
         "WEEKDAY" => eval_date_part(func, schema, row, weekday_of),
+        // TiDB `DAYOFWEEK`: Sunday = 1 .. Saturday = 7.
+        "DAYOFWEEK" => eval_date_part(func, schema, row, |t| (weekday_of(t) + 1).rem_euclid(7) + 1),
+        "DAYNAME" | "MONTHNAME" => eval_temporal_name(func, schema, row),
         "WEEK" => eval_week(func, schema, row),
         // MySQL `TO_DAYS`: days since year 0 (1970-01-01 == 719528).
         "TO_DAYS" => eval_date_part(func, schema, row, |t| {
@@ -2008,6 +2174,11 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         // `DATE(expr)` / `TIME(expr)` / `TIMESTAMP(expr)`: the temporal part of
         // the argument (TiDB `builtinCastXxxSig`).
         "DATE" | "TIME" | "TIMESTAMP" => eval_temporal_cast(func, schema, row),
+        // MySQL `WEIGHT_STRING(expr [AS CHAR(n) | BINARY(n)])`: the collation
+        // key of `expr`. The executor appends the argument's static collation as
+        // a trailing literal (`weight_string(expr, 'CHAR', n, 'utf8mb4_bin')`);
+        // without one, no table type was known and `utf8mb4_bin` applies.
+        "WEIGHT_STRING" => eval_weight_string(func, schema, row),
         "COERCIBILITY" => {
             let Some(arg) = func.args.first() else {
                 return Err(Error::new(
@@ -2031,14 +2202,20 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             if value.is_null() || digits.is_null() {
                 return Ok(Datum::Null);
             }
-            let scale = digits.as_i64()?;
+            let scale = truncate_scale(&digits);
+            // An integer argument keeps its integer form (`truncate(42, 1)` is
+            // `42`, not `42.0`), and a negative scale must not overflow through
+            // a DECIMAL: `truncate(cast(-1 as unsigned), -10)` stays unsigned.
+            match &value {
+                Datum::I64(v) => return Ok(Datum::I64(truncate_int(*v, scale))),
+                Datum::U64(v) => return Ok(Datum::U64(truncate_uint(*v, scale))),
+                Datum::Year(v) => return Ok(Datum::I64(truncate_int(i64::from(*v), scale))),
+                _ => {}
+            }
             let decimal = match &value {
                 Datum::Decimal(d) => d.clone(),
                 Datum::F64(f) => MyDecimal::parse(&format!("{f}"))?,
                 Datum::Bytes(b) => MyDecimal::parse(&String::from_utf8_lossy(b))?,
-                Datum::I64(_) | Datum::U64(_) | Datum::Year(_) => {
-                    MyDecimal::from_i64(value.as_i64()?)
-                }
                 other => MyDecimal::parse(&format!("{}", other.as_f64()?))?,
             };
             truncate_decimal(decimal, scale)
@@ -2055,8 +2232,8 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 Datum::Null => Ok(Datum::Null),
                 Datum::I64(_) | Datum::U64(_) => Ok(value),
                 Datum::F64(v) => Ok(Datum::I64(v.floor() as i64)),
-                Datum::Decimal(d) => Ok(Datum::I64(d.to_f64()?.floor() as i64)),
-                other => Ok(Datum::I64(other.as_f64()?.floor() as i64)),
+                Datum::Decimal(d) => decimal_round_to_int(&d, false),
+                other => Ok(Datum::I64(real_arg(&other)?.floor() as i64)),
             }
         }
         "CEIL" | "CEILING" => {
@@ -2071,8 +2248,294 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 Datum::Null => Ok(Datum::Null),
                 Datum::I64(_) | Datum::U64(_) => Ok(value),
                 Datum::F64(v) => Ok(Datum::I64(v.ceil() as i64)),
-                Datum::Decimal(d) => Ok(Datum::I64(d.to_f64()?.ceil() as i64)),
-                other => Ok(Datum::I64(other.as_f64()?.ceil() as i64)),
+                Datum::Decimal(d) => decimal_round_to_int(&d, true),
+                other => Ok(Datum::I64(real_arg(&other)?.ceil() as i64)),
+            }
+        }
+        // TiDB `SIGN(x)`: -1 / 0 / 1 as `bigint`; NULL in -> NULL out.
+        "SIGN" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "SIGN requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            let v = match &value {
+                Datum::Null => return Ok(Datum::Null),
+                Datum::I64(v) => *v as f64,
+                Datum::U64(v) => *v as f64,
+                Datum::F64(v) => *v,
+                Datum::Decimal(d) => d.to_f64()?,
+                other => other.as_f64()?,
+            };
+            Ok(Datum::I64(if v > 0.0 {
+                1
+            } else if v < 0.0 {
+                -1
+            } else {
+                0
+            }))
+        }
+        // TiDB/MySQL `SQRT(x)`: `double`; a negative argument is NULL.
+        "SQRT" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "SQRT requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let v = real_arg(&value)?;
+            Ok(if v < 0.0 {
+                Datum::Null
+            } else {
+                Datum::F64(v.sqrt())
+            })
+        }
+        // TiDB `DEGREES`/`RADIANS`/`SIN`/`COS`/`TAN`/`COT`/`ASIN`/`ACOS`:
+        // `double` in, `double` out. `ASIN`/`ACOS` outside [-1, 1] are NULL and
+        // `COT(0)` overflows to 1690.
+        "DEGREES" | "RADIANS" | "SIN" | "COS" | "TAN" | "COT" | "ASIN" | "ACOS" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("{} requires 1 argument", func.name.to_uppercase()),
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let v = real_arg(&value)?;
+            let out = match func.name.to_ascii_lowercase().as_str() {
+                "degrees" => v.to_degrees(),
+                "radians" => v.to_radians(),
+                "sin" => v.sin(),
+                "cos" => v.cos(),
+                "tan" => v.tan(),
+                "cot" => {
+                    let t = v.tan();
+                    if t == 0.0 {
+                        return Err(double_range_error(func, &[value]));
+                    }
+                    1.0 / t
+                }
+                "asin" => {
+                    if !(-1.0..=1.0).contains(&v) {
+                        return Ok(Datum::Null);
+                    }
+                    v.asin()
+                }
+                _ => {
+                    if !(-1.0..=1.0).contains(&v) {
+                        return Ok(Datum::Null);
+                    }
+                    v.acos()
+                }
+            };
+            Ok(Datum::F64(out))
+        }
+        // `ATAN(y)` / `ATAN(y, x)` (the two-argument form is `atan2`).
+        "ATAN" => {
+            if !(1..=2).contains(&func.args.len()) {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "ATAN requires 1 or 2 arguments",
+                ));
+            }
+            let first = eval_expr_with_row(&func.args[0], schema, row)?;
+            if first.is_null() {
+                return Ok(Datum::Null);
+            }
+            let y = real_arg(&first)?;
+            match func.args.get(1) {
+                Some(arg) => {
+                    let second = eval_expr_with_row(arg, schema, row)?;
+                    if second.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    Ok(Datum::F64(y.atan2(real_arg(&second)?)))
+                }
+                None => Ok(Datum::F64(y.atan())),
+            }
+        }
+        // TiDB `POW(x, y)` / `POWER(x, y)`: `double`; NULL propagates.
+        "POW" | "POWER" => {
+            if func.args.len() != 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("{} requires 2 arguments", func.name.to_uppercase()),
+                ));
+            }
+            let base = eval_expr_with_row(&func.args[0], schema, row)?;
+            let exp = eval_expr_with_row(&func.args[1], schema, row)?;
+            if base.is_null() || exp.is_null() {
+                return Ok(Datum::Null);
+            }
+            let out = real_arg(&base)?.powf(real_arg(&exp)?);
+            if out.is_infinite() {
+                return Err(double_range_error(func, &[base, exp]));
+            }
+            Ok(Datum::F64(out))
+        }
+        // TiDB `PI()`: the constant as a `double`.
+        "PI" => Ok(Datum::F64(std::f64::consts::PI)),
+        // TiDB `EXP(x)` / `LN(x)` / `LOG(...)` / `LOG2` / `LOG10`: `double`;
+        // a non-positive argument yields NULL (MySQL warnings aside).
+        "EXP" | "LN" | "LOG" | "LOG2" | "LOG10" => {
+            let name = func.name.to_ascii_uppercase();
+            let ok_args = match name.as_str() {
+                "LOG" => (1..=2).contains(&func.args.len()),
+                _ => func.args.len() == 1,
+            };
+            if !ok_args {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("{name} requires {} argument(s)", if name == "LOG" { "1 or 2" } else { "1" }),
+                ));
+            }
+            let mut vals = Vec::with_capacity(func.args.len());
+            let mut datums = Vec::with_capacity(func.args.len());
+            for arg in &func.args {
+                let v = eval_expr_with_row(arg, schema, row)?;
+                if v.is_null() {
+                    return Ok(Datum::Null);
+                }
+                vals.push(real_arg(&v)?);
+                datums.push(v);
+            }
+            let out = match name.as_str() {
+                "EXP" => {
+                    let out = vals[0].exp();
+                    if out.is_infinite() {
+                        return Err(double_range_error(func, &datums));
+                    }
+                    out
+                }
+                "LN" => {
+                    if vals[0] <= 0.0 {
+                        return Ok(Datum::Null);
+                    }
+                    vals[0].ln()
+                }
+                "LOG2" => {
+                    if vals[0] <= 0.0 {
+                        return Ok(Datum::Null);
+                    }
+                    vals[0].log2()
+                }
+                "LOG10" => {
+                    if vals[0] <= 0.0 {
+                        return Ok(Datum::Null);
+                    }
+                    vals[0].log10()
+                }
+                // `LOG(x)` is the natural log; `LOG(b, x)` uses base `b`.
+                "LOG" if vals.len() == 1 => {
+                    if vals[0] <= 0.0 {
+                        return Ok(Datum::Null);
+                    }
+                    vals[0].ln()
+                }
+                _ => {
+                    if vals[0] <= 0.0 || vals[0] == 1.0 || vals[1] <= 0.0 {
+                        return Ok(Datum::Null);
+                    }
+                    vals[1].log(vals[0])
+                }
+            };
+            Ok(Datum::F64(out))
+        }
+        // TiDB `RAND([seed])`: `double` in [0, 1). A constant seed makes the
+        // sequence deterministic across runs.
+        "RAND" => {
+            if func.args.len() > 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "RAND requires 0 or 1 argument",
+                ));
+            }
+            let seed = match func.args.first() {
+                Some(arg) => {
+                    let v = eval_expr_with_row(arg, schema, row)?;
+                    if v.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    Some(v.as_i64()?)
+                }
+                None => None,
+            };
+            let next = RAND_STATE.with(|state| {
+                let (cur_seed, mut st) = state.get();
+                if let Some(seed) = seed {
+                    st = seed as u64;
+                } else if st == 0 {
+                    st = 0x2545_f491_4f6c_dd1d;
+                }
+                // 64-bit LCG (Numerical Recipes constants).
+                st = st
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state.set((seed.unwrap_or(cur_seed), st));
+                (st >> 33) as f64 / 2_147_483_648.0
+            });
+            Ok(Datum::F64(next))
+        }
+        // TiDB `NULLIF(a, b)`: NULL when `a = b`, otherwise `a`.
+        "NULLIF" => {
+            if func.args.len() != 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "NULLIF requires 2 arguments",
+                ));
+            }
+            let first = eval_expr_with_row(&func.args[0], schema, row)?;
+            let second = eval_expr_with_row(&func.args[1], schema, row)?;
+            if first.is_null() || second.is_null() {
+                return Ok(first);
+            }
+            if compare_datums(&first, &second)?.is_eq() {
+                return Ok(Datum::Null);
+            }
+            Ok(first)
+        }
+        // TiDB `MOD(a, b)`: the numeric remainder; a zero divisor is NULL
+        // (division by zero yields NULL with a warning, not an error).
+        "MOD" => {
+            if func.args.len() != 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "MOD requires 2 arguments",
+                ));
+            }
+            let a = eval_expr_with_row(&func.args[0], schema, row)?;
+            let b = eval_expr_with_row(&func.args[1], schema, row)?;
+            if a.is_null() || b.is_null() {
+                return Ok(Datum::Null);
+            }
+            match (&a, &b) {
+                (Datum::I64(x), Datum::I64(y)) => Ok(if *y == 0 {
+                    Datum::Null
+                } else {
+                    Datum::I64(x.wrapping_rem(*y))
+                }),
+                (Datum::U64(x), Datum::U64(y)) => Ok(if *y == 0 {
+                    Datum::Null
+                } else {
+                    Datum::U64(x % y)
+                }),
+                _ => {
+                    let y = b.as_f64()?;
+                    Ok(if y == 0.0 {
+                        Datum::Null
+                    } else {
+                        Datum::F64(a.as_f64()? % y)
+                    })
+                }
             }
         }
         // TiDB `vitess_hash(x)` (`builtinVitessHashSig`): the null-key DES
@@ -2708,15 +3171,28 @@ fn datum_as_time(d: &Datum) -> Result<Time> {
             t.tp = TimeType::Datetime;
             Ok(t)
         }
-        // TiDB numeric→datetime: 20240628 → 2024-06-28 00:00:00.
+        // TiDB numeric→datetime: 20240628 → 2024-06-28 00:00:00, and the
+        // fractional part is the (microsecond) sub-second field, e.g.
+        // `19000101001843.456789` → 1900-01-01 00:18:43.456789.
         other => {
             let n = other.as_i64()?;
-            time_from_yyyymmdd(n).ok_or_else(|| {
+            let mut t = time_from_yyyymmdd(n).ok_or_else(|| {
                 Error::new(
                     sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
                     format!("Incorrect datetime value: '{other:?}'"),
                 )
-            })
+            })?;
+            // Keep the fraction exact for DECIMAL literals (f64 would lose
+            // the microsecond digits of a 14-digit datetime value).
+            let numeric_text = match other {
+                Datum::Decimal(d) => d.to_string(),
+                _ => other.as_f64().map(|v| format!("{v}")).unwrap_or_default(),
+            };
+            if let Some(micro) = fraction_micros(&numeric_text) {
+                t.micro = micro;
+                t.fsp = 6;
+            }
+            Ok(t)
         }
     }
 }
@@ -2791,6 +3267,52 @@ fn time_from_yyyymmdd(n: i64) -> Option<Time> {
     })
 }
 
+/// `TRUNCATE`'s second argument. MySQL saturates an out-of-range scale and
+/// clamps the usable precision to the maximum DECIMAL scale (30), so
+/// `truncate(1.23, 100)` prints 30 fractional digits instead of 100.
+fn truncate_scale(digits: &Datum) -> i64 {
+    let limit = sealdb_types::mydecimal::MAX_DECIMAL_SCALE as i64;
+    let raw = match digits {
+        Datum::I64(v) => *v,
+        Datum::U64(v) => i64::try_from(*v).unwrap_or(i64::MAX),
+        Datum::F64(v) => v.trunc() as i64,
+        Datum::Bytes(b) => {
+            let text = String::from_utf8_lossy(b).trim().to_string();
+            sealdb_types::datum::mysql_numeric_prefix(&text) as i64
+        }
+        Datum::Decimal(d) => d
+            .with_frac(0)
+            .to_string()
+            .parse::<i64>()
+            .unwrap_or_else(|_| {
+                if d.to_string().starts_with('-') {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
+            }),
+        other => other.as_i64().unwrap_or(0),
+    };
+    raw.clamp(-limit, limit)
+}
+
+/// Integer `TRUNCATE`: only a negative scale changes the value.
+fn truncate_int(v: i64, scale: i64) -> i64 {
+    if scale >= 0 {
+        return v;
+    }
+    let factor = 10i64.checked_pow((-scale) as u32).unwrap_or(i64::MAX);
+    (v / factor) * factor
+}
+
+fn truncate_uint(v: u64, scale: i64) -> u64 {
+    if scale >= 0 {
+        return v;
+    }
+    let factor = 10u64.checked_pow((-scale) as u32).unwrap_or(u64::MAX);
+    (v / factor) * factor
+}
+
 /// MySQL `TRUNCATE`: keep `scale` fractional digits (dropping the rest toward
 /// zero); a negative scale zeros `-scale` integer digits instead.
 fn truncate_decimal(decimal: MyDecimal, scale: i64) -> Result<Datum> {
@@ -2831,13 +3353,415 @@ fn truncate_decimal(decimal: MyDecimal, scale: i64) -> Result<Datum> {
     ))?))
 }
 
+/// `WEIGHT_STRING` argument that is a plain literal, if any.
+fn weight_string_literal(expr: &ExprNode) -> Option<String> {
+    match expr {
+        ExprNode::Value(value) => Some(String::from_utf8_lossy(&value.datum.as_bytes()).into_owned()),
+        _ => None,
+    }
+}
+
+fn looks_like_collation(text: &str) -> bool {
+    text == "binary"
+        || (text.contains('_')
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+fn eval_weight_string(
+    func: &FuncCallExpr,
+    schema: &[String],
+    row: &[Datum],
+) -> Result<Datum> {
+    let Some(first) = func.args.first() else {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "WEIGHT_STRING requires 1 argument",
+        ));
+    };
+    let value = eval_expr_with_row(first, schema, row)?;
+    let mut rest: Vec<&ExprNode> = func.args.iter().skip(1).collect();
+    // The executor's trailing collation literal is the only string argument at
+    // the end that is not the `CHAR`/`BINARY` keyword.
+    let mut collation = String::from("utf8mb4_bin");
+    if let Some(last) = rest.last() {
+        if let Some(text) = weight_string_literal(last) {
+            if looks_like_collation(&text) {
+                collation = text;
+                rest.pop();
+            }
+        }
+    }
+    let kind = rest
+        .first()
+        .and_then(|arg| weight_string_literal(arg))
+        .map(|text| text.to_ascii_uppercase());
+    let length = match rest.get(1) {
+        Some(arg) => {
+            let len = eval_expr_with_row(arg, schema, row)?;
+            if len.is_null() {
+                return Ok(Datum::Null);
+            }
+            len.as_i64().unwrap_or(0).max(0) as usize
+        }
+        None => 0,
+    };
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    // TiDB materialises the padded value before computing its weight, so a
+    // `WEIGHT_STRING(… AS BINARY(n)|CHAR(n))` that would exceed
+    // `max_allowed_packet` yields NULL with a 1301 warning instead.
+    // `BINARY(n)` counts bytes; `CHAR(n)` counts characters (≤ 4 bytes each
+    // under utf8mb4).
+    let overflow = match kind.as_deref() {
+        Some("BINARY") => length > MAX_ALLOWED_PACKET,
+        Some("CHAR") => length.saturating_mul(4) > MAX_ALLOWED_PACKET,
+        _ => false,
+    };
+    if overflow {
+        let func_name = if kind.as_deref() == Some("BINARY") {
+            "cast_as_binary()"
+        } else {
+            "weight_string()"
+        };
+        push_warning(
+            sealdb_errno::ERR_ALLOWED_PACKET_OVERFLOWED,
+            format!(
+                "Result of {func_name} was larger than max_allowed_packet \
+                 ({MAX_ALLOWED_PACKET}) - truncated"
+            ),
+        );
+        return Ok(Datum::Null);
+    }
+    let numeric = matches!(
+        value,
+        Datum::I64(_) | Datum::U64(_) | Datum::F64(_) | Datum::Decimal(_) | Datum::Year(_)
+    );
+    match kind.as_deref() {
+        Some("BINARY") => {
+            let mut bytes = value.as_bytes();
+            if length > 0 {
+                if bytes.len() >= length {
+                    bytes.truncate(length);
+                } else {
+                    bytes.resize(length, 0);
+                }
+            }
+            Ok(Datum::Bytes(bytes))
+        }
+        Some("CHAR") => {
+            if numeric {
+                return Ok(Datum::Null);
+            }
+            let text: Vec<char> = String::from_utf8_lossy(&value.as_bytes()).chars().collect();
+            let text = if length == 0 {
+                text
+            } else if text.len() >= length {
+                text[..length].to_vec()
+            } else {
+                let mut padded = text;
+                padded.resize(length, ' ');
+                padded
+            };
+            let bytes: String = text.into_iter().collect();
+            Ok(Datum::Bytes(weight_key(&collation, bytes.as_bytes())))
+        }
+        _ => {
+            if numeric {
+                return Ok(Datum::Null);
+            }
+            Ok(Datum::Bytes(weight_key(&collation, &value.as_bytes())))
+        }
+    }
+}
+
+/// Collation key (sort weight bytes) of `text`. PAD SPACE collations ignore
+/// trailing spaces, binary keys keep the raw bytes, and the `_ci` collations
+/// emit one big-endian 16-bit weight per character.
+fn weight_key(collation: &str, text: &[u8]) -> Vec<u8> {
+    let mut end = text.len();
+    while end > 0 && text[end - 1] == b' ' {
+        end -= 1;
+    }
+    let text = &text[..end];
+    match collation {
+        "utf8mb4_bin" | "utf8_bin" | "binary" => text.to_vec(),
+        "utf8mb4_unicode_ci" | "utf8_unicode_ci" => {
+            let mut out = Vec::with_capacity(text.len() * 2);
+            for ch in String::from_utf8_lossy(text).chars() {
+                let cp = ch as u32;
+                // UCA implicit weights for CJK: 0xFB40 + plane, then the low
+                // 15 bits with the high bit set.
+                if (0x3400..=0x9FFF).contains(&cp) || (0x20000..=0x2FFFF).contains(&cp) {
+                    out.extend_from_slice(&(0xFB40u16 + (cp >> 15) as u16).to_be_bytes());
+                    out.extend_from_slice(&(((cp & 0x7FFF) as u16) | 0x8000).to_be_bytes());
+                } else {
+                    out.extend_from_slice(&general_ci_weight(ch).to_be_bytes());
+                }
+            }
+            out
+        }
+        _ => {
+            let mut out = Vec::with_capacity(text.len() * 2);
+            for ch in String::from_utf8_lossy(text).chars() {
+                out.extend_from_slice(&general_ci_weight(ch).to_be_bytes());
+            }
+            out
+        }
+    }
+}
+
+/// `utf8mb4_general_ci` weight of one character: the uppercase base letter for
+/// Latin letters (accents folded), otherwise the code point itself.
+fn general_ci_weight(ch: char) -> u16 {
+    let up = ch.to_uppercase().next().unwrap_or(ch);
+    let base = match up {
+        'À'..='Å' | 'Ā' | 'Ă' | 'Ą' => 'A',
+        'Ç' | 'Ć' | 'Ĉ' | 'Ċ' | 'Č' => 'C',
+        'Ð' | 'Ď' | 'Đ' => 'D',
+        'È'..='Ë' | 'Ē' | 'Ĕ' | 'Ė' | 'Ę' | 'Ě' => 'E',
+        'Ĝ' | 'Ğ' | 'Ġ' | 'Ģ' => 'G',
+        'Ĥ' | 'Ħ' => 'H',
+        'Ì'..='Ï' | 'Ĩ' | 'Ī' | 'Ĭ' | 'Į' | 'İ' => 'I',
+        'Ĵ' => 'J',
+        'Ķ' => 'K',
+        'Ĺ' | 'Ļ' | 'Ľ' | 'Ŀ' | 'Ł' => 'L',
+        'Ñ' | 'Ń' | 'Ņ' | 'Ň' | 'Ŋ' => 'N',
+        'Ò'..='Ö' | 'Ø' | 'Ō' | 'Ŏ' | 'Ő' => 'O',
+        'Ŕ' | 'Ŗ' | 'Ř' => 'R',
+        'Ś' | 'Ŝ' | 'Ş' | 'Š' => 'S',
+        'Ţ' | 'Ť' | 'Ŧ' => 'T',
+        'Ù'..='Ü' | 'Ũ' | 'Ū' | 'Ŭ' | 'Ů' | 'Ű' | 'Ų' => 'U',
+        'Ý' | 'Ŷ' | 'Ÿ' => 'Y',
+        'Ź' | 'Ż' | 'Ž' => 'Z',
+        other => other,
+    };
+    let cp = base as u32;
+    if cp > u16::MAX as u32 {
+        0xFFFD
+    } else {
+        cp as u16
+    }
+}
+
+/// MySQL `STR_TO_DATE(str, format)`: parse `str` with MySQL format
+/// specifiers. Date components default to zero (rejected under
+/// `NO_ZERO_DATE`), a time-only format returns a `TIME`, and any time
+/// component makes the result a `DATETIME`.
+fn eval_str_to_date(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "STR_TO_DATE requires 2 arguments",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    let format = eval_expr_with_row(&func.args[1], schema, row)?;
+    if value.is_null() || format.is_null() {
+        return Ok(Datum::Null);
+    }
+    let input = String::from_utf8_lossy(&value.as_bytes()).into_owned();
+    let format = String::from_utf8_lossy(&format.as_bytes()).into_owned();
+    Ok(parse_str_to_date(&input, &format).unwrap_or(Datum::Null))
+}
+
+fn parse_str_to_date(input: &str, format: &str) -> Option<Datum> {
+    fn take_digits(bytes: &[u8], i: &mut usize, max: usize) -> Option<u32> {
+        let start = *i;
+        while *i < bytes.len() && *i - start < max && bytes[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i == start {
+            return None;
+        }
+        std::str::from_utf8(&bytes[start..*i]).ok()?.parse().ok()
+    }
+    fn take_word(bytes: &[u8], i: &mut usize) -> String {
+        let start = *i;
+        while *i < bytes.len() && bytes[*i].is_ascii_alphabetic() {
+            *i += 1;
+        }
+        String::from_utf8_lossy(&bytes[start..*i]).into_owned()
+    }
+    let month_of = |word: &str| -> Option<u8> {
+        let word = word.to_ascii_lowercase();
+        const MONTHS: [&str; 12] = [
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ];
+        MONTHS
+            .iter()
+            .position(|m| word.starts_with(&m[..3]) && m.starts_with(&word))
+            .map(|pos| pos as u8 + 1)
+    };
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    let (mut year, mut month, mut day) = (0u16, 0u8, 0u8);
+    let (mut hour, mut minute, mut second, mut micro) = (0u16, 0u8, 0u8, 0u32);
+    let mut fsp = 0i8;
+    let mut has_date = false;
+    let mut has_time = false;
+    let mut pm = false;
+    let mut chars = format.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            if c.is_whitespace() {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            } else if i < bytes.len() && bytes[i] == c as u8 {
+                i += 1;
+            }
+            continue;
+        }
+        match chars.next()? {
+            'Y' => {
+                year = take_digits(bytes, &mut i, 4)? as u16;
+                has_date = true;
+            }
+            'y' => {
+                let v = take_digits(bytes, &mut i, 2)?;
+                year = if v < 70 { 2000 + v } else { 1900 + v } as u16;
+                has_date = true;
+            }
+            'm' | 'c' => {
+                month = take_digits(bytes, &mut i, 2)? as u8;
+                has_date = true;
+            }
+            'd' | 'e' => {
+                day = take_digits(bytes, &mut i, 2)? as u8;
+                has_date = true;
+            }
+            'H' | 'k' | 'h' | 'I' | 'l' => {
+                hour = take_digits(bytes, &mut i, 2)? as u16;
+                has_time = true;
+            }
+            'i' => {
+                minute = take_digits(bytes, &mut i, 2)? as u8;
+                has_time = true;
+            }
+            's' | 'S' => {
+                second = take_digits(bytes, &mut i, 2)? as u8;
+                has_time = true;
+            }
+            'f' => {
+                let start = i;
+                let v = take_digits(bytes, &mut i, 6)?;
+                let len = (i - start) as u32;
+                micro = v * 10u32.pow(6 - len);
+                fsp = len as i8;
+                has_time = true;
+            }
+            'p' => {
+                let rest = input[i..].to_ascii_uppercase();
+                if rest.starts_with("PM") {
+                    pm = true;
+                    i += 2;
+                } else if rest.starts_with("AM") {
+                    i += 2;
+                } else {
+                    return None;
+                }
+            }
+            'M' => {
+                month = month_of(&take_word(bytes, &mut i))?;
+                has_date = true;
+            }
+            'b' => {
+                month = month_of(&take_word(bytes, &mut i))?;
+                has_date = true;
+            }
+            'W' | 'a' => {
+                take_word(bytes, &mut i);
+            }
+            'j' => {
+                take_digits(bytes, &mut i, 3)?;
+                has_date = true;
+            }
+            'T' => {
+                hour = take_digits(bytes, &mut i, 2)? as u16;
+                if i < bytes.len() && bytes[i] == b':' {
+                    i += 1;
+                }
+                minute = take_digits(bytes, &mut i, 2)? as u8;
+                if i < bytes.len() && bytes[i] == b':' {
+                    i += 1;
+                }
+                second = take_digits(bytes, &mut i, 2)? as u8;
+                has_time = true;
+            }
+            'r' => {
+                hour = take_digits(bytes, &mut i, 2)? as u16;
+                if i < bytes.len() && bytes[i] == b':' {
+                    i += 1;
+                }
+                minute = take_digits(bytes, &mut i, 2)? as u8;
+                if i < bytes.len() && bytes[i] == b':' {
+                    i += 1;
+                }
+                second = take_digits(bytes, &mut i, 2)? as u8;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let rest = input[i..].to_ascii_uppercase();
+                if rest.starts_with("PM") {
+                    pm = true;
+                    i += 2;
+                } else if rest.starts_with("AM") {
+                    i += 2;
+                }
+                has_time = true;
+            }
+            '%' => {
+                if i < bytes.len() && bytes[i] == b'%' {
+                    i += 1;
+                }
+            }
+            _ => return None,
+        }
+    }
+    if !has_date && !has_time {
+        return None;
+    }
+    if pm && hour < 12 {
+        hour += 12;
+    }
+    if month > 12 || day > 31 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    if has_date && sql_mode_flag("NO_ZERO_DATE") && (month == 0 || day == 0) {
+        return None;
+    }
+    let tp = match (has_date, has_time) {
+        (true, true) => TimeType::Datetime,
+        (false, true) => TimeType::Time,
+        _ => TimeType::Date,
+    };
+    let mut t = Time::new(year, month, day, hour, minute, second);
+    t.micro = micro;
+    t.fsp = fsp;
+    t.tp = tp;
+    Some(Datum::Time(t))
+}
+
 fn eval_date_part(
     func: &FuncCallExpr,
     schema: &[String],
     row: &[Datum],
     part: impl Fn(&Time) -> i64,
-) -> Result<Datum> {
-    if func.args.len() != 1 {
+) -> Result<Datum> {    if func.args.len() != 1 {
         return Err(Error::new(
             sealdb_errno::ERR_WRONG_ARGUMENTS,
             format!("{} requires 1 argument", func.name),
@@ -2853,6 +3777,64 @@ fn eval_date_part(
         t = utc_to_session_local(t)?;
     }
     Ok(Datum::I64(part(&t)))
+}
+
+/// MySQL `DAYNAME(date)` / `MONTHNAME(date)`: the English weekday / month
+/// name of the temporal argument.
+fn eval_temporal_name(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("{} requires 1 argument", func.name.to_uppercase()),
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut t = datum_as_time(&value)?;
+    if matches!(t.tp, TimeType::Timestamp) {
+        t = utc_to_session_local(t)?;
+    }
+    let (text, number) = if func.name.eq_ignore_ascii_case("DAYNAME") {
+        const DAYS: [&str; 7] = [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+        ];
+        let weekday = weekday_of(&t);
+        (DAYS[weekday as usize].to_string(), weekday as u64)
+    } else {
+        const MONTHS: [&str; 12] = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ];
+        let month = usize::from(t.month.clamp(1, 12));
+        (MONTHS[month - 1].to_string(), month as u64)
+    };
+    // TiDB's DAYNAME datum keeps the weekday index as its numeric value
+    // (`dayname('1962-03-01') + 0` is 3); `Enum` carries both label and index.
+    if func.name.eq_ignore_ascii_case("DAYNAME") {
+        return Ok(Datum::Enum(sealdb_types::datum::EnumValue::new(
+            text.into_bytes(),
+            number,
+        )));
+    }
+    Ok(Datum::Bytes(text.into_bytes()))
 }
 
 /// MySQL `WEEK(date[, mode])`: the week number under one of MySQL's eight
@@ -2985,11 +3967,455 @@ fn unit_name(d: &Datum) -> Result<String> {
     }
 }
 
+/// Split a synthesized `INTERVAL value unit` call into its parts.
+fn interval_parts(expr: &ExprNode) -> Option<(&ExprNode, String)> {
+    let ExprNode::Func(func) = expr else {
+        return None;
+    };
+    if !func.name.eq_ignore_ascii_case("__sealdb_interval") || func.args.len() != 2 {
+        return None;
+    }
+    let ExprNode::Value(unit) = &func.args[1] else {
+        return None;
+    };
+    let Datum::Bytes(bytes) = &unit.datum else {
+        return None;
+    };
+    Some((
+        &func.args[0],
+        String::from_utf8_lossy(bytes).to_ascii_uppercase(),
+    ))
+}
+
+/// `base +/- INTERVAL amount unit`, matching TiDB's `date_add`/`date_sub`
+/// rewrite for the arithmetic syntax.
+fn eval_interval_date(
+    base_expr: &ExprNode,
+    amount_expr: &ExprNode,
+    unit: &str,
+    subtract: bool,
+    schema: &[String],
+    row: &[Datum],
+) -> Result<Datum> {
+    let base = eval_expr_with_row(base_expr, schema, row)?;
+    if base.is_null() {
+        return Ok(Datum::Null);
+    }
+    let amount_value = match eval_expr_with_row(amount_expr, schema, row) {
+        Ok(v) => v,
+        // A negative literal below BIGINT range (`INTERVAL -9223372036854775809
+        // YEAR`) surfaces as an unsigned-negation overflow; the interval
+        // conversion reports it as a decimal 1292 instead.
+        Err(err) if err.code == sealdb_errno::ERR_DATA_OUT_OF_RANGE => {
+            if strict_dml() {
+                return Err(Error::new(
+                    sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                    format!(
+                        "Truncated incorrect DECIMAL value: '{}'",
+                        amount_expr.restore_string()
+                    ),
+                ));
+            }
+            return Ok(Datum::Null);
+        }
+        Err(err) => return Err(err),
+    };
+    if amount_value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let Some(amount) = interval_amount_for(unit, &amount_value)? else {
+        return Ok(Datum::Null);
+    };
+    let mut t = match datum_as_time(&base) {
+        Ok(t) => t,
+        Err(err) if err.code == sealdb_errno::ERR_TRUNCATED_WRONG_VALUE => {
+            let text = String::from_utf8_lossy(&base.as_bytes()).into_owned();
+            push_warning(
+                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                format!("Incorrect datetime value: '{text}'"),
+            );
+            return Ok(Datum::Null);
+        }
+        Err(err) => return Err(err),
+    };
+    if let Datum::Time(base_time) = &base {
+        if matches!(base_time.tp, TimeType::Timestamp) {
+            t = utc_to_session_local(t)?;
+        }
+        t.tp = TimeType::Datetime;
+    }
+    add_interval_amount_datum(t, unit, amount, subtract)
+}
+
+/// A parsed interval amount.
+enum IntervalAmount {
+    /// Whole units for the calendar units (YEAR..DAY).
+    Units(i64),
+    /// Total microseconds for SECOND/MICROSECOND, so fractional seconds
+    /// survive (`INTERVAL 1.123456789e3 SECOND`).
+    Micros(i128),
+    /// Composite interval fields (`INTERVAL '2.2' DAY_HOUR` → 2 days 2 hours).
+    Composite {
+        years: i64,
+        months: i64,
+        days: i64,
+        micros: i128,
+    },
+}
+
+impl IntervalAmount {
+    fn negate(self) -> Result<Self> {
+        match self {
+            IntervalAmount::Units(v) => v
+                .checked_neg()
+                .map(IntervalAmount::Units)
+                .ok_or_else(datetime_overflow),
+            IntervalAmount::Micros(v) => v
+                .checked_neg()
+                .map(IntervalAmount::Micros)
+                .ok_or_else(datetime_overflow),
+            IntervalAmount::Composite {
+                years,
+                months,
+                days,
+                micros,
+            } => {
+                let neg = |v: i64| v.checked_neg().ok_or_else(datetime_overflow);
+                Ok(IntervalAmount::Composite {
+                    years: neg(years)?,
+                    months: neg(months)?,
+                    days: neg(days)?,
+                    micros: micros.checked_neg().ok_or_else(datetime_overflow)?,
+                })
+            }
+        }
+    }
+}
+
+/// Leading signed integer of `text`, the way MySQL coerces a string interval
+/// (`"2.9"` → 2, `"1e2"` → 1, `"   1   "` → 1). `None` when no digits follow
+/// the optional sign; the value saturates at `i128` so callers can detect an
+/// out-of-BIGINT amount.
+fn leading_int_prefix(text: &str) -> Option<i128> {
+    let bytes = text.trim_start().as_bytes();
+    let (neg, rest) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    let mut v: i128 = 0;
+    let mut any = false;
+    for b in rest.iter().take_while(|b| b.is_ascii_digit()) {
+        any = true;
+        v = v
+            .saturating_mul(10)
+            .saturating_add(i128::from(b - b'0'));
+    }
+    if !any {
+        return None;
+    }
+    Some(if neg { -v } else { v })
+}
+
+/// Exact microseconds carried by the fractional digits of `text` (the text
+/// form of a numeric literal), rounding half away from zero at the 7th digit.
+fn fraction_micros(text: &str) -> Option<u32> {
+    let frac = text.split_once('.')?.1;
+    let digits: Vec<u8> = frac.bytes().take_while(|b| b.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let mut micro: u32 = 0;
+    for (i, d) in digits.iter().take(6).enumerate() {
+        micro += u32::from(*d - b'0') * 10u32.pow(5 - i as u32);
+    }
+    if digits.len() > 6 && digits[6] >= b'5' {
+        micro = micro.saturating_add(1);
+    }
+    Some(micro.min(999_999))
+}
+
+/// Interval amount → integer units. Numeric values round half away from zero;
+/// strings parse a leading integer and truncate any fraction. A string without
+/// digits warns 1292 (an error under strict DML); an amount beyond BIGINT is
+/// NULL.
+fn interval_amount(d: &Datum) -> Result<Option<i64>> {
+    let rounded = |v: f64| -> Option<i64> {
+        if !v.is_finite() {
+            return None;
+        }
+        let r = v.round();
+        if r < i64::MIN as f64 || r > i64::MAX as f64 {
+            return None;
+        }
+        Some(r as i64)
+    };
+    match d {
+        Datum::I64(v) => Ok(Some(*v)),
+        Datum::Year(v) => Ok(Some(i64::from(*v))),
+        Datum::U64(v) => match i64::try_from(*v) {
+            Ok(v) => Ok(Some(v)),
+            Err(_) if strict_dml() => Err(Error::new(
+                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                format!("Incorrect datetime value: '{v}'"),
+            )),
+            Err(_) => Ok(None),
+        },
+        Datum::F64(v) => Ok(rounded(*v)),
+        Datum::Decimal(d) => match d.with_frac(0).to_i64() {
+            Ok(v) => Ok(Some(v)),
+            Err(_) if strict_dml() => Err(Error::new(
+                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                format!("Truncated incorrect DECIMAL value: '{d}'"),
+            )),
+            Err(_) => Ok(None),
+        },
+        Datum::Bytes(bytes) => {
+            let text = String::from_utf8_lossy(bytes).trim().to_string();
+            if let Some(v) = leading_int_prefix(&text) {
+                if v > i128::from(i64::MAX) || v < i128::from(i64::MIN) {
+                    return Ok(None);
+                }
+                return Ok(Some(v as i64));
+            }
+            if strict_dml() {
+                return Err(Error::new(
+                    sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                    format!("Truncated incorrect DECIMAL value: '{text}'"),
+                ));
+            }
+            push_warning(
+                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                format!("Truncated incorrect DECIMAL value: '{text}'"),
+            );
+            Ok(Some(0))
+        }
+        other => Ok(Some(other.as_i64()?)),
+    }
+}
+
+/// Interval amount for SECOND/MICROSECOND as total microseconds. Numeric
+/// values round half away from zero at microsecond precision; strings keep the
+/// MySQL leading-integer coercion.
+fn interval_micros(d: &Datum, scale: i128, string_is_number: bool) -> Result<Option<i128>> {
+    let scaled = |v: i64| i128::from(v) * scale;
+    let rounded = |v: f64| -> Option<i128> {
+        if !v.is_finite() {
+            return None;
+        }
+        let r = (v * scale as f64).round();
+        if r < i64::MIN as f64 || r > i64::MAX as f64 {
+            return None;
+        }
+        Some(r as i128)
+    };
+    match d {
+        Datum::F64(v) => Ok(rounded(*v)),
+        Datum::Decimal(d) => Ok(rounded(d.to_f64()?)),
+        // Strings reaching a second/microsecond interval go through the full
+        // numeric prefix (`"2.9"` → 2.9 s, `"1e2"` → 100 s), which is what
+        // TiDB's duration parser does for these units.
+        Datum::Bytes(bytes) if !string_is_number => Ok(interval_amount(d)?.map(scaled)),
+        Datum::Bytes(bytes) => {
+            let text = String::from_utf8_lossy(bytes).trim().to_string();
+            if !text.bytes().any(|b| b.is_ascii_digit()) {
+                if strict_dml() {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                        format!("Truncated incorrect DECIMAL value: '{text}'"),
+                    ));
+                }
+                return Ok(Some(0));
+            }
+            if let Some(int_part) = leading_int_prefix(&text)
+                && (int_part > i128::from(i64::MAX) || int_part < i128::from(i64::MIN))
+            {
+                return Ok(None);
+            }
+            // String amounts truncate toward zero (`"2.9"` micro → 2).
+            let scaled = sealdb_types::datum::mysql_numeric_prefix(&text) * scale as f64;
+            let truncated = scaled.trunc();
+            if !truncated.is_finite()
+                || truncated < i64::MIN as f64
+                || truncated > i64::MAX as f64
+            {
+                return Ok(None);
+            }
+            Ok(Some(truncated as i128))
+        }
+        // Integers keep the integer coercion.
+        other => Ok(interval_amount(other)?.map(scaled)),
+    }
+}
+
+/// Field indexes into `[year, month, day, hour, minute, second, microsecond]`.
+const INTERVAL_FIELD_MICROSECOND: usize = 6;
+
+/// `(least significant field, maximum field count)` for MySQL composite
+/// interval units (`SECOND_MICROSECOND`, `DAY_HOUR`, …).
+fn composite_interval_layout(unit: &str) -> Option<(usize, usize)> {
+    let layout = match unit {
+        "SECOND_MICROSECOND" => (INTERVAL_FIELD_MICROSECOND, 2),
+        "MINUTE_MICROSECOND" => (INTERVAL_FIELD_MICROSECOND, 3),
+        "MINUTE_SECOND" => (5, 2),
+        "HOUR_MICROSECOND" => (INTERVAL_FIELD_MICROSECOND, 4),
+        "HOUR_SECOND" => (5, 3),
+        "HOUR_MINUTE" => (4, 2),
+        "DAY_MICROSECOND" => (INTERVAL_FIELD_MICROSECOND, 5),
+        "DAY_SECOND" => (5, 4),
+        "DAY_MINUTE" => (4, 3),
+        "DAY_HOUR" => (3, 2),
+        "YEAR_MONTH" => (1, 2),
+        _ => return None,
+    };
+    Some(layout)
+}
+
+/// TiDB `parseTimeValue`: split `text` into digit runs and fill the unit's
+/// fields right to left (`"2.2" HOUR_MINUTE` → 2 hours 2 minutes). The
+/// microsecond field is a fraction padded right to six digits (`"2"` →
+/// 200000 µs), which is why `INTERVAL -2 SECOND_MICROSECOND` subtracts 0.2 s.
+fn parse_composite_interval(
+    unit: &str,
+    text: &str,
+) -> Result<Option<(i64, i64, i64, i128)>> {
+    let Some((start, max_fields)) = composite_interval_layout(unit) else {
+        return Ok(None);
+    };
+    let trimmed = text.trim();
+    let (neg, body) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let mut runs: Vec<&str> = Vec::new();
+    let mut begin: Option<usize> = None;
+    for (i, b) in body.bytes().enumerate() {
+        if b.is_ascii_digit() {
+            begin.get_or_insert(i);
+        } else if let Some(s) = begin.take() {
+            runs.push(&body[s..i]);
+        }
+    }
+    if let Some(s) = begin {
+        runs.push(&body[s..]);
+    }
+    let bad_value = || {
+        Error::new(
+            sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+            format!("Incorrect datetime value: '{trimmed}'"),
+        )
+    };
+    if runs.len() > max_fields {
+        if strict_dml() {
+            return Err(bad_value());
+        }
+        push_warning(
+            sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+            format!("Incorrect datetime value: '{trimmed}'"),
+        );
+        return Ok(Some((0, 0, 0, 0)));
+    }
+    let mut fields: [&str; 7] = ["0"; 7];
+    let mut index = start;
+    for run in runs.iter().rev() {
+        fields[index] = run;
+        if index == 0 {
+            break;
+        }
+        index -= 1;
+    }
+    let parse_field = |digits: &str| -> Result<i64> {
+        match digits.parse::<i64>() {
+            Ok(v) => Ok(v),
+            Err(_) if strict_dml() => Err(bad_value()),
+            Err(_) => {
+                push_warning(
+                    sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                    format!("Incorrect datetime value: '{trimmed}'"),
+                );
+                Ok(0)
+            }
+        }
+    };
+    let years = parse_field(fields[0])?;
+    let months = parse_field(fields[1])?;
+    let days = parse_field(fields[2])?;
+    let hours = parse_field(fields[3])?;
+    let minutes = parse_field(fields[4])?;
+    let seconds = parse_field(fields[5])?;
+    // The microsecond field is a fraction string; the leading digits are the
+    // most significant ones.
+    let micro_digits = fields[INTERVAL_FIELD_MICROSECOND].as_bytes();
+    let taken = micro_digits.len().min(6);
+    let mut micro: i128 = 0;
+    for d in &micro_digits[..taken] {
+        micro = micro * 10 + i128::from(d - b'0');
+    }
+    micro *= 10i128.pow((6 - taken) as u32);
+    let truncated = |v: i128| -> i64 {
+        i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
+    };
+    let to_days: i128 = i128::from(hours) * 3600 + i128::from(minutes) * 60 + i128::from(seconds);
+    let day_part = days as i128 + to_days / 86_400;
+    let second_part = to_days % 86_400;
+    let micros = second_part * 1_000_000 + micro;
+    let sign = if neg { -1 } else { 1 };
+    Ok(Some((
+        truncated(i128::from(years) * sign),
+        truncated(i128::from(months) * sign),
+        truncated(day_part * sign),
+        micros * sign,
+    )))
+}
+
+/// Unit-aware interval amount: seconds keep their fractional part, the
+/// calendar units take whole numbers.
+fn interval_amount_for(unit: &str, d: &Datum) -> Result<Option<IntervalAmount>> {
+    if composite_interval_layout(unit).is_some() {
+        let text = String::from_utf8_lossy(&d.as_bytes()).into_owned();
+        let Some((years, months, days, micros)) = parse_composite_interval(unit, &text)? else {
+            return Ok(None);
+        };
+        return Ok(Some(IntervalAmount::Composite {
+            years,
+            months,
+            days,
+            micros,
+        }));
+    }
+    let (scale, string_is_number) = match unit {
+        "SECOND" | "SECONDS" => (1_000_000, true),
+        "MICROSECOND" | "MICROSECONDS" => (1, false),
+        _ => {
+            let amount = interval_amount(d)?.map(IntervalAmount::Units);
+            if amount.is_none() {
+                push_warning(
+                    sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW,
+                    "Datetime function: datetime field overflow",
+                );
+            }
+            return Ok(amount);
+        }
+    };
+    let amount = interval_micros(d, scale, string_is_number)?.map(IntervalAmount::Micros);
+    if amount.is_none() {
+        push_warning(
+            sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW,
+            "Datetime function: datetime field overflow",
+        );
+    }
+    Ok(amount)
+}
+
 fn add_interval(mut t: Time, unit: &str, amount: i64, subtract: bool) -> Result<Time> {
-    let amount = if subtract { -amount } else { amount };
+    let amount = if subtract {
+        amount.checked_neg().ok_or_else(datetime_overflow)?
+    } else {
+        amount
+    };
     match unit {
         "HOUR" | "HOURS" => {
-            let total = i64::from(t.hour) + amount;
+            let total = i64::from(t.hour).saturating_add(amount);
             let days = total.div_euclid(24);
             t.hour = total.rem_euclid(24) as u16;
             if days != 0 {
@@ -2997,40 +4423,49 @@ fn add_interval(mut t: Time, unit: &str, amount: i64, subtract: bool) -> Result<
             }
         }
         "MINUTE" | "MINUTES" => {
-            let total = i64::from(t.minute) + amount;
+            let total = i64::from(t.minute).saturating_add(amount);
             let hours = total.div_euclid(60);
             t.minute = total.rem_euclid(60) as u8;
             return add_interval(t, "HOUR", hours, false);
         }
         "SECOND" | "SECONDS" => {
-            let total = i64::from(t.second) + amount;
+            let total = i64::from(t.second).saturating_add(amount);
             let mins = total.div_euclid(60);
             t.second = total.rem_euclid(60) as u8;
             return add_interval(t, "MINUTE", mins, false);
         }
         "MICROSECOND" | "MICROSECONDS" => {
-            let total = i64::from(t.micro) + amount;
+            let total = i64::from(t.micro).saturating_add(amount);
             let secs = total.div_euclid(1_000_000);
             t.micro = total.rem_euclid(1_000_000) as u32;
             t.fsp = t.fsp.max(6);
             return add_interval(t, "SECOND", secs, false);
         }
+        "WEEK" | "WEEKS" => {
+            let days = amount.checked_mul(7).ok_or_else(datetime_overflow)?;
+            add_days(&mut t, days)?;
+        }
+        "QUARTER" | "QUARTERS" => {
+            let months = amount.checked_mul(3).ok_or_else(datetime_overflow)?;
+            return add_interval(t, "MONTH", months, false);
+        }
         "DAY" | "DAYS" => add_days(&mut t, amount)?,
         "YEAR" | "YEARS" => {
-            let total = i64::from(t.year) + amount;
+            let total = i64::from(t.year).saturating_add(amount);
             if !(1..=9999).contains(&total) {
-                return Ok(zero_datetime());
+                return Err(datetime_overflow());
             }
             t.year = total as u16;
             clamp_day(&mut t);
         }
         "MONTH" | "MONTHS" => {
-            let total = (i64::from(t.year) * 12 + i64::from(t.month) - 1) + amount;
-            if total < 0 {
-                return Ok(zero_datetime());
+            let total = (i64::from(t.year) * 12 + i64::from(t.month) - 1).saturating_add(amount);
+            let year = total.div_euclid(12);
+            if !(1..=9999).contains(&year) {
+                return Err(datetime_overflow());
             }
-            t.year = (total / 12) as u16;
-            t.month = (total % 12 + 1) as u8;
+            t.year = year as u16;
+            t.month = (total.rem_euclid(12) + 1) as u8;
             clamp_day(&mut t);
         }
         other => {
@@ -3042,29 +4477,12 @@ fn add_interval(mut t: Time, unit: &str, amount: i64, subtract: bool) -> Result<
 }
 
 fn add_days(t: &mut Time, days: i64) -> Result<()> {
-    // Naive civil-day arithmetic (good enough for suite dates).
-    let mut y = t.year as i32;
-    let mut m = t.month as i32;
-    let mut d = t.day as i32 + days as i32;
-    while d <= 0 {
-        m -= 1;
-        if m <= 0 {
-            m = 12;
-            y -= 1;
-        }
-        d += days_in_month_i(y, m);
-    }
-    loop {
-        let dim = days_in_month_i(y, m);
-        if d <= dim {
-            break;
-        }
-        d -= dim;
-        m += 1;
-        if m > 12 {
-            m = 1;
-            y += 1;
-        }
+    // Exact civil-date arithmetic so negative rollovers stay correct and huge
+    // intervals cannot overflow (unlike a naive day-by-day loop).
+    let epoch = days_from_civil(t.year, t.month, t.day);
+    let (y, m, d) = civil_from_days(epoch.saturating_add(days));
+    if !(1..=9999).contains(&y) {
+        return Err(datetime_overflow());
     }
     t.year = y as u16;
     t.month = m as u8;
@@ -3072,19 +4490,108 @@ fn add_days(t: &mut Time, days: i64) -> Result<()> {
     Ok(())
 }
 
-fn zero_datetime() -> Time {
-    Time {
-        year: 0,
-        month: 0,
-        day: 0,
-        hour: 0,
-        minute: 0,
-        second: 0,
-        micro: 0,
-        fsp: 0,
-        neg: false,
-        tp: TimeType::Datetime,
+/// Proleptic Gregorian civil date for a day count since 1970-01-01.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z.saturating_add(719_468);
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn datetime_overflow() -> Error {
+    Error::new(
+        sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW,
+        "Datetime function: datetime field overflow",
+    )
+}
+
+/// Add a signed microsecond count to `t` exactly, rolling whole days over
+/// through the civil-date helper.
+fn add_micros(mut t: Time, micros: i128) -> Result<Time> {
+    const DAY_MICROS: i128 = 86_400_000_000;
+    let base = (i128::from(t.hour) * 3600
+        + i128::from(t.minute) * 60
+        + i128::from(t.second))
+        * 1_000_000
+        + i128::from(t.micro);
+    let total = base + micros;
+    let days = total.div_euclid(DAY_MICROS);
+    let rem = total.rem_euclid(DAY_MICROS);
+    if days != 0 {
+        let days = i64::try_from(days).map_err(|_| datetime_overflow())?;
+        add_days(&mut t, days)?;
     }
+    t.hour = (rem / 3_600_000_000) as u16;
+    t.minute = (rem / 60_000_000 % 60) as u8;
+    t.second = (rem / 1_000_000 % 60) as u8;
+    t.micro = (rem % 1_000_000) as u32;
+    // A zero fraction prints without the fractional part, matching TiDB.
+    t.fsp = if t.micro == 0 { 0 } else { 6 };
+    check_dst_transition(&t)?;
+    Ok(t)
+}
+
+/// Add a parsed interval amount, mapping an out-of-range result to NULL with a
+/// 1441 warning (or the error itself under strict DML).
+fn add_interval_amount_datum(
+    t: Time,
+    unit: &str,
+    amount: IntervalAmount,
+    subtract: bool,
+) -> Result<Datum> {
+    let amount = if subtract { amount.negate()? } else { amount };
+    let result = match amount {
+        IntervalAmount::Units(v) => add_interval(t, unit, v, false),
+        IntervalAmount::Micros(v) => add_micros(t, v),
+        IntervalAmount::Composite {
+            years,
+            months,
+            days,
+            micros,
+        } => add_composite_interval(t, years, months, days, micros),
+    };
+    match result {
+        Ok(t) => Ok(Datum::Time(t)),
+        Err(err)
+            if err.code == sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW && !strict_dml() =>
+        {
+            push_warning(
+                sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW,
+                "Datetime function: datetime field overflow",
+            );
+            Ok(Datum::Null)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Apply a composite interval the way TiDB's `addDate` does: fractional
+/// seconds first, then years+months together (one day clamp), then days.
+fn add_composite_interval(
+    t: Time,
+    years: i64,
+    months: i64,
+    days: i64,
+    micros: i128,
+) -> Result<Time> {
+    let mut t = add_micros(t, micros)?;
+    let months = years
+        .checked_mul(12)
+        .and_then(|m| m.checked_add(months))
+        .ok_or_else(datetime_overflow)?;
+    if months != 0 {
+        t = add_interval(t, "MONTH", months, false)?;
+    }
+    if days != 0 {
+        t = add_interval(t, "DAY", days, false)?;
+    }
+    Ok(t)
 }
 
 fn clamp_day(t: &mut Time) {
@@ -3150,11 +4657,19 @@ fn eval_date_add_sub(
     if base.is_null() {
         return Ok(Datum::Null);
     }
-    let amount = eval_expr_with_row(&func.args[amount_index], schema, row)?.as_i64()?;
+    let amount_value = eval_expr_with_row(&func.args[amount_index], schema, row)?;
+    if amount_value.is_null() {
+        return Ok(Datum::Null);
+    }
     let unit = if days_form {
         "DAY".to_string()
     } else {
         unit_name(&eval_expr_with_row(&func.args[2], schema, row)?)?
+    };
+    // An interval amount outside BIGINT range yields NULL (EvalInt overflow),
+    // e.g. `INTERVAL 9223372036854775808 day`.
+    let Some(amount) = interval_amount_for(&unit, &amount_value)? else {
+        return Ok(Datum::Null);
     };
     // An unparsable datetime argument warns 1292 and yields NULL (TiDB
     // `builtinDateArithmeticSig` on a bad string), it does not fail the query.
@@ -3179,10 +4694,8 @@ fn eval_date_add_sub(
         // DATE_ADD always returns DATETIME (no DST reject).
         t.tp = TimeType::Datetime;
     }
-    let t = add_interval(t, &unit, amount, subtract)?;
-    Ok(Datum::Time(t))
+    add_interval_amount_datum(t, &unit, amount, subtract)
 }
-
 fn eval_timestamp_add(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     if func.args.len() != 3 {
         return Err(Error::new(
@@ -3191,7 +4704,13 @@ fn eval_timestamp_add(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> 
         ));
     }
     let unit = unit_name(&eval_expr_with_row(&func.args[0], schema, row)?)?;
-    let amount = eval_expr_with_row(&func.args[1], schema, row)?.as_i64()?;
+    let amount_value = eval_expr_with_row(&func.args[1], schema, row)?;
+    if amount_value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let Some(amount) = interval_amount_for(&unit, &amount_value)? else {
+        return Ok(Datum::Null);
+    };
     let base = eval_expr_with_row(&func.args[2], schema, row)?;
     if base.is_null() {
         return Ok(Datum::Null);
@@ -3204,9 +4723,17 @@ fn eval_timestamp_add(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> 
     {
         t = utc_to_session_local(t)?;
         t.tp = TimeType::Timestamp;
+    } else {
+        // TIMESTAMPADD yields a DATETIME even for a DATE argument.
+        t.tp = TimeType::Datetime;
     }
-    let t = add_interval(t, &unit, amount, false)?;
-    Ok(Datum::Time(t))
+    match add_interval_amount_datum(t, &unit, amount, false)? {
+        Datum::Time(mut out) => {
+            out.fsp = if out.micro == 0 { 0 } else { 6 };
+            Ok(Datum::Time(out))
+        }
+        other => Ok(other),
+    }
 }
 
 /// Minutes east of UTC for a session time zone value. `SYSTEM` resolves to the
@@ -3444,6 +4971,192 @@ fn shift_minutes(t: &mut Time, minutes: i64) -> Result<()> {
 }
 
 /// `TIMEDIFF(expr1, expr2)`: `expr1 - expr2` as a signed `TIME` value.
+/// `ADDTIME(expr1, expr2)` / `SUBTIME(expr1, expr2)`: add or subtract a
+/// day-time value (`[sign]D HH:MM:SS[.frac]`) from a DATE/DATETIME/TIME value.
+fn eval_add_sub_time(
+    func: &FuncCallExpr,
+    schema: &[String],
+    row: &[Datum],
+    subtract: bool,
+) -> Result<Datum> {
+    if func.args.len() != 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "ADDTIME/SUBTIME requires 2 arguments",
+        ));
+    }
+    let base = eval_expr_with_row(&func.args[0], schema, row)?;
+    let delta = eval_expr_with_row(&func.args[1], schema, row)?;
+    if base.is_null() || delta.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut t = match datum_as_time(&base) {
+        Ok(t) => t,
+        Err(err) if err.code == sealdb_errno::ERR_TRUNCATED_WRONG_VALUE => {
+            push_warning(
+                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                format!(
+                    "Incorrect datetime value: '{}'",
+                    String::from_utf8_lossy(&base.as_bytes())
+                ),
+            );
+            return Ok(Datum::Null);
+        }
+        Err(err) => return Err(err),
+    };
+    let Some(duration) = duration_micros(&delta) else {
+        push_warning(
+            sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+            format!(
+                "Incorrect time value: '{}'",
+                String::from_utf8_lossy(&delta.as_bytes())
+            ),
+        );
+        return Ok(Datum::Null);
+    };
+    let signed = if subtract { -duration } else { duration };
+    if matches!(t.tp, TimeType::Time) {
+        return Ok(add_time_micros(t, signed));
+    }
+    // MySQL normalises the zero month/day of a partial date (`2024-0-1` is
+    // 2023-12-01, `2024-1-0` is 2023-12-31) before the arithmetic.
+    if t.month == 0 || t.day == 0 {
+        if !normalize_zero_date(&mut t) {
+            return Ok(Datum::Null);
+        }
+    }
+    t.tp = TimeType::Datetime;
+    match add_micros(t, signed) {
+        Ok(t) => Ok(Datum::Time(t)),
+        Err(err)
+            if err.code == sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW && !strict_dml() =>
+        {
+            push_warning(
+                sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW,
+                "Datetime function: datetime field overflow",
+            );
+            Ok(Datum::Null)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Normalise a zero month/day by walking back through the calendar. `false`
+/// when the result would fall before year 1.
+fn normalize_zero_date(t: &mut Time) -> bool {
+    if t.month == 0 {
+        t.month = 12;
+        if t.year == 0 {
+            return false;
+        }
+        t.year -= 1;
+    }
+    if t.day == 0 {
+        if t.month == 1 {
+            t.month = 12;
+            if t.year == 0 {
+                return false;
+            }
+            t.year -= 1;
+        } else {
+            t.month -= 1;
+        }
+        t.day = days_in_month_i(i32::from(t.year), i32::from(t.month)) as u8;
+    }
+    t.year >= 1
+}
+
+/// Total microseconds of a day-time value (`1 12:00:01.341300`,
+/// `-12:00:01.000001`, a TIME datum, …). `None` when the text is not a
+/// day-time value.
+fn duration_micros(d: &Datum) -> Option<i128> {
+    match d {
+        Datum::Time(t) => {
+            let micros = (i128::from(t.hour) * 3600
+                + i128::from(t.minute) * 60
+                + i128::from(t.second))
+                * 1_000_000
+                + i128::from(t.micro);
+            Some(if t.neg { -micros } else { micros })
+        }
+        Datum::Bytes(bytes) => parse_duration_micros(&String::from_utf8_lossy(bytes)),
+        other => other.as_i64().ok().map(|s| i128::from(s) * 1_000_000),
+    }
+}
+
+fn parse_duration_micros(text: &str) -> Option<i128> {
+    let mut text = text.trim();
+    let mut neg = false;
+    if let Some(rest) = text.strip_prefix('-') {
+        neg = true;
+        text = rest.trim_start();
+    } else if let Some(rest) = text.strip_prefix('+') {
+        text = rest.trim_start();
+    }
+    let (days, clock) = match text.split_once(char::is_whitespace) {
+        Some((days, clock)) => (days.trim().parse::<i128>().ok()?, clock.trim()),
+        None => (0, text),
+    };
+    let mut parts = clock.splitn(3, ':');
+    let hour: i128 = parts.next()?.trim().parse().ok()?;
+    let minute: i128 = parts.next()?.trim().parse().ok()?;
+    let (second, micro) = match parts.next() {
+        Some(sec) => {
+            let sec = sec.trim();
+            let (sec, frac) = match sec.split_once('.') {
+                Some((sec, frac)) => (sec, Some(frac)),
+                None => (sec, None),
+            };
+            let micro = match frac {
+                Some(frac) => {
+                    let digits: String = frac
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if digits.is_empty() {
+                        0
+                    } else {
+                        format!("{digits:0<6}")[..6].parse().unwrap_or(0)
+                    }
+                }
+                None => 0,
+            };
+            (sec.parse::<i128>().ok()?, micro)
+        }
+        None => (0, 0),
+    };
+    let total = ((days * 86_400 + hour * 3600 + minute * 60 + second) * 1_000_000)
+        + i128::from(micro);
+    Some(if neg { -total } else { total })
+}
+
+/// Add microseconds to a TIME value, keeping it inside MySQL's
+/// `-838:59:59.999999 ..= 838:59:59.999999` range (NULL outside it).
+fn add_time_micros(t: Time, micros: i128) -> Datum {
+    const LIMIT: i128 = 838 * 3_600_000_000 + 59 * 60_000_000 + 59_999_999;
+    let base = (i128::from(t.hour) * 3600
+        + i128::from(t.minute) * 60
+        + i128::from(t.second))
+        * 1_000_000
+        + i128::from(t.micro);
+    let total = (if t.neg { -base } else { base }) + micros;
+    if total.abs() > LIMIT {
+        return Datum::Null;
+    }
+    let neg = total < 0;
+    let abs = total.abs();
+    Datum::Time(Time {
+        hour: (abs / 3_600_000_000) as u16,
+        minute: (abs / 60_000_000 % 60) as u8,
+        second: (abs / 1_000_000 % 60) as u8,
+        micro: (abs % 1_000_000) as u32,
+        neg,
+        fsp: if abs % 1_000_000 == 0 { 0 } else { 6 },
+        tp: TimeType::Time,
+        ..t
+    })
+}
+
 fn eval_time_diff(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     if func.args.len() != 2 {
         return Err(Error::new(
@@ -4294,7 +6007,7 @@ fn is_decimal_arith(left: &Datum, right: &Datum) -> bool {
     let exact_operand = |d: &Datum| {
         matches!(
             d,
-            Datum::Decimal(_) | Datum::I64(_) | Datum::U64(_) | Datum::Year(_)
+            Datum::Decimal(_) | Datum::I64(_) | Datum::U64(_) | Datum::Year(_) | Datum::Enum(_)
         )
     };
     // A DOUBLE, string, bit or temporal operand makes MySQL compute in real.
@@ -4310,6 +6023,7 @@ fn decimal_of(d: &Datum) -> Result<MyDecimal> {
         Datum::I64(v) => Ok(MyDecimal::from_i64(*v)),
         Datum::U64(v) => Ok(MyDecimal::from_i64(*v as i64)),
         Datum::Year(v) => Ok(MyDecimal::from_i64(i64::from(*v))),
+        Datum::Enum(e) => Ok(MyDecimal::from_i64(e.number as i64)),
         other => MyDecimal::parse(&format!("{}", other.as_f64()?)),
     }
 }
@@ -4434,6 +6148,8 @@ fn datum_decimal_label(d: &Datum) -> String {
     match d {
         Datum::I64(v) => v.to_string(),
         Datum::U64(v) => v.to_string(),
+        Datum::F64(v) => go_float_label(*v),
+        Datum::Decimal(d) => d.to_string(),
         other => other
             .as_i64()
             .map(|v| v.to_string())
@@ -4441,7 +6157,9 @@ fn datum_decimal_label(d: &Datum) -> String {
     }
 }
 
-fn minus_operand_label(expr: &ExprNode, value: &Datum) -> String {
+/// Operand text for an arithmetic range error: a column reference gets its
+/// qualified name, everything else its literal value.
+fn decimal_operand_label(expr: &ExprNode, value: &Datum) -> String {
     match expr {
         ExprNode::Column(_) => expr_overflow_label(expr),
         _ => datum_decimal_label(value),
@@ -4469,6 +6187,182 @@ fn datum_as_u64(d: &Datum) -> Result<u64> {
     }
 }
 
+/// Every integer-valued `Datum` (`Year` included) takes the exact integer
+/// arithmetic path; anything else (DOUBLE, string, temporal) keeps the older
+/// `num_bin` coercion.
+fn is_plain_int(d: &Datum) -> bool {
+    matches!(d, Datum::I64(_) | Datum::U64(_) | Datum::Year(_))
+}
+
+/// TiDB's 1690 for a signed BIGINT overflow, labelled the way MySQL prints the
+/// operands (`BIGINT value is out of range in '(1234567890 * 12345671890)'`).
+fn bigint_range_error(
+    left_expr: &ExprNode,
+    left: &Datum,
+    op: char,
+    right_expr: &ExprNode,
+    right: &Datum,
+) -> Error {
+    Error::new(
+        ERR_DATA_OUT_OF_RANGE,
+        format!(
+            "BIGINT value is out of range in '({} {op} {})'",
+            decimal_operand_label(left_expr, left),
+            decimal_operand_label(right_expr, right)
+        ),
+    )
+}
+
+/// Go's shortest `%v` float formatting, which TiDB puts in error messages
+/// (`1e+06`, `1.7976931348623157e+308`; plain digits below 1e6).
+fn go_float_label(v: f64) -> String {
+    if v == 0.0 {
+        return if v.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
+    }
+    if !v.is_finite() {
+        return format!("{v}");
+    }
+    let sci = format!("{v:e}");
+    let (mantissa, exponent) = match sci.split_once('e') {
+        Some(parts) => parts,
+        None => return sci,
+    };
+    let exp: i32 = exponent.parse().unwrap_or(0);
+    // Go's `%v` (shortest 'g') switches to exponent form outside [1e-4, 1e6).
+    if !(-4..6).contains(&exp) {
+        return format!(
+            "{mantissa}e{}{:02}",
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        );
+    }
+    format!("{v}")
+}
+
+/// Numeric coercion for the math builtins: strings take their numeric prefix
+/// (`sin('abcd')` is `0` with a 1292 warning, not an error) and temporals their
+/// MySQL numeric form.
+fn real_arg(d: &Datum) -> Result<f64> {
+    match d {
+        Datum::Bytes(b) => Ok(sealdb_types::datum::mysql_numeric_prefix(
+            &String::from_utf8_lossy(b),
+        )),
+        Datum::Time(t) if matches!(t.tp, TimeType::Timestamp) => {
+            Ok(utc_to_session_local(*t)?.to_number() as f64)
+        }
+        Datum::Time(t) => Ok(t.to_number() as f64),
+        other => other.as_f64(),
+    }
+}
+
+/// TiDB's 1690 for a DOUBLE result out of range, labelled the way MySQL prints
+/// the call (`exp(1e+06)`, `cot(expression__builtin.t.a)`).
+fn double_range_error(func: &FuncCallExpr, values: &[Datum]) -> Error {
+    let args: Vec<String> = func
+        .args
+        .iter()
+        .zip(values)
+        .map(|(expr, value)| decimal_operand_label(expr, value))
+        .collect();
+    Error::new(
+        ERR_DATA_OUT_OF_RANGE,
+        format!(
+            "DOUBLE value is out of range in '{}({})'",
+            func.name.to_ascii_lowercase(),
+            args.join(", ")
+        ),
+    )
+}
+
+/// `FLOOR` / `CEIL` on a DECIMAL: clear the fraction toward -inf / +inf and
+/// keep the DECIMAL form so values past 2^63 stay exact.
+fn decimal_round_to_int(decimal: &MyDecimal, up: bool) -> Result<Datum> {
+    let text = decimal.to_string();
+    let (sign, body) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.as_str()),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((int, frac)) => (int, frac),
+        None => (body, ""),
+    };
+    let has_frac = frac_part.bytes().any(|b| b != b'0');
+    let int_part = if int_part.is_empty() { "0" } else { int_part };
+    let magnitude = if !has_frac {
+        int_part.to_string()
+    } else if up {
+        if sign == "-" {
+            // -1.5 → -1
+            int_part.to_string()
+        } else {
+            increment_digits(int_part)
+        }
+    } else if sign == "-" {
+        // -1.5 → -2
+        increment_digits(int_part)
+    } else {
+        int_part.to_string()
+    };
+    let out = format!("{sign}{magnitude}");
+    MyDecimal::parse(&out).map(Datum::Decimal)
+}
+
+/// `"123"` → `"124"` (decimal digit increment with carry).
+fn increment_digits(digits: &str) -> String {
+    let mut out: Vec<u8> = digits.bytes().collect();
+    let mut i = out.len();
+    while i > 0 {
+        i -= 1;
+        if out[i] == b'9' {
+            out[i] = b'0';
+        } else {
+            out[i] += 1;
+            return String::from_utf8(out).unwrap_or_else(|_| "0".to_string());
+        }
+    }
+    let mut s = String::from("1");
+    s.push_str(&String::from_utf8(out).unwrap_or_default());
+    s
+}
+
+/// Unsigned `+` (either operand UNSIGNED): MySQL wraps a negative signed
+/// operand into the unsigned domain and reports 1690 past `2^64-1`.
+fn unsigned_plus(
+    left_expr: &ExprNode,
+    left: &Datum,
+    right_expr: &ExprNode,
+    right: &Datum,
+) -> Result<Datum> {
+    let l = datum_as_u64_wrapping(left)?;
+    let r = datum_as_u64_wrapping(right)?;
+    match l.checked_add(r) {
+        Some(v) => Ok(Datum::U64(v)),
+        None => Err(Error::new(
+            ERR_DATA_OUT_OF_RANGE,
+            format!(
+                "BIGINT UNSIGNED value is out of range in '({} + {})'",
+                decimal_operand_label(left_expr, left),
+                decimal_operand_label(right_expr, right)
+            ),
+        )),
+    }
+}
+
+/// Signed→unsigned coercion used by MySQL's unsigned arithmetic: a negative
+/// value keeps its two's-complement bit pattern.
+fn datum_as_u64_wrapping(d: &Datum) -> Result<u64> {
+    match d {
+        Datum::U64(v) => Ok(*v),
+        Datum::I64(v) => Ok(*v as u64),
+        Datum::Year(v) => Ok(*v as u64),
+        other => Ok(other.as_i64()? as u64),
+    }
+}
+
 fn unsigned_minus(
     left_expr: &ExprNode,
     left: &Datum,
@@ -4481,8 +6375,8 @@ fn unsigned_minus(
         // TiDB labels column refs (`cte.t1.c1`) and literal values (`1`).
         let label = format!(
             "({} - {})",
-            minus_operand_label(left_expr, left),
-            minus_operand_label(right_expr, right)
+            decimal_operand_label(left_expr, left),
+            decimal_operand_label(right_expr, right)
         );
         return Err(Error::new(
             ERR_DATA_OUT_OF_RANGE,
@@ -4549,7 +6443,11 @@ mod tests {
     #[test]
     fn test_f01_arithmetic_compare_logic_cast_if() {
         assert_eq!(eval_sql_expr("1 + 2"), Datum::I64(3));
-        assert_eq!(eval_sql_expr("6 / 2"), Datum::I64(3));
+        // MySQL/TiDB `/` is exact DECIMAL division: `6/2` is `3.0000`.
+        assert_eq!(
+            eval_sql_expr("6 / 2"),
+            Datum::Decimal(sealdb_types::mydecimal::MyDecimal::parse("3.0000").unwrap())
+        );
         assert_eq!(eval_sql_expr("1 = 1"), Datum::I64(1));
         assert_eq!(eval_sql_expr("1 < 2"), Datum::I64(1));
         assert_eq!(eval_sql_expr("1 AND 0"), Datum::I64(0));

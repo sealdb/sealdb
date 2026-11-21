@@ -3,13 +3,15 @@
 // Completeness wave / not this feature: generated columns, nested subpartition storage,
 // multi-schema-state jobs.
 use crate::create_table::{
-    field_type_from_name, is_temporal_type, normalize_default, referenced_by_foreign_key,
-    references_identifier, requote_default, ttl_column_name, validate_default_fsp,
-    validate_default_literal, validate_display_width, validate_generated_auto_increment,
-    validate_generated_column_refs, validate_generated_expr,
+    affinity_setting, field_type_from_name, is_temporal_type, normalize_default,
+    referenced_by_foreign_key, references_identifier, requote_default, ttl_column_name,
+    validate_default_fsp, validate_default_literal, validate_display_width,
+    validate_generated_auto_increment, validate_generated_column_refs, validate_generated_expr,
 };
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
-use crate::partition::{add_partitions, drop_partitions, exchange_partition, repartition};
+use crate::partition::{
+    add_partitions, drop_partitions, exchange_partition, repartition, truncate_partitions,
+};
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_CANT_DROP_FIELD_OR_KEY,
@@ -195,15 +197,39 @@ pub fn alter_table(
                 alter_cache(meta, &snapshot, stmt, *cached, current_db)?
             }
             AlterTableSpec::AddPartition { defs } => {
+                check_affinity_partition_op(
+                    &snapshot,
+                    &stmt.table,
+                    current_db,
+                    "Unsupported ADD PARTITION of a table with AFFINITY option",
+                )?;
                 add_partitions(meta, &snapshot, &stmt.table, defs, current_db)?;
             }
             AlterTableSpec::Repartition(option) => {
+                check_affinity_partition_op(
+                    &snapshot,
+                    &stmt.table,
+                    current_db,
+                    "Unsupported ALTER TABLE PARTITIONING of a table with AFFINITY option",
+                )?;
                 repartition(meta, &snapshot, &stmt.table, option, current_db, storage)?;
             }
             AlterTableSpec::ExchangePartition {
                 partition,
                 table: with_table,
             } => {
+                check_affinity_partition_op(
+                    &snapshot,
+                    &stmt.table,
+                    current_db,
+                    "Unsupported EXCHANGE PARTITION of a table with AFFINITY option",
+                )?;
+                check_affinity_partition_op(
+                    &snapshot,
+                    with_table,
+                    current_db,
+                    "Unsupported EXCHANGE PARTITION of a table with AFFINITY option",
+                )?;
                 exchange_partition(
                     meta,
                     &snapshot,
@@ -214,6 +240,12 @@ pub fn alter_table(
                 )?;
             }
             AlterTableSpec::DropPartition { if_exists, names } => {
+                check_affinity_partition_op(
+                    &snapshot,
+                    &stmt.table,
+                    current_db,
+                    "Unsupported DROP PARTITION of a table with AFFINITY option",
+                )?;
                 drop_partitions(
                     meta,
                     &snapshot,
@@ -223,6 +255,9 @@ pub fn alter_table(
                     current_db,
                     storage,
                 )?;
+            }
+            AlterTableSpec::TruncatePartition { names } => {
+                truncate_partitions(&snapshot, &stmt.table, names, current_db, storage)?;
             }
             AlterTableSpec::SetTtl {
                 expr,
@@ -251,6 +286,36 @@ pub fn alter_table(
                 info.ttl = None;
                 meta.update_table(db.id, &info)?;
                 meta.gen_schema_version()?;
+            }
+            AlterTableSpec::SetAffinity(value) => {
+                alter_affinity(meta, &snapshot, stmt, value, current_db)?
+            }
+            AlterTableSpec::RemovePartitioning => {
+                check_affinity_partition_op(
+                    &snapshot,
+                    &stmt.table,
+                    current_db,
+                    "Unsupported REMOVE PARTITIONING of a table with AFFINITY option",
+                )?;
+                return Err(Error::unsupported("REMOVE PARTITIONING"));
+            }
+            AlterTableSpec::CoalescePartition(_) => {
+                check_affinity_partition_op(
+                    &snapshot,
+                    &stmt.table,
+                    current_db,
+                    "Unsupported COALESCE PARTITION of a table with AFFINITY option",
+                )?;
+                return Err(Error::unsupported("COALESCE PARTITION"));
+            }
+            AlterTableSpec::ReorganizePartition => {
+                check_affinity_partition_op(
+                    &snapshot,
+                    &stmt.table,
+                    current_db,
+                    "Unsupported REORGANIZE PARTITION of a table with AFFINITY option",
+                )?;
+                return Err(Error::unsupported("REORGANIZE PARTITION"));
             }
             AlterTableSpec::AddForeignKey(fk) => {
                 add_foreign_key_spec(meta, &snapshot, stmt, fk, current_db)?
@@ -313,6 +378,60 @@ fn alter_cache(
     updated.cached_table = cached;
     meta.update_table(db.id, &updated)?;
     meta.gen_schema_version()?;
+    Ok(())
+}
+
+/// `ALTER TABLE t AFFINITY [=] 'table'|'partition'|'none'|''` (TiDB 8266).
+fn alter_affinity(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &AlterTableStmt,
+    raw: &str,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let Some(info) = is.table_by_name(&schema, &table).cloned() else {
+        return Err(Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        ));
+    };
+    if info.is_view() {
+        return Err(Error::new(
+            ERR_WRONG_OBJECT,
+            format!("'{schema}.{table}' is not BASE TABLE"),
+        ));
+    }
+    let value = affinity_setting(raw, false, info.partition.is_some())?;
+    if info.affinity == value {
+        return Ok(());
+    }
+    let mut updated = info;
+    updated.affinity = value;
+    meta.update_table(db.id, &updated)?;
+    meta.gen_schema_version()?;
+    Ok(())
+}
+
+/// Partition maintenance on an `AFFINITY` table is unsupported (8200).
+fn check_affinity_partition_op(
+    is: &InfoSchema,
+    table: &TableName,
+    current_db: &str,
+    message: &str,
+) -> Result<()> {
+    let Ok((schema, name)) = resolve_name(table, current_db) else {
+        return Ok(());
+    };
+    if is
+        .table_by_name(&schema, &name)
+        .is_some_and(|info| info.has_affinity())
+    {
+        return Err(Error::new(ERR_UNSUPPORTED_DDL_OPERATION, message));
+    }
     Ok(())
 }
 

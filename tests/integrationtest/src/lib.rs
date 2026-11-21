@@ -1010,13 +1010,24 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
             }
         }
         (Err(_), Some(-1)) => Ok(format!("{}\nGot one of the listed errors", step.sql)),
-        (Err(err), Some(code)) if err.code != code => Err(Error::new(
-            sealdb_errno::ERR_UNKNOWN_ERROR,
-            format!(
-                "expected error {code} for {}, got {} ({})",
-                step.sql, err.code, err.message
-            ),
-        )),
+        (Err(err), Some(code)) if err.code != code => {
+            // Triage aid: `SEALDB_ITEST_LENIENT_ERRORS` keeps the run going so
+            // the whole suite's actual output can be dumped in one pass.
+            if std::env::var_os("SEALDB_ITEST_LENIENT_ERRORS").is_some() {
+                Ok(format!(
+                    "{}\n[wrong error {}] Error {} ({}): {}",
+                    step.sql, code, err.code, err.sqlstate, err.message
+                ))
+            } else {
+                Err(Error::new(
+                    sealdb_errno::ERR_UNKNOWN_ERROR,
+                    format!(
+                        "expected error {code} for {}, got {} ({})",
+                        step.sql, err.code, err.message
+                    ),
+                ))
+            }
+        }
         (Err(err), _) => {
             let mut out = format!(
                 "{}\nError {} ({}): {}",

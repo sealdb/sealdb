@@ -117,7 +117,7 @@ use sqlparser::ast::{
     CreateView, CreateViewAlgorithm, CreateViewSecurity, Cte, CteAsMaterialized, DataType, Delete,
     Distinct as SqlDistinct, DuplicateTreatment, Expr, FlushType, FromTable, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName,
-    GroupByExpr, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
+    GroupByExpr, Interval, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
     LockTableType as SqlLockTableType, LockType, MySQLColumnPosition, NamedWindowDefinition,
     NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OnInsert, OrderByExpr,
     OrderByKind, OrderBySort, Privileges, Query, RenameTable as SqlRenameTable,
@@ -145,6 +145,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // TiDB `/*T![clustered_index] clustered */` → keyword before MySQL version
     // comments are expanded (the "T" comment is otherwise an ordinary comment).
     let rewritten = rewrite_tidb_clustered_comment(&rewritten);
+    let rewritten = rewrite_tidb_affinity_comment(&rewritten);
     // Expand MySQL `/*!50100 ... */` version comments so PARTITION/options parse.
     let rewritten = rewrite_mysql_version_comments(&rewritten);
     // TiDB `int1`…`int4` type aliases: sqlparser only knows the canonical names,
@@ -188,6 +189,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // sqlparser rejects `INTERVAL '2:30' MINUTE_SECOND`; rewrite for parse and
     // recover TiDB ExplainInfo in frame lowering.
     let rewritten = rewrite_mysql_interval_minute_second(&rewritten);
+    // MySQL `WEIGHT_STRING(expr AS CHAR(n)|BINARY(n))`: sqlparser has no `AS`
+    // clause inside a function call, so encode the padding as extra arguments.
+    let rewritten = rewrite_weight_string_padding(&rewritten);
     // MySQL `FROM (t)` / `FROM (t1, t2)` — sqlparser only allows NestedJoin with JOIN.
     let rewritten = rewrite_mysql_paren_from(&rewritten);
     let rewritten = rewrite_dml_ignore(&rewritten);
@@ -214,7 +218,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_group_by_order(&rewritten);
     let (rewritten, materialize_hints) = rewrite_cte_materialized(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
-    let (rewritten, ttls) = extract_create_table_ttl(&rewritten)?;
+    let (rewritten, ttls, create_affinities) = extract_create_table_ttl(&rewritten)?;
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let (rewritten, alter_parts) = extract_alter_partitions(&rewritten)?;
     // sqlparser rejects MySQL `GRANT/REVOKE role TO/FROM user` (no ON).
@@ -250,6 +254,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     })?;
     let mut flags = pessimistic_flags.into_iter();
     let mut ttls = ttls.into_iter();
+    let mut create_affinities = create_affinities.into_iter();
     let mut partitions = partitions.into_iter();
     let mut alter_parts = alter_parts.into_iter();
     let mut prepares = prepares.into_iter();
@@ -298,6 +303,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         }
         if let Statement::CreateTable(create) = &mut lowered {
             create.ttl = ttls.next().flatten();
+            create.affinity = create_affinities.next().flatten();
             create.partition = partitions.next().flatten();
         }
         if let Statement::AlterTable(alter) = &mut lowered
@@ -330,6 +336,23 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                 }
                 AlterPartOp::Ttl(spec) => alter.specs.push(spec),
                 AlterPartOp::Cache(cached) => alter.specs.push(AlterTableSpec::Cache { cached }),
+                AlterPartOp::Affinity(value) => {
+                    alter.specs.push(AlterTableSpec::SetAffinity(value));
+                }
+                AlterPartOp::RemovePartitioning => {
+                    alter.specs.push(AlterTableSpec::RemovePartitioning);
+                }
+                AlterPartOp::ReorganizePartition => {
+                    alter.specs.push(AlterTableSpec::ReorganizePartition);
+                }
+                AlterPartOp::CoalescePartition(num) => {
+                    alter.specs.push(AlterTableSpec::CoalescePartition(num));
+                }
+                AlterPartOp::TruncatePartition(names) => {
+                    alter
+                        .specs
+                        .push(AlterTableSpec::TruncatePartition { names });
+                }
                 AlterPartOp::Attributes {
                     partition,
                     attributes,
@@ -1926,8 +1949,9 @@ fn rewrite_comment_double_quotes(sql: &str) -> String {
         }
         if (bytes[i] == b'c' || bytes[i] == b'C')
             && (i == 0 || !is_ident_char(bytes[i - 1]))
-            && sql[i..].len() >= 7
-            && sql[i..i + 7].eq_ignore_ascii_case("comment")
+            && sql
+                .get(i..i + 7)
+                .is_some_and(|s| s.eq_ignore_ascii_case("comment"))
             && !is_ident_char(bytes.get(i + 7).copied().unwrap_or(b' '))
         {
             let mut j = i + 7;
@@ -2619,8 +2643,9 @@ fn split_top_level_commas(text: &str) -> Vec<String> {
             }
             _ => {}
         }
-        current.push_str(&text[i..i + 1]);
-        i += 1;
+        let ch = text[i..].chars().next().unwrap();
+        current.push(ch);
+        i += ch.len_utf8();
     }
     parts.push(current);
     parts
@@ -3969,6 +3994,60 @@ fn rewrite_tidb_clustered_comment(sql: &str) -> String {
     out
 }
 
+/// Expand TiDB `/*T![affinity] AFFINITY='table' */` into the bare table option
+/// so the CREATE/ALTER option extractors can capture it.
+fn rewrite_tidb_affinity_comment(sql: &str) -> String {
+    const PREFIX: &str = "/*T![affinity]";
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains(&PREFIX.to_ascii_lowercase()) {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let q = bytes[i];
+            out.push(q as char);
+            i += 1;
+            while i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                if q == b'\'' && ch == '\\' {
+                    if let Some(next) = sql[i..].chars().next() {
+                        out.push(next);
+                        i += next.len_utf8();
+                    }
+                    continue;
+                }
+                if ch == q as char {
+                    if i < bytes.len() && bytes[i] == q {
+                        out.push(q as char);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if lower[i..].starts_with(&PREFIX.to_ascii_lowercase())
+            && let Some(end) = lower[i..].find("*/")
+        {
+            out.push(' ');
+            out.push_str(&sql[i + PREFIX.len()..i + end]);
+            out.push(' ');
+            i += end + 2;
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn rewrite_mysql_version_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -4599,45 +4678,155 @@ fn rewrite_mysql_bang(sql: &str) -> String {
     out
 }
 
-/// `INTERVAL '2:30' MINUTE_SECOND` → `INTERVAL 'SEALDB_MS:2:30' MINUTE` for sqlparser.
-fn rewrite_mysql_interval_minute_second(sql: &str) -> String {
+/// MySQL `WEIGHT_STRING(expr AS CHAR(n))` / `AS BINARY(n)`: sqlparser has no
+/// `AS` clause inside a function call, so rewrite it to extra arguments
+/// (`WEIGHT_STRING(expr, 'CHAR', n)`) that `lower` keeps as a normal call.
+fn rewrite_weight_string_padding(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
+    if !lower.contains("weight_string") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 16);
     let mut i = 0;
-    let bytes = sql.as_bytes();
     while i < bytes.len() {
-        if lower[i..].starts_with("interval") {
-            // Copy INTERVAL keyword as-is.
+        let keyword = lower[i..].starts_with("weight_string")
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && !is_ident_char(bytes.get(i + 13).copied().unwrap_or(b' '));
+        if keyword {
+            let mut open = i + "weight_string".len();
+            while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+                open += 1;
+            }
+            if bytes.get(open) == Some(&b'(') {
+                let close = skip_balanced(bytes, open);
+                if close > open + 1 && close <= bytes.len() && bytes[close - 1] == b')' {
+                    let inner = &sql[open + 1..close - 1];
+                    if let Some(rewritten) = weight_string_padding_args(inner) {
+                        out.push_str("weight_string(");
+                        out.push_str(&rewritten);
+                        out.push(')');
+                        i = close;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Split `expr AS CHAR(n)` / `expr AS BINARY(n)` into
+/// `expr, 'CHAR', n`. Only a top-level `AS` (outside quotes and nested
+/// parentheses) counts, so `CAST(x AS DATE)` stays inside `expr`.
+fn weight_string_padding_args(inner: &str) -> Option<String> {
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    let mut as_at = None;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => quote = Some(bytes[i]),
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {
+                if depth == 0
+                    && (bytes[i] == b'a' || bytes[i] == b'A')
+                    && i + 1 < bytes.len()
+                    && (bytes[i + 1] == b's' || bytes[i + 1] == b'S')
+                    && i > 0
+                    && bytes[i - 1].is_ascii_whitespace()
+                    && bytes.get(i + 2).is_some_and(|b| b.is_ascii_whitespace())
+                {
+                    as_at = Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    let as_at = as_at?;
+    let expr = inner[..as_at].trim();
+    let tail = inner[as_at + 2..].trim();
+    let (kind, rest) = {
+        let low = tail.to_ascii_lowercase();
+        if let Some(rest) = low.strip_prefix("char") {
+            ("CHAR", &tail[tail.len() - rest.len()..])
+        } else if let Some(rest) = low.strip_prefix("binary") {
+            ("BINARY", &tail[tail.len() - rest.len()..])
+        } else {
+            return None;
+        }
+    };
+    let rest = rest.trim();
+    let length = rest.strip_prefix('(')?.strip_suffix(')')?.trim();
+    if expr.is_empty() || length.is_empty() {
+        return None;
+    }
+    Some(format!("{expr}, '{kind}', {length}"))
+}
+
+/// Composite MySQL interval units (`SECOND_MICROSECOND`, `DAY_SECOND`, …) are
+/// absent from sqlparser's grammar. Rewrite
+/// `INTERVAL <value> HOUR_MINUTE` as
+/// `INTERVAL __sealdb_interval_composite(<value>, 'HOUR_MINUTE') MICROSECOND`
+/// so the statement parses; `lower_interval_parts` recovers the real unit.
+fn rewrite_mysql_interval_minute_second(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            let b = bytes[i];
+            // Copy whole UTF-8 scalars so non-ASCII literals survive verbatim.
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            if b == b'\\' && i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            quote = Some(bytes[i]);
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let at_word_start = i == 0 || !is_word_byte(bytes[i - 1]);
+        if at_word_start && lower[i..].starts_with("interval") && word_boundary_at(bytes, i + 8) {
             out.push_str(&sql[i..i + 8]);
             i += 8;
-            let after = skip_ws_and_comments(bytes, i);
-            out.push_str(&sql[i..after]);
-            i = after;
-            // Quoted literal.
-            if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"') {
-                let quote = bytes[i];
-                out.push(quote as char);
-                i += 1;
-                let start = i;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += 1;
-                }
-                let lit = &sql[start..i];
-                out.push_str("SEALDB_MS:");
-                out.push_str(lit);
-                if i < bytes.len() {
-                    out.push(quote as char);
-                    i += 1;
-                }
-                let after_lit = skip_ws_and_comments(bytes, i);
-                out.push_str(&sql[i..after_lit]);
-                i = after_lit;
-                // Replace minute_second unit with minute.
-                if lower[i..].starts_with("minute_second") {
-                    out.push_str("MINUTE");
-                    i += "minute_second".len();
-                    continue;
-                }
+            if let Some((unit, unit_start)) = find_composite_interval_unit(&lower, bytes, i) {
+                let value_start = skip_ws_and_comments(bytes, i);
+                out.push_str(&sql[i..value_start]);
+                let value = sql[value_start..unit_start].trim();
+                out.push_str("__sealdb_interval_composite(");
+                out.push_str(value);
+                out.push_str(", '");
+                out.push_str(&unit.to_ascii_uppercase());
+                out.push_str("') MICROSECOND");
+                i = unit_start + unit.len();
             }
             continue;
         }
@@ -4646,6 +4835,85 @@ fn rewrite_mysql_interval_minute_second(sql: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// MySQL composite interval units, longest first so prefixes cannot win.
+const COMPOSITE_INTERVAL_UNITS: [&str; 11] = [
+    "second_microsecond",
+    "minute_microsecond",
+    "hour_microsecond",
+    "day_microsecond",
+    "minute_second",
+    "hour_second",
+    "hour_minute",
+    "day_second",
+    "day_minute",
+    "year_month",
+    "day_hour",
+];
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn word_boundary_at(bytes: &[u8], at: usize) -> bool {
+    at >= bytes.len() || !is_word_byte(bytes[at])
+}
+
+/// Find a composite interval unit that terminates an `INTERVAL <value>`.
+fn find_composite_interval_unit(
+    lower: &str,
+    bytes: &[u8],
+    start: usize,
+) -> Option<(&'static str, usize)> {
+    let mut i = start;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(b);
+                i += 1;
+                continue;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            b',' if depth == 0 => return None,
+            _ => {}
+        }
+        if depth == 0 && b.is_ascii_alphabetic() {
+            for unit in COMPOSITE_INTERVAL_UNITS {
+                if lower[i..].starts_with(unit) && word_boundary_at(bytes, i + unit.len()) {
+                    return Some((unit, i));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Unwrap `((SELECT …) UNION [ALL] (SELECT …))` → `(SELECT … UNION [ALL] SELECT …)`
@@ -5067,6 +5335,14 @@ fn rewrite_mysql_paren_from(sql: &str) -> String {
                 {
                     break;
                 }
+                // A parenthesized join expression keeps its grouping: the
+                // alias/join operands inside (`(t1 AS ref_0 JOIN …)`) are
+                // rewritten by the normal scan instead.
+                if top_level_join_keyword(inner) {
+                    out.push_str(&sql[i..after + 1]);
+                    i = after + 1;
+                    break;
+                }
                 // A parenthesized table list that is a JOIN operand keeps its
                 // grouping: `(t3, t4) LEFT JOIN (t1, t2)` is not the same as
                 // `t3, t4 LEFT JOIN t1, t2`. Nest it as CROSS JOINs instead.
@@ -5110,11 +5386,26 @@ fn rewrite_mysql_paren_from(sql: &str) -> String {
                         || keyword_at(inner_bytes, start, "WITH")
                         || keyword_at(inner_bytes, start, "VALUES")
                         || keyword_at(inner_bytes, start, "TABLE");
-                    if !derived && let Some(body) = cross_join_comma_list(inner) {
+                    if !derived {
+                        // MySQL allows a table alias inside the parens
+                        // (`JOIN (t0 AS ref_1) ON …`); sqlparser only takes
+                        // the alias after the closing paren.
+                        if top_level_join_keyword(inner) {
+                            out.push_str(&sql[i..after + 1]);
+                            i = after + 1;
+                            continue;
+                        }
+                        if let Some(body) = cross_join_comma_list(inner) {
+                            out.push_str(&sql[i..after]);
+                            out.push('(');
+                            out.push_str(&body);
+                            out.push(')');
+                            i = close;
+                            continue;
+                        }
                         out.push_str(&sql[i..after]);
-                        out.push('(');
-                        out.push_str(&body);
-                        out.push(')');
+                        out.push(' ');
+                        out.push_str(inner);
                         i = close;
                         continue;
                     }
@@ -5149,6 +5440,55 @@ fn follows_join_keyword(bytes: &[u8], close: usize) -> bool {
 /// Rewrite a top-level comma table list into explicit CROSS JOINs so it can be
 /// nested in parentheses: `t1, t2` → `t1 CROSS JOIN t2`. Returns `None` when
 /// the text has no top-level comma (single table).
+/// True when the parenthesized table group contains a JOIN at its top level,
+/// i.e. it is a join expression whose parentheses must be preserved.
+fn top_level_join_keyword(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\'' | b'"' | b'`' => {
+                let quote = c;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && quote != b'`' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && (keyword_at(bytes, i, "JOIN") || keyword_at(bytes, i, "STRAIGHT_JOIN")) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn cross_join_comma_list(inner: &str) -> Option<String> {
     let bytes = inner.as_bytes();
     let mut out = String::with_capacity(inner.len() + 16);
@@ -5464,7 +5804,7 @@ fn rewrite_one_update_comma_join(sql: &str, start: usize) -> Result<Option<(Stri
         // reference (`UPDATE t1, t2, t3 SET …`); anything else stays
         // unsupported.
         let arm = &sql[comma + 1..end];
-        let text = match rewrite_simple_derived_update_side(arm) {
+        let (text, cond) = match rewrite_simple_derived_update_side(arm) {
             Some(right) => {
                 if let Some(alias) = derived_update_alias(arm) {
                     crate::parser::note_derived_update_alias(&alias);
@@ -5472,13 +5812,19 @@ fn rewrite_one_update_comma_join(sql: &str, start: usize) -> Result<Option<(Stri
                 right
             }
             None => match simple_update_table_side(arm) {
-                Some(right) => right,
+                Some(right) => (right, None),
                 None => return Ok(None),
             },
         };
         fragment.push_str(" JOIN ");
         fragment.push_str(&text);
-        fragment.push_str(" ON TRUE ");
+        match cond {
+            // A derived table with a `WHERE` is flattened into its base table;
+            // its predicate joins as the ON condition (inner join, so this is
+            // equivalent to merging it into the outer WHERE).
+            Some(cond) => fragment.push_str(&format!(" ON ({cond}) ")),
+            None => fragment.push_str(" ON TRUE "),
+        }
     }
     Ok(Some((fragment, set_pos)))
 }
@@ -5517,8 +5863,11 @@ fn derived_update_alias(item: &str) -> Option<String> {
 }
 
 /// `(SELECT a, b FROM t) t2` → `t t2` when the subquery only projects base
-/// columns with no filtering, grouping, ordering, or limit.
-fn rewrite_simple_derived_update_side(item: &str) -> Option<String> {
+/// columns with no grouping, ordering, or limit. A `WHERE` clause is kept as
+/// the returned second element so the caller can splice it into the JOIN's
+/// `ON` condition; the alias stays on the base table so outer references still
+/// resolve.
+fn rewrite_simple_derived_update_side(item: &str) -> Option<(String, Option<String>)> {
     let text = item.trim();
     let open = text.find('(')?;
     let close = text.rfind(')')?;
@@ -5543,8 +5892,7 @@ fn rewrite_simple_derived_update_side(item: &str) -> Option<String> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return None;
     };
-    if select.selection.is_some()
-        || select.having.is_some()
+    if select.having.is_some()
         || query.order_by.is_some()
         || query.limit_clause.is_some()
         || select.from.len() != 1
@@ -5570,7 +5918,89 @@ fn rewrite_simple_derived_update_side(item: &str) -> Option<String> {
     else {
         return None;
     };
-    Some(format!("{name} {alias}"))
+    // The derived predicate moves out of the subquery's scope, so bind its
+    // unqualified columns to the derived alias (the alias stays on the base
+    // table). A subquery inside the predicate has its own scope and a shape
+    // this text rewrite cannot follow, so those arms stay unsupported.
+    let base = name
+        .0
+        .last()
+        .map(|part| match part {
+            sqlparser::ast::ObjectNamePart::Identifier(ident) => ident.value.clone(),
+            sqlparser::ast::ObjectNamePart::Function(func) => func.name.value.clone(),
+        })
+        .unwrap_or_default();
+    let cond = match &select.selection {
+        None => None,
+        Some(selection) => {
+            let mut selection = selection.clone();
+            if !qualify_derived_columns(&mut selection, alias, &base) {
+                return None;
+            }
+            Some(selection.to_string())
+        }
+    };
+    Some((format!("{name} {alias}"), cond))
+}
+
+/// Bind every column reference in a derived-table predicate to `alias`:
+/// unqualified columns gain the alias, and columns written against the base
+/// table (`t1.c`) are renamed, because the flattened join arm carries the
+/// derived alias while the executor evaluates the `ON` against it.
+/// Returns `false` for expression shapes whose scope this rewrite cannot
+/// follow (subqueries, and constructs with unhandled sub-expressions).
+fn qualify_derived_columns(expr: &mut Expr, alias: &str, base: &str) -> bool {
+    match expr {
+        Expr::Identifier(ident) => {
+            let column = ident.clone();
+            *expr = Expr::CompoundIdentifier(vec![sqlparser::ast::Ident::new(alias), column]);
+            true
+        }
+        Expr::CompoundIdentifier(parts) => {
+            if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case(base) {
+                parts[0] = sqlparser::ast::Ident::new(alias);
+            }
+            true
+        }
+        Expr::Value(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            qualify_derived_columns(left, alias, base) && qualify_derived_columns(right, alias, base)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr) => qualify_derived_columns(expr, alias, base),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            qualify_derived_columns(expr, alias, base)
+                && qualify_derived_columns(low, alias, base)
+                && qualify_derived_columns(high, alias, base)
+        }
+        Expr::InList { expr, list, .. } => {
+            qualify_derived_columns(expr, alias, base)
+                && list
+                    .iter_mut()
+                    .all(|item| qualify_derived_columns(item, alias, base))
+        }
+        Expr::Function(function) => match &mut function.args {
+            FunctionArguments::List(list) => list.args.iter_mut().all(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    qualify_derived_columns(expr, alias, base)
+                }
+                _ => false,
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn keyword_at(bytes: &[u8], i: usize, keyword: &str) -> bool {
@@ -7926,6 +8356,16 @@ enum AlterPartOp {
         partition: Option<String>,
         attributes: Option<String>,
     },
+    /// `AFFINITY [=] '<table|partition|none|>'`.
+    Affinity(String),
+    /// `REMOVE PARTITIONING`.
+    RemovePartitioning,
+    /// `REORGANIZE PARTITION … INTO (…)`.
+    ReorganizePartition,
+    /// `COALESCE PARTITION n`.
+    CoalescePartition(u64),
+    /// `TRUNCATE PARTITION p0, p1`.
+    TruncatePartition(Vec<String>),
     /// `CACHE` / `NOCACHE` (sqlparser has no cached-table grammar).
     Cache(bool),
 }
@@ -8147,6 +8587,106 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                     i = skip_ws(bytes, end);
                     continue;
                 }
+                // `ALTER TABLE t AFFINITY [=] 'table'|'partition'|'none'|''`.
+                if keyword_at(bytes, after_name, "AFFINITY") {
+                    let mut j = skip_ws(bytes, after_name + "AFFINITY".len());
+                    if j < bytes.len() && bytes[j] == b'=' {
+                        j = skip_ws(bytes, j + 1);
+                    }
+                    if j < bytes.len() && matches!(bytes[j], b'\'' | b'"') {
+                        let (value, next) = read_sql_string(bytes, j)?;
+                        out.push_str(&sql[i..after_name]);
+                        out.push_str("ALGORITHM=INPLACE");
+                        ops.push(Some(AlterPartOp::Affinity(value)));
+                        i = skip_ws(bytes, next);
+                        continue;
+                    }
+                }
+                // `ALTER TABLE t REORGANIZE PARTITION p0, p1 INTO (...)`.
+                if keyword_at(bytes, after_name, "REORGANIZE")
+                    && keyword_at(
+                        bytes,
+                        skip_ws(bytes, after_name + "REORGANIZE".len()),
+                        "PARTITION",
+                    )
+                {
+                    let end = stmt_end(bytes, after_name);
+                    out.push_str(&sql[i..after_name]);
+                    out.push_str("ALGORITHM=INPLACE");
+                    ops.push(Some(AlterPartOp::ReorganizePartition));
+                    i = skip_ws(bytes, end);
+                    continue;
+                }
+                // `ALTER TABLE t TRUNCATE PARTITION p0[, p1]`.
+                if keyword_at(bytes, after_name, "TRUNCATE") {
+                    let after_truncate = skip_ws(bytes, after_name + "TRUNCATE".len());
+                    if keyword_at(bytes, after_truncate, "PARTITION") {
+                        let mut j = skip_ws(bytes, after_truncate + "PARTITION".len());
+                        let mut names = Vec::new();
+                        loop {
+                            let (name, next) = read_ident(bytes, j);
+                            if name.is_empty() {
+                                break;
+                            }
+                            names.push(name);
+                            j = skip_ws(bytes, next);
+                            if j < bytes.len() && bytes[j] == b',' {
+                                j = skip_ws(bytes, j + 1);
+                                continue;
+                            }
+                            break;
+                        }
+                        if names.is_empty() {
+                            return Err(Error::unsupported("TRUNCATE PARTITION without names"));
+                        }
+                        let end = stmt_end(bytes, j);
+                        out.push_str(&sql[i..after_name]);
+                        out.push_str("ALGORITHM=INPLACE");
+                        ops.push(Some(AlterPartOp::TruncatePartition(names)));
+                        i = skip_ws(bytes, end);
+                        continue;
+                    }
+                }
+                // `ALTER TABLE t REMOVE PARTITIONING`.
+                if keyword_at(bytes, after_name, "REMOVE")
+                    && keyword_at(
+                        bytes,
+                        skip_ws(bytes, after_name + "REMOVE".len()),
+                        "PARTITIONING",
+                    )
+                {
+                    let end = stmt_end(bytes, after_name);
+                    out.push_str(&sql[i..after_name]);
+                    out.push_str("ALGORITHM=INPLACE");
+                    ops.push(Some(AlterPartOp::RemovePartitioning));
+                    i = skip_ws(bytes, end);
+                    continue;
+                }
+                // `ALTER TABLE t COALESCE PARTITION n`.
+                if keyword_at(bytes, after_name, "COALESCE")
+                    && keyword_at(
+                        bytes,
+                        skip_ws(bytes, after_name + "COALESCE".len()),
+                        "PARTITION",
+                    )
+                {
+                    let mut j = skip_ws(bytes, after_name + "COALESCE".len());
+                    j = skip_ws(bytes, j + "PARTITION".len());
+                    let num_start = j;
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    let num = std::str::from_utf8(&bytes[num_start..j])
+                        .unwrap_or_default()
+                        .parse::<u64>()
+                        .map_err(|_| Error::unsupported("COALESCE PARTITION count"))?;
+                    let end = stmt_end(bytes, j);
+                    out.push_str(&sql[i..after_name]);
+                    out.push_str("ALGORITHM=INPLACE");
+                    ops.push(Some(AlterPartOp::CoalescePartition(num)));
+                    i = skip_ws(bytes, end);
+                    continue;
+                }
                 // `ALTER TABLE t CACHE` / `NOCACHE` — cached-table toggle,
                 // which sqlparser has no grammar for.
                 if keyword_at(bytes, after_name, "CACHE")
@@ -8365,17 +8905,24 @@ fn parse_add_partition_defs(body: &str) -> Result<Vec<PartitionDef>> {
 /// sqlparser-rs MySQL dialect does not accept TiDB/MySQL `PARTITION BY`.
 /// Strip the clause and re-attach it after lowering, same pattern as
 /// `BEGIN PESSIMISTIC`.
-/// Strip `TTL = expr` / `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …` table options
-/// so sqlparser / PARTITION extract see a clean CREATE TABLE (...). One slot per
-/// CREATE TABLE. Repeated options keep the last value (TiDB semantics).
-fn extract_create_table_ttl(sql: &str) -> Result<(String, Vec<Option<TtlInfo>>)> {
+/// Strip `TTL = expr` / `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …` and
+/// `AFFINITY [=] '…'` table options so sqlparser / PARTITION extract see a
+/// clean CREATE TABLE (...). One slot per CREATE TABLE. Repeated options keep
+/// the last value (TiDB semantics).
+fn extract_create_table_ttl(
+    sql: &str,
+) -> Result<(String, Vec<Option<TtlInfo>>, Vec<Option<String>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut ttls = Vec::new();
+    let mut affinities = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if keyword_at(bytes, i, "CREATE") {
             let mut p = skip_ws(bytes, i + "CREATE".len());
+            if keyword_at(bytes, p, "GLOBAL") {
+                p = skip_ws(bytes, p + "GLOBAL".len());
+            }
             let mut temporary = false;
             if keyword_at(bytes, p, "TEMPORARY") {
                 temporary = true;
@@ -8392,6 +8939,7 @@ fn extract_create_table_ttl(sql: &str) -> Result<(String, Vec<Option<TtlInfo>>)>
                     let mut ttl: Option<TtlInfo> = None;
                     let mut enable: Option<bool> = None;
                     let mut interval: Option<String> = None;
+                    let mut affinity: Option<String> = None;
                     let mut j = close + 1;
                     while j < bytes.len() {
                         if bytes[j].is_ascii_whitespace() {
@@ -8435,6 +8983,18 @@ fn extract_create_table_ttl(sql: &str) -> Result<(String, Vec<Option<TtlInfo>>)>
                                 continue;
                             }
                         }
+                        if keyword_at(bytes, j, "AFFINITY") {
+                            let mut k = skip_ws(bytes, j + "AFFINITY".len());
+                            if k < bytes.len() && bytes[k] == b'=' {
+                                k = skip_ws(bytes, k + 1);
+                            }
+                            if k < bytes.len() && matches!(bytes[k], b'\'' | b'"') {
+                                let (value, next) = read_sql_string(bytes, k)?;
+                                affinity = Some(value);
+                                j = skip_ws(bytes, next);
+                                continue;
+                            }
+                        }
                         j = copy_sql_token(&mut out, sql, bytes, j);
                     }
                     if ttl.is_none() && (enable.is_some() || interval.is_some()) {
@@ -8461,6 +9021,7 @@ fn extract_create_table_ttl(sql: &str) -> Result<(String, Vec<Option<TtlInfo>>)>
                     } else {
                         ttls.push(None);
                     }
+                    affinities.push(affinity);
                     i = j;
                     continue;
                 }
@@ -8469,7 +9030,7 @@ fn extract_create_table_ttl(sql: &str) -> Result<(String, Vec<Option<TtlInfo>>)>
         out.push(sql[i..].chars().next().unwrap());
         i += sql[i..].chars().next().unwrap().len_utf8();
     }
-    Ok((out, ttls))
+    Ok((out, ttls, affinities))
 }
 
 /// Value of `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …`: a quoted literal or a
@@ -9031,6 +9592,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     defs: Vec::new(),
                     num,
                     subpartition_ignored: false,
+                    range_columns,
                 },
                 end,
             ))
@@ -9055,6 +9617,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     num: defs.len() as u64,
                     defs,
                     subpartition_ignored: has_sub,
+                    range_columns,
                 },
                 end + 1,
             ))
@@ -9079,6 +9642,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     num: defs.len() as u64,
                     defs,
                     subpartition_ignored: has_sub,
+                    range_columns,
                 },
                 end + 1,
             ))
@@ -12315,6 +12879,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         collate,
         partition: None,
         ttl: None,
+        affinity: None,
         refer_table,
         select,
         shard_row_id_bits,
@@ -12636,6 +13201,56 @@ fn between_range(inner: &ExprNode, low: &ExprNode, high: &ExprNode, negated: boo
     })
 }
 
+/// Split an `INTERVAL` spec into (value, unit).
+///
+/// `rewrite_mysql_interval_minute_second` tags every quoted literal with
+/// `SEALDB_MS:` and turns composite units into
+/// `__sealdb_interval_composite(<value>, 'HOUR_MINUTE') MICROSECOND`, which
+/// sqlparser parses as an `Interval` on a call with unit `MICROSECOND`.
+fn lower_interval_parts(iv: &Interval) -> Result<(ExprNode, String)> {
+    let unit = iv
+        .leading_field
+        .as_ref()
+        .map(|f| f.to_string())
+        .unwrap_or_else(|| "DAY".to_string());
+    if let Expr::Function(f) = iv.value.as_ref()
+        && f.name
+            .to_string()
+            .eq_ignore_ascii_case("__sealdb_interval_composite")
+        && let FunctionArguments::List(list) = &f.args
+        && let [
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(unit_expr)),
+        ] = list.args.as_slice()
+    {
+        let unit = match unit_expr {
+            Expr::Value(v) => match &v.value {
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                    s.to_ascii_uppercase()
+                }
+                _ => unit_expr.to_string().to_ascii_uppercase(),
+            },
+            _ => unit_expr.to_string().to_ascii_uppercase(),
+        };
+        return Ok((lower_expr(arg)?, unit));
+    }
+    let value = match iv.value.as_ref() {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                match s.strip_prefix("SEALDB_MS:") {
+                    Some(rest) => ExprNode::Value(ValueExpr {
+                        datum: Datum::Bytes(rest.as_bytes().to_vec()),
+                    }),
+                    None => lower_expr(&iv.value)?,
+                }
+            }
+            _ => lower_expr(&iv.value)?,
+        },
+        _ => lower_expr(&iv.value)?,
+    };
+    Ok((value, unit))
+}
+
 fn lower_expr(expr: &Expr) -> Result<ExprNode> {
     match expr {
         Expr::Value(v) => Ok(ExprNode::Value(ValueExpr {
@@ -12672,10 +13287,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 let ExprNode::Column(col) = target else {
                     return Err(Error::unsupported(format!("operator {op}")));
                 };
-                if col.table.is_some()
-                    || !col.name.starts_with('@')
-                    || col.name.starts_with("@@")
-                {
+                if col.table.is_some() || !col.name.starts_with('@') || col.name.starts_with("@@") {
                     return Err(Error::unsupported(format!("operator {op}")));
                 }
                 return Ok(ExprNode::Func(FuncCallExpr {
@@ -12801,12 +13413,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         Expr::Interval(iv) => {
             // Bare INTERVAL is only meaningful inside DATE_ADD/DATE_SUB; keep as
             // a 2-arg synthetic call for restore/eval diagnostics.
-            let value = lower_expr(&iv.value)?;
-            let unit = iv
-                .leading_field
-                .as_ref()
-                .map(|f| f.to_string())
-                .unwrap_or_else(|| "DAY".to_string());
+            let (value, unit) = lower_interval_parts(iv)?;
             Ok(ExprNode::Func(FuncCallExpr {
                 name: "__sealdb_interval".to_string(),
                 args: vec![
@@ -13001,6 +13608,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             expr,
             substring_from,
             substring_for,
+            shorthand,
             ..
         } => {
             let mut args = vec![lower_expr(expr)?];
@@ -13014,7 +13622,10 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 args.push(lower_expr(len)?);
             }
             Ok(ExprNode::Func(FuncCallExpr {
-                name: "substring".to_string(),
+                // TiDB keeps the written spelling: `substr` and `substring` are
+                // distinct builtins, and EXPLAIN prints the function the user
+                // named (`substr(…)` vs `substring(…)`).
+                name: if *shorthand { "substr" } else { "substring" }.to_string(),
                 args,
                 distinct: false,
             }))
@@ -13120,12 +13731,7 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
         && let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Interval(iv))) = &list.args[1]
     {
         let expr = lower_function_arg(&list.args[0])?;
-        let value = lower_expr(&iv.value)?;
-        let unit = iv
-            .leading_field
-            .as_ref()
-            .map(|f| f.to_string())
-            .unwrap_or_else(|| "DAY".to_string());
+        let (value, unit) = lower_interval_parts(iv)?;
         let fname = if upper == "ADDDATE" {
             "DATE_ADD"
         } else if upper == "SUBDATE" {
@@ -13393,6 +13999,41 @@ fn lower_frame_bound(bound: &SqlWindowFrameBound) -> Result<WindowFrameBound> {
 fn lower_frame_offset(expr: &Expr, preceding: bool) -> Result<WindowFrameBound> {
     // INTERVAL '2:30' MINUTE_SECOND
     if let Expr::Interval(iv) = expr {
+        // Composite units were rewritten to
+        // `__sealdb_interval_composite(<value>, 'MINUTE_SECOND') MICROSECOND`.
+        if let Expr::Function(f) = iv.value.as_ref()
+            && f.name
+                .to_string()
+                .eq_ignore_ascii_case("__sealdb_interval_composite")
+            && let FunctionArguments::List(list) = &f.args
+            && let [
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(first)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(second)),
+            ] = list.args.as_slice()
+        {
+            let quoted = |expr: &Expr| -> String {
+                match expr {
+                    Expr::Value(v) => match &v.value {
+                        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                            format!("\"{s}\"")
+                        }
+                        other => format!("\"{other}\""),
+                    },
+                    other => format!("\"{other}\""),
+                }
+            };
+            return Ok(if preceding {
+                WindowFrameBound::IntervalPreceding {
+                    value: quoted(first),
+                    unit: quoted(second),
+                }
+            } else {
+                WindowFrameBound::IntervalFollowing {
+                    value: quoted(first),
+                    unit: quoted(second),
+                }
+            });
+        }
         let raw = match iv.value.as_ref() {
             Expr::Value(v) => match &v.value {
                 Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
@@ -13643,6 +14284,7 @@ fn lower_unary_op(op: &UnaryOperator) -> Result<Op> {
         UnaryOperator::Plus => Op::Plus,
         UnaryOperator::Minus => Op::UnaryMinus,
         UnaryOperator::Not => Op::Not,
+        UnaryOperator::BitwiseNot => Op::BitNeg,
         _ => return Err(Error::unsupported(format!("unary operator {op}"))),
     })
 }

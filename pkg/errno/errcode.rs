@@ -26,6 +26,9 @@ pub const ERR_NO_SUCH_TABLE: i32 = 1146;
 pub const ERR_ROW_IS_REFERENCED_2: i32 = 1451;
 /// MySQL `ER_NO_REFERENCED_ROW_2`: a child row's key has no parent row (1452).
 pub const ERR_NO_REFERENCED_ROW_2: i32 = 1452;
+/// MySQL `ER_DATETIME_FUNCTION_OVERFLOW`: a date/time function produced a
+/// value outside the supported range (1441).
+pub const ERR_DATETIME_FUNCTION_OVERFLOW: i32 = 1441;
 pub const ERR_UNKNOWN_ERROR: i32 = 1105;
 pub const ERR_WRONG_VALUE_COUNT: i32 = 1058;
 /// MySQL `ER_WRONG_VALUE_COUNT_ON_ROW`: VALUES arity differs from the columns.
@@ -255,6 +258,9 @@ pub const ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT: i32 = 3754;
 /// TiDB `ErrUnsupportedModifyCharset` (8200): an existing column's character
 /// set cannot be changed, e.g. `MODIFY c VARCHAR(10) CHARACTER SET gbk`.
 pub const ERR_UNSUPPORTED_MODIFY_CHARSET: i32 = 8200;
+/// TiDB `ErrAffinity` (8266): invalid `AFFINITY` table option, or an affinity
+/// that the table kind (partitioned / non-partitioned / temporary) forbids.
+pub const ERR_AFFINITY: i32 = 8266;
 /// TiDB `ErrOptOnTemporaryTable` (8006): an option or operation that is not
 /// supported on temporary tables, e.g. `CREATE GLOBAL BINDING` over one.
 pub const ERR_OPT_ON_TEMPORARY_TABLE: i32 = 8006;

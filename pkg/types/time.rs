@@ -12,6 +12,13 @@ pub enum TimeType {
     Time,
 }
 
+/// `fsp` sentinel for a temporal value produced by folding an uncorrelated
+/// scalar subquery at optimization time (see
+/// `session::fold_explain_scalar_subqueries`). `EXPLAIN` prints such a value
+/// in the subquery's own text form instead of padding it like a literal, so it
+/// is distinguishable from a real temporal value, whose `fsp` is 0..=6.
+pub const FOLDED_SUBQUERY_FSP: i8 = 7;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Time {
     pub year: u16,
@@ -74,17 +81,21 @@ impl Time {
     }
 
     pub fn to_packed_u64(self) -> u64 {
+        // A `TIME` is a duration, not a date+clock: year/month/day are unused,
+        // so the top bit marks it and the hour gets a full 10-bit field
+        // (durations run to 838 hours; the shared date layout only leaves 5).
+        if self.tp == TimeType::Time {
+            let sign = u64::from(self.neg) << 62;
+            let magnitude = (u64::from(self.hour) << 32)
+                | (u64::from(self.minute) << 26)
+                | (u64::from(self.second) << 20)
+                | u64::from(self.micro & 0xf_ffff);
+            return (1 << 63) | sign | magnitude;
+        }
         let ymd = (u64::from(self.year) * 13 + u64::from(self.month)) << 5 | u64::from(self.day);
         let hms =
             (u64::from(self.hour) << 12) | (u64::from(self.minute) << 6) | u64::from(self.second);
-        let packed = ((ymd << 17) | hms) << 24 | u64::from(self.micro);
-        // A negative `TIME` keeps its magnitude in the low bits with the top
-        // bit as the sign (a date type never uses it: `year < 2^16`).
-        if self.neg && self.tp == TimeType::Time {
-            packed | (1 << 63)
-        } else {
-            packed
-        }
+        ((ymd << 17) | hms) << 24 | u64::from(self.micro)
     }
 
     /// MySQL numeric value: `YYYYMMDD` for DATE, `YYYYMMDDHHMMSS` for the
@@ -103,8 +114,34 @@ impl Time {
     }
 
     pub fn from_packed_u64(v: u64) -> Self {
-        let neg = v >> 63 == 1;
-        let v = v & !(1 << 63);
+        // Top bit set: a duration (`TIME`), with the sign bit next and the
+        // magnitude in the low bits. A date/datetime never sets it
+        // (`year < 2^16` keeps the packed value below 2^63).
+        if v >> 63 == 1 {
+            let neg = (v >> 62) & 1 == 1;
+            let hour = ((v >> 32) & 0x3ff) as u16;
+            let minute = ((v >> 26) & 0x3f) as u8;
+            let second = ((v >> 20) & 0x3f) as u8;
+            let micro = (v & 0xf_ffff) as u32;
+            let fsp = if micro == 0 {
+                0
+            } else {
+                (6 - (micro.trailing_zeros() / 4).min(6)) as i8
+            };
+            return Self {
+                year: 0,
+                month: 0,
+                day: 0,
+                hour,
+                minute,
+                second,
+                micro,
+                fsp,
+                neg,
+                tp: TimeType::Time,
+            };
+        }
+        let neg = false;
         let ymdhms = v >> 24;
         let ymd = ymdhms >> 17;
         let day = (ymd & ((1 << 5) - 1)) as u8;
@@ -911,9 +948,14 @@ fn parse_datetime_string(s: &str) -> Result<Time> {
     }
     let year = year as u16;
     let zero_date = year == 0 && month == 0 && day == 0;
-    // `0000-00-00 …` is the zero date. TiDB parses it at the literal layer and
-    // leaves `NO_ZERO_DATE` / strict-mode checks to storage.
-    if (!valid_ymd(year, month, day) && !zero_date) || hour > 23 || minute > 59 {
+    // `0000-00-00 …` is the zero date, and a partial date with a zero month or
+    // day (`2024-0-1`, `2024-1-0`) parses too: TiDB leaves the
+    // `NO_ZERO_DATE` / `NO_ZERO_IN_DATE` policy to storage.
+    let zero_part = (month == 0 || day == 0) && month <= 12 && day <= 31;
+    if (!valid_ymd(year, month, day) && !zero_date && !zero_part)
+        || hour > 23
+        || minute > 59
+    {
         return Err(incorrect("datetime", s));
     }
     // When frac absorbed into second, display still uses original fsp.
@@ -1139,7 +1181,11 @@ pub fn parse_date_literal(s: &str) -> Result<Time> {
     let year: u16 = seps[0].parse().map_err(|_| incorrect("date", s))?;
     let month: u8 = seps[1].parse().map_err(|_| incorrect("date", s))?;
     let day: u8 = seps[2].parse().map_err(|_| incorrect("date", s))?;
-    if !valid_ymd(year, month, day) {
+    // The zero date and partial dates (`2024-0-1`, `2024-1-0`) parse at the
+    // literal layer; `NO_ZERO_DATE` / `NO_ZERO_IN_DATE` are storage policies.
+    let zero_part = (month == 0 || day == 0) && !(year == 0 && month == 0 && day == 0) && day <= 31;
+    let zero_date = year == 0 && month == 0 && day == 0;
+    if !valid_ymd(year, month, day) && !zero_part && !zero_date {
         return Err(incorrect("date", s));
     }
     Ok(Time {

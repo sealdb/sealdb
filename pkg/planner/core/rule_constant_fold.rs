@@ -96,6 +96,16 @@ fn is_constant(expr: &ExprNode) -> bool {
         ExprNode::Binary(b) => is_constant(&b.left) && is_constant(&b.right),
         ExprNode::Unary(u) => is_constant(&u.expr),
         ExprNode::Func(f) => {
+            // An `INTERVAL 'XXX' unit` amount has no numeric prefix: keep it
+            // unfolded so an INSERT under strict mode raises 1292 at execution
+            // instead of folding the warning away at plan time.
+            if f.name.eq_ignore_ascii_case("__sealdb_interval")
+                && let Some(ExprNode::Value(v)) = f.args.first()
+                && let Datum::Bytes(bytes) = &v.datum
+                && !bytes.iter().any(u8::is_ascii_digit)
+            {
+                return false;
+            }
             !f.distinct
                 && !is_volatile_func(&f.name)
                 && !is_aggregate_func(&f.name)

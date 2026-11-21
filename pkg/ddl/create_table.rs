@@ -1,9 +1,10 @@
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_CANNOT_ADD_FOREIGN, ERR_DUP_FIELDNAME,
-    ERR_DUPLICATED_VALUE_IN_TYPE, ERR_FK_DUP_NAME, ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED,
-    ERR_GENERATED_COLUMN_REF_AUTO_INC, ERR_INVALID_DEFAULT, ERR_NO_SUCH_TABLE,
-    ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE,
-    ERR_VIEW_WRONG_LIST, ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, Error, Result,
+    ERR_AFFINITY, ERR_BAD_FIELD, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_CANNOT_ADD_FOREIGN,
+    ERR_DUP_FIELDNAME, ERR_DUPLICATED_VALUE_IN_TYPE, ERR_FK_DUP_NAME,
+    ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED, ERR_GENERATED_COLUMN_REF_AUTO_INC,
+    ERR_INVALID_DEFAULT, ERR_NO_SUCH_TABLE, ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN,
+    ERR_TTL_UNSUPPORTED_PK_TYPE, ERR_VIEW_WRONG_LIST, ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, Error,
+    Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
@@ -966,6 +967,41 @@ pub(crate) fn validate_ttl(info: &TableInfo) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Validate a TiDB `AFFINITY` table option for a table of the given kind and
+/// return the value to store (`"table"` / `"partition"`, empty when unset).
+pub(crate) fn affinity_setting(raw: &str, temporary: bool, partitioned: bool) -> Result<String> {
+    if temporary {
+        return Err(Error::new(
+            ERR_AFFINITY,
+            "Can not set AFFINITY on a temporary table.",
+        ));
+    }
+    let stored = match raw.to_ascii_lowercase().as_str() {
+        "table" => "table",
+        "partition" => "partition",
+        "none" | "" => "",
+        _ => {
+            return Err(Error::new(
+                ERR_AFFINITY,
+                format!("Invalid AFFINITY '{raw}'"),
+            ));
+        }
+    };
+    if stored == "table" && partitioned {
+        return Err(Error::new(
+            ERR_AFFINITY,
+            "Can not set AFFINITY='table' on a partition table.",
+        ));
+    }
+    if stored == "partition" && !partitioned {
+        return Err(Error::new(
+            ERR_AFFINITY,
+            "Can not set AFFINITY='partition' on a non-partition table.",
+        ));
+    }
+    Ok(stored.to_string())
 }
 
 /// Table-level `DEFAULT CHARSET` / `COLLATE`, also inherited by character

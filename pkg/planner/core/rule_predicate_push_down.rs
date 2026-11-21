@@ -125,6 +125,112 @@ fn push_into(
                     common_handle: false,
                 };
             }
+            // Filters that arrive after the access path was decided (join-side
+            // derived predicates, null rejects) ride *above* a handle range:
+            // the `TableRangeScan` keeps the access cardinality and the cop
+            // `Selection` filters it. Fold them into the EXPLAIN-only range
+            // marker so the scan shape matches TiDB and re-derive the reader
+            // estimate from the accumulated cop filters.
+            let mut filter_est = filter_est;
+            let mut range_scan = range_scan;
+            if let Some(raw) = range_scan.as_deref() {
+                // A marker with an access-time `SEL:` already describes its
+                // residual filter; leave it alone. Any other marker (a bare
+                // handle range, or our own `SCAN:` one) folds in the cop
+                // filters that were pushed after the access path was decided
+                // (join-side derived predicates, null rejects), so they render
+                // as the cop `Selection` above the range.
+                let mut parts = raw.split('\u{1}');
+                let base = parts.next().unwrap_or(raw).to_string();
+                // Keep the access-time markers the recompute does not own
+                // (`PROJ:` above a rowid range).
+                let mut preserved: Vec<&str> = Vec::new();
+                let mut access_sel: Option<&str> = None;
+                let mut consumed: Option<&str> = None;
+                for part in parts {
+                    if let Some(sel) = part.strip_prefix("SEL:") {
+                        access_sel = Some(sel);
+                    } else if let Some(range) = part.strip_prefix("CONSUMED:") {
+                        consumed = Some(range);
+                    } else if !part.starts_with("SCAN:") {
+                        preserved.push(part);
+                    }
+                }
+                let access_rows = raw
+                    .split('\u{1}')
+                    .find_map(|part| {
+                        part.strip_prefix("SCAN:")
+                            .and_then(|rows| rows.parse::<f64>().ok())
+                    })
+                    .or(filter_est)
+                    .unwrap_or(row_count);
+                let filters = and_opt(
+                    ExprNode::compose_cnf(pushable.clone()).map(simplify_or_arms),
+                    pushed.clone(),
+                );
+                if let Some(filters) = filters.as_ref() {
+                    // The `TableRangeScan` handle is the clustered primary
+                    // key, or the implicit `_tidb_rowid` of a heap table —
+                    // `handle_column` falls back to the first integer column
+                    // for the latter, which is *not* the seek key.
+                    let handle = table_info.as_ref().map(|info| {
+                        if info.pk_is_handle {
+                            info.handle_column()
+                                .map(|column| column.name.o().to_string())
+                                .unwrap_or_else(|| "_tidb_rowid".to_string())
+                        } else {
+                            "_tidb_rowid".to_string()
+                        }
+                    });
+                    // The `TableRangeScan` already encodes the handle
+                    // conjuncts (`id BETWEEN …`); only the other cop
+                    // filters belong to the `Selection` above it.
+                    let mut above: Vec<ExprNode> = Vec::new();
+                    let mut fresh = false;
+                    for conjunct in filters.split_cnf() {
+                        let rendered = super::explain::explain_pushed_filter(&table, &conjunct);
+                        // The access range already enforces this conjunct.
+                        if consumed.is_some_and(|range| range.contains(&rendered)) {
+                            continue;
+                        }
+                        if handle.as_ref().is_some_and(|handle| {
+                            sealdb_statistics::pseudo::conjunct_bound_sets(&conjunct)
+                                .is_some_and(|(name, _)| name.eq_ignore_ascii_case(handle))
+                        }) {
+                            continue;
+                        }
+                        if above
+                            .iter()
+                            .any(|seen| seen.restore_string() == conjunct.restore_string())
+                        {
+                            continue;
+                        }
+                        if !access_sel.is_some_and(|sel| sel.contains(&rendered)) {
+                            fresh = true;
+                        }
+                        above.push(conjunct);
+                    }
+                    if fresh {
+                        let sel = sealdb_statistics::pseudo::selectivity(&above, 1.0, None)
+                            .unwrap_or(1.0);
+                        filter_est = Some(access_rows * sel);
+                        let mut info: Vec<String> = above
+                            .iter()
+                            .map(|expr| super::explain::explain_pushed_filter(&table, expr))
+                            .collect();
+                        info.sort();
+                        let preserved = if preserved.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\u{1}{}", preserved.join("\u{1}"))
+                        };
+                        range_scan = Some(format!(
+                            "{base}{preserved}\u{1}SCAN:{access_rows}\u{1}SEL:{}",
+                            info.join(", ")
+                        ));
+                    }
+                }
+            }
             wrap_residual(
                 PhysicalPlan::TableReader {
                     table,
@@ -676,6 +782,14 @@ fn push_into(
             child: Box::new(push_into(*child, conjuncts, is, current_db)),
             est_rows: None,
         },
+        // The star-order projection only restores column order; filters still
+        // belong to the join below it.
+        PhysicalPlan::StarOrderProjection { exprs, child } => {
+            PhysicalPlan::StarOrderProjection {
+                exprs,
+                child: Box::new(push_into(*child, conjuncts, is, current_db)),
+            }
+        }
         PhysicalPlan::Distinct {
             keys,
             fields,
@@ -759,10 +873,16 @@ fn push_into(
                 let left_map = column_owners(&left_tables, is, current_db);
                 let right_map = column_owners(&right_tables, is, current_db);
                 let mut keep = Vec::new();
-                // HashJoin derives its hash key from the first equality in
-                // `ON`; further equalities stay as a filter above the join so
-                // they are still enforced (inner joins are filter-equivalent).
-                let mut key_taken = !is_true_expr(&on);
+                // TiDB `pushDownPredicatesForJoin` promotes *every* cross-table
+                // equality into the join keys (`HashJoin equal:[eq(…)
+                // eq(…)]`); inner joins are filter-equivalent, so promoting
+                // more keys only tightens the estimate. The executor hashes on
+                // the first key and applies the rest as residual conditions.
+                let mut on_keys: Vec<ExprNode> = if is_true_expr(&on) {
+                    Vec::new()
+                } else {
+                    on.split_cnf()
+                };
                 for expr in residual {
                     match resolve_conjunct_side(
                         &expr,
@@ -785,14 +905,13 @@ fn push_into(
                                 // residual `Selection` applies MySQL coercion
                                 // (`int = bit`): only promote a type-identical
                                 // key, else the join would drop matching rows.
-                                if key_taken || !same_join_key_type(&key, is, current_db) {
+                                if !same_join_key_type(&key, is, current_db) {
                                     keep.push(key);
                                 } else {
                                     // CROSS JOIN's placeholder `ON TRUE` gives
-                                    // way to the equality key.
-                                    on = key;
+                                    // way to the equality keys.
+                                    on_keys.push(key);
                                     tp = JoinType::Inner;
-                                    key_taken = true;
                                 }
                             } else {
                                 keep.push(expr);
@@ -800,6 +919,7 @@ fn push_into(
                         }
                     }
                 }
+                on = ExprNode::compose_cnf(on_keys).unwrap_or(on);
                 // TiDB `pushDownPredicatesForJoin`: an inner-join equality key
                 // makes single-side predicates derivable on the other side
                 // (`t1.c1 > k` ⇒ `t2.c1 > k` when `t1.c1 = t2.c1`).
@@ -1055,7 +1175,7 @@ fn pk_eq_handle(
 /// `cast_enum` (`cast(col, double)` / `cast(col, var_string)`), so a
 /// blacklisted `enum` row keeps every predicate over such a column on the TiDB
 /// side — even a plain `gt(b, 1)`.
-fn cop_pushable(expr: &ExprNode, table: &str) -> bool {
+pub(crate) fn cop_pushable(expr: &ExprNode, table: &str) -> bool {
     // `mysql.expr_pushdown_blacklist`: TiDB checks the expression's own
     // `ScalarFunction` name at every node of the conjunct, so a blacklisted
     // `lt` keeps the whole conjunct (and its children) on the tidb side.
@@ -1087,17 +1207,10 @@ fn cop_pushable(expr: &ExprNode, table: &str) -> bool {
         ExprNode::Like(like) => {
             cop_pushable(&like.expr, table) && cop_pushable(&like.pattern, table)
         }
-        ExprNode::Case(case) => {
-            case.operand.as_ref().is_none_or(|o| cop_pushable(o, table))
-                && case
-                    .when_then
-                    .iter()
-                    .all(|(when, then)| cop_pushable(when, table) && cop_pushable(then, table))
-                && case
-                    .else_expr
-                    .as_ref()
-                    .is_none_or(|e| cop_pushable(e, table))
-        }
+        // TiDB's coprocessor has no `case` scalar function: a `CASE` expression
+        // keeps its whole conjunct on the tidb side (`index_advise` sizes the
+        // root `Selection` with the 0.8 factor over the cop-filtered scan).
+        ExprNode::Case(_) => false,
         _ => true,
     }
 }
