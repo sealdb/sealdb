@@ -74,7 +74,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **118 个** �
 → PASS: memory=1 tikv=1
 ```
 
-TiKV 侧：**首次跑通全量 `-s tikv` gate**（`PASS: tikv=124`，4 分 32 秒）。此前全量 TiKV gate 反复卡死（曾 68 分钟无输出）的根因不是 DDL prewrite 逻辑，而是本地 store 长期复用后膨胀到 **51 GB**（大量 tombstone / 失效 region，日志持续报 `skip invalid split key`），单机 TiKV 被 compaction 与无效 split 拖住。处理方式：`project/scripts/run_local_pd_tikv.sh stop` + `rm -rf /tmp/sealdb-pd-tikv` 后重启全新单节点集群，再做全量 gate。后续每次全量 TiKV gate 前建议都从空 store 起，若复用则先检查 `du -sh /tmp/sealdb-pd-tikv`。
+TiKV 侧：**首次跑通全量 `-s tikv` gate**（`PASS: tikv=124`，4 分 32 秒）。此前全量 TiKV gate 反复卡死（曾 68 分钟无输出）的根因不是 DDL prewrite 逻辑，而是本地 store 长期复用后膨胀到 **51 GB**（大量 tombstone / 失效 region，日志持续报 `skip invalid split key`），单机 TiKV 被 compaction 与无效 split 拖住。处理方式：`project/scripts/run_local_pd_tikv.sh stop` + `rm -rf /tmp/sealdb-pd-tikv` 后重启全新单节点集群，再做全量 gate。实测每轮全量 gate 会让 store 增长约 20 GB（跑完一轮后 23 GB 时同样 gate 耗时升到 8 分钟），因此全量 TiKV gate 前统一从空 store 起，并先用 `du -sh /tmp/sealdb-pd-tikv` 确认。
 
 ---
 
