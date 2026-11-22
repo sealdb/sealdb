@@ -291,10 +291,23 @@ pub fn conjunct_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
         return Some((column, vec![point]));
     }
     if let Some((column, value)) = expr.ne_column_const() {
+        // Out-of-domain NE against a negative constant (typical for unsigned
+        // columns): TiDB keeps the NE in ExplainInfo but estimates it like a
+        // one-sided `[0, +inf)` range (`3333.33`), not the two open ranges
+        // around -1 and not the null-deducted `(-inf, 0)` less-rate.
+        if matches!(&value, Datum::I64(v) if *v < 0)
+            || matches!(&value, Datum::F64(v) if *v < 0.0)
+            || matches!(&value, Datum::Decimal(d) if d.to_f64().ok().is_some_and(|f| f < 0.0))
+        {
+            return Some((column, vec![(Some((Datum::I64(0), true)), None)]));
+        }
         // TiDB ranger: `a <> v` → `(-inf,v), (v,+inf)`.
         let below = (None, Some((value.clone(), false)));
         let above = (Some((value, false)), None);
         return Some((column, vec![below, above]));
+    }
+    if let Some((column, low, high)) = like_prefix_bound(expr) {
+        return Some((column, vec![(Some((low, true)), Some((high, false)))]));
     }
     if let Some((column, op, value)) = expr.column_cmp_const() {
         if op == Op::Ne {
@@ -423,6 +436,8 @@ pub fn like_prefix_bound(expr: &ExprNode) -> Option<(String, Datum, Datum)> {
 }
 
 /// `a = 1 OR a = 2 …` over one column: point range per DNF arm.
+/// Constant-false arms (`or(eq(a, 1), 0)`) are ignored so the estimate matches
+/// the surviving equality (TiDB keeps the `or(…, 0)` text but uses eq NDV).
 fn dnf_eq_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
     let arms = expr.split_dnf();
     if arms.len() < 2 {
@@ -431,12 +446,21 @@ fn dnf_eq_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
     let mut column: Option<String> = None;
     let mut ranges = Vec::with_capacity(arms.len());
     for arm in &arms {
+        if let ExprNode::Value(v) = arm {
+            if v.datum.is_null() || matches!(v.datum, Datum::I64(0) | Datum::U64(0)) {
+                continue;
+            }
+            return None;
+        }
         let (name, value) = arm.eq_key_const()?;
         match &column {
             Some(have) if !have.eq_ignore_ascii_case(&name) => return None,
             _ => column = Some(name),
         }
         ranges.push((Some((value.clone(), true)), Some((value, true))));
+    }
+    if ranges.is_empty() {
+        return None;
     }
     Some((column?, ranges))
 }
@@ -821,6 +845,19 @@ pub fn selectivity(conjuncts: &[ExprNode], table_rows: f64, handle: Option<&str>
         }
         let mut dnf_selectivity = 0.0f64;
         for item in items {
+            // Constant false/true arms (`or(eq(a, 1), 0)`): TiDB drops the
+            // zero arm from the estimate so the OR matches the eq selectivity.
+            if let ExprNode::Value(v) = &item {
+                if v.datum.is_null() || matches!(v.datum, Datum::I64(0) | Datum::U64(0)) {
+                    continue;
+                }
+                if matches!(v.datum, Datum::I64(n) if n != 0)
+                    || matches!(v.datum, Datum::U64(n) if n != 0)
+                {
+                    dnf_selectivity = 1.0;
+                    break;
+                }
+            }
             let arm = selectivity(&item.split_cnf(), table_rows, handle)?;
             dnf_selectivity = dnf_selectivity + arm - dnf_selectivity * arm;
         }
@@ -949,6 +986,13 @@ mod tests {
     }
 
     #[test]
+    fn test_or_eq_with_false_arm_is_point_selectivity() {
+        let conds = [parse_expr("a = 1 or 0").expect("parsed")];
+        let sel = selectivity(&conds, 10_000.0, None).expect("modeled");
+        assert!((sel * 10_000.0 - 10.0).abs() < 1e-6, "{}", sel * 10_000.0);
+    }
+
+    #[test]
     fn test_dnf_over_handle_and_column_is_independent() {
         // TiDB: `not(isnull(c)) and (a = 1 or b = 1)` with `a` the int handle
         // over 10000 pseudo rows → 0.999 * (1 - (1 - 1/10000)(1 - 1/1000)).
@@ -1072,5 +1116,22 @@ mod tests {
     fn test_key_range_point_on_unique_index_is_one_row() {
         let point = KeyRange::point(vec![int(1), int(2)]);
         assert_eq!(index_key_ranges_rows(10_000.0, &[point], 2, true), 1.0);
+    }
+
+    #[test]
+    fn test_gt_min_ne_max_notnull_est() {
+        // TiDB: `a > INT_MIN AND a != INT_MAX AND a IS NOT NULL` → 3583.33
+        // (NE two-range intersected with the open gt bound).
+        let conds = [
+            parse_expr("a > -9223372036854775808").expect("gt"),
+            parse_expr("a != 9223372036854775807").expect("ne"),
+            parse_expr("a is not null").expect("nn"),
+        ];
+        let sel = selectivity(&conds, 10_000.0, None).expect("sel");
+        assert!(
+            (sel * 10_000.0 - 3_583.333_333_333).abs() < 1e-6,
+            "{}",
+            sel * 10_000.0
+        );
     }
 }

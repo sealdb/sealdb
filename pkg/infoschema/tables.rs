@@ -818,25 +818,41 @@ fn partitions(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
             ]);
             return;
         };
-        let method = match part.tp {
-            PartitionType::Range => "RANGE",
-            PartitionType::Hash => "HASH",
-            PartitionType::List => "LIST",
-            PartitionType::Key => "KEY",
+        let method = match (part.tp, part.range_columns) {
+            (PartitionType::Range, true) => "RANGE COLUMNS",
+            (PartitionType::Range, false) => "RANGE",
+            (PartitionType::Hash, _) => "HASH",
+            (PartitionType::List, true) => "LIST COLUMNS",
+            (PartitionType::List, false) => "LIST",
+            (PartitionType::Key, _) => "KEY",
+        };
+        // TiDB reports the partitioning expression of a COLUMNS partition as a
+        // backticked column list (`` `a`,`b` ``) and a plain column key as a
+        // backticked identifier too; expression partitions keep the stored text.
+        let expression = if part.range_columns {
+            part.columns
+                .iter()
+                .map(|c| format!("`{}`", c.o()))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            let trimmed = part.expr.trim();
+            if !trimmed.is_empty()
+                && trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+            {
+                format!("`{trimmed}`")
+            } else {
+                part.expr.clone()
+            }
         };
         let table_stats = is.stats().and_then(|h| h.table(db, table.name.o()));
         for (i, def) in part.definitions.iter().enumerate() {
             let desc = if def.in_values.is_empty() {
                 def.less_than.join(",")
             } else {
-                def.in_values
-                    .iter()
-                    .map(|v| match v {
-                        Some(v) => v.to_string(),
-                        None => "NULL".to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
+                format_list_partition_description(&def.in_values, part.range_columns)
             };
             let (row_count, avg_row_length, data_length, index_length) =
                 estimate_partition_row_lengths(table, table_stats.as_ref(), def.id);
@@ -850,7 +866,7 @@ fn partitions(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                 Datum::Null,
                 bytes(method),
                 Datum::Null,
-                bytes(&part.expr),
+                bytes(&expression),
                 Datum::Null,
                 if desc.is_empty() {
                     Datum::Null
@@ -1586,6 +1602,34 @@ fn stats_table_locked(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
         })
         .unwrap_or_default();
     (columns, rows)
+}
+
+fn format_list_partition_description(
+    entries: &[sealdb_meta::ListInEntry],
+    list_columns: bool,
+) -> String {
+    entries
+        .iter()
+        .map(|e| match e {
+            sealdb_meta::ListInEntry::Default => "DEFAULT".to_string(),
+            sealdb_meta::ListInEntry::Row(row) => {
+                let multi = list_columns && row.len() > 1;
+                let inner = row
+                    .iter()
+                    .map(|lit| match lit {
+                        sealdb_meta::ListLiteral::Null => "NULL".to_string(),
+                        sealdb_meta::ListLiteral::Number(n) => n.clone(),
+                        sealdb_meta::ListLiteral::String(s) => {
+                            format!("'{}'", sealdb_meta::escape_mysql_string(s))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if multi { format!("({inner})") } else { inner }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn bytes(value: &str) -> Datum {

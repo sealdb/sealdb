@@ -147,14 +147,11 @@ fn rewrite_ifnull(func: &FuncCallExpr, cols: &Columns<'_>) -> Option<ExprNode> {
     }))
 }
 
-/// `isnull(<not null col>)` → `0`.
+/// `isnull(<not null col>)` → `0`; `is not null` → `1`.
 fn rewrite_isnull(
     expr: &sealdb_parser::ast::expressions::IsNullExpr,
     cols: &Columns<'_>,
 ) -> Option<ExprNode> {
-    if expr.not {
-        return None;
-    }
     let ExprNode::Column(col) = expr.expr.as_ref() else {
         return None;
     };
@@ -163,7 +160,7 @@ fn rewrite_isnull(
         return None;
     }
     Some(ExprNode::Value(ValueExpr {
-        datum: Datum::I64(0),
+        datum: Datum::I64(if expr.not { 1 } else { 0 }),
     }))
 }
 

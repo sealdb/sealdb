@@ -188,6 +188,9 @@ impl ExprNode {
                 out
             }
             ExprNode::Cast(c) => format!("cast({} as {})", c.expr.text(), c.target),
+            // TiDB `field.Text()` for window exprs is lowercase
+            // (`first_value(a) over(rows between 1 preceding and 1 following)`).
+            ExprNode::Window(w) => w.field_text(),
             other => other.restore_string(),
         }
     }
@@ -216,9 +219,11 @@ impl ExprNode {
                 Datum::Time(t) => format!("{t}"),
                 Datum::Null => "NULL".to_string(),
             },
-            ExprNode::Func(_) | ExprNode::Cast(_) | ExprNode::Binary(_) | ExprNode::Unary(_) => {
-                self.text()
-            }
+            ExprNode::Func(_)
+            | ExprNode::Cast(_)
+            | ExprNode::Binary(_)
+            | ExprNode::Unary(_)
+            | ExprNode::Window(_) => self.text(),
             _ => String::new(),
         }
     }
@@ -963,6 +968,13 @@ pub struct FuncCallExpr {
 
 impl FuncCallExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        // `expr COLLATE name` is collation metadata: TiDB renders the operand
+        // itself (`eq(t.a, "aa")`), not the internal wrapper.
+        if self.name.eq_ignore_ascii_case("__collate")
+            && let Some(arg) = self.args.first()
+        {
+            return arg.restore(ctx);
+        }
         // `IS [NOT] TRUE|FALSE|UNKNOWN` round-trips as a predicate.
         if let Some(suffix) = is_truth_suffix(&self.name)
             && let Some(arg) = self.args.first()
@@ -1507,5 +1519,92 @@ impl WindowFuncExpr {
         self.spec.restore(ctx)?;
         ctx.write_str(")");
         Ok(())
+    }
+
+    /// Implicit select-list name (TiDB `SelectField.Text()` for window funcs).
+    pub fn field_text(&self) -> String {
+        let mut out = self.name.to_ascii_lowercase();
+        out.push('(');
+        if self.name.eq_ignore_ascii_case("COUNT") && self.args.is_empty() {
+            out.push('*');
+        } else {
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&arg.text());
+            }
+        }
+        out.push(')');
+        if self.ignore_nulls {
+            out.push_str(" ignore nulls");
+        }
+        out.push_str(" over(");
+        out.push_str(&self.spec.field_text());
+        out.push(')');
+        out
+    }
+}
+
+impl WindowSpec {
+    fn field_text(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.partition_by.is_empty() {
+            let cols = self
+                .partition_by
+                .iter()
+                .map(|e| e.text())
+                .collect::<Vec<_>>()
+                .join(",");
+            parts.push(format!("partition by {cols}"));
+        }
+        if !self.order_by.is_empty() {
+            let cols = self
+                .order_by
+                .iter()
+                .map(|item| {
+                    let mut s = item.expr.text();
+                    if item.desc {
+                        s.push_str(" desc");
+                    }
+                    s
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            parts.push(format!("order by {cols}"));
+        }
+        if let Some(frame) = &self.frame {
+            parts.push(frame.field_text());
+        }
+        parts.join(" ")
+    }
+}
+
+impl WindowFrameSpec {
+    fn field_text(&self) -> String {
+        format!(
+            "{} between {} and {}",
+            self.units.restore().to_ascii_lowercase(),
+            self.start.field_text(),
+            self.end.field_text()
+        )
+    }
+}
+
+impl WindowFrameBound {
+    fn field_text(&self) -> String {
+        match self {
+            WindowFrameBound::UnboundedPreceding => "unbounded preceding".into(),
+            WindowFrameBound::Preceding(n) => format!("{n} preceding"),
+            WindowFrameBound::CurrentRow => "current row".into(),
+            WindowFrameBound::Following(n) => format!("{n} following"),
+            WindowFrameBound::UnboundedFollowing => "unbounded following".into(),
+            WindowFrameBound::IntervalPreceding { value, unit } => {
+                format!("interval {value} {unit} preceding")
+            }
+            WindowFrameBound::IntervalFollowing { value, unit } => {
+                format!("interval {value} {unit} following")
+            }
+        }
     }
 }

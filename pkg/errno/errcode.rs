@@ -134,6 +134,9 @@ pub const ERR_VIEW_NO_EXPLAIN: i32 = 1345;
 pub const ERR_INFO_SCHEMA_EXPIRED: i32 = 8027;
 pub const ERR_INFO_SCHEMA_CHANGED: i32 = 8028;
 pub const ERR_UNKNOWN_STMT_HANDLER: i32 = 1243;
+/// TiDB `ErrPreparedStmtNotFound`: `EXECUTE name` when the session has no
+/// such prepared statement (8111). Distinct from MySQL's COM_STMT 1243.
+pub const ERR_PREPARED_STMT_NOT_FOUND: i32 = 8111;
 pub const ERR_UNKNOWN_CHARACTER_SET: i32 = 1115;
 pub const ERR_UNKNOWN_COLLATION: i32 = 1273;
 /// MySQL `ER_COLLATION_CHARSET_MISMATCH`: a COLLATE names a collation that

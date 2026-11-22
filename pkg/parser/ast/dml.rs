@@ -426,7 +426,12 @@ impl SelectStmt {
                 .map(|with| with.ctes.iter().map(|cte| cte.name.clone()).collect())
                 .unwrap_or_default();
             ctx.push_cte_names(&names);
-            let restored = self.restore_view_body(ctx);
+            let ctes: Vec<&CommonTableExpression> = self
+                .with
+                .as_ref()
+                .map(|with| with.ctes.iter().collect())
+                .unwrap_or_default();
+            let restored = self.restore_view_body(ctx, &ctes);
             ctx.truncate_cte_names(before);
             return restored;
         }
@@ -527,17 +532,33 @@ impl SelectStmt {
             .map(|with| with.ctes.iter().map(|cte| cte.name.clone()).collect())
             .unwrap_or_default();
         ctx.push_cte_names(&names);
-        let restored = self.restore_view_body(ctx);
-        ctx.truncate_cte_names(before);
-        restored
-    }
-
-    fn restore_view_body(&self, ctx: &mut RestoreCtx) -> Result<()> {
         let ctes: Vec<&CommonTableExpression> = self
             .with
             .as_ref()
             .map(|with| with.ctes.iter().collect())
             .unwrap_or_default();
+        let restored = self.restore_view_body(ctx, &ctes);
+        ctx.truncate_cte_names(before);
+        restored
+    }
+
+    /// `ctes` is the enclosing WITH list used to inline nested derived tables.
+    /// When this select is itself a derived CTE body, pass the parent's CTEs so
+    /// sibling derived sources stay nested subqueries instead of bare names.
+    fn restore_view_body(
+        &self,
+        ctx: &mut RestoreCtx,
+        ctes: &[&CommonTableExpression],
+    ) -> Result<()> {
+        self.restore_view_body_scoped(ctx, ctes, &[])
+    }
+
+    fn restore_view_body_scoped(
+        &self,
+        ctx: &mut RestoreCtx,
+        ctes: &[&CommonTableExpression],
+        inlining: &[&str],
+    ) -> Result<()> {
         if let Some(with) = &self.with {
             let normal: Vec<&CommonTableExpression> =
                 with.ctes.iter().filter(|cte| !cte.derived).collect();
@@ -583,13 +604,13 @@ impl SelectStmt {
         }
         if !self.joins.is_empty() {
             ctx.write_str(" FROM ");
-            self.restore_view_join(ctx, &ctes, self.joins.len() - 1)?;
+            self.restore_view_join(ctx, ctes, inlining, self.joins.len() - 1)?;
         } else if let Some(from) = &self.from {
             ctx.write_str(" FROM ");
-            restore_view_table(from, ctx, &ctes)?;
+            restore_view_table_scoped(from, ctx, ctes, inlining)?;
         } else if let Some(item) = &self.from_item {
             ctx.write_str(" FROM ");
-            restore_view_from_item(item, ctx, &ctes)?;
+            restore_view_from_item_scoped(item, ctx, ctes, inlining)?;
         }
         if let Some(selection) = &self.selection {
             ctx.write_str(" WHERE ");
@@ -640,14 +661,15 @@ impl SelectStmt {
         &self,
         ctx: &mut RestoreCtx,
         ctes: &[&CommonTableExpression],
+        inlining: &[&str],
         i: usize,
     ) -> Result<()> {
         if i > 0 {
             ctx.write_str("(");
-            self.restore_view_join(ctx, ctes, i - 1)?;
+            self.restore_view_join(ctx, ctes, inlining, i - 1)?;
             ctx.write_str(")");
         } else {
-            restore_view_table(&self.joins[0].left, ctx, ctes)?;
+            restore_view_table_scoped(&self.joins[0].left, ctx, ctes, inlining)?;
         }
         let join = &self.joins[i];
         ctx.write_str(" ");
@@ -656,7 +678,7 @@ impl SelectStmt {
         }
         ctx.write_str(join.tp.restore());
         ctx.write_str(" ");
-        restore_view_table(&join.right, ctx, ctes)?;
+        restore_view_table_scoped(&join.right, ctx, ctes, inlining)?;
         if !join.using_cols.is_empty() {
             ctx.write_str(" USING (");
             for (j, col) in join.using_cols.iter().enumerate() {
@@ -681,17 +703,35 @@ fn restore_view_table(
     ctx: &mut RestoreCtx,
     ctes: &[&CommonTableExpression],
 ) -> Result<()> {
-    if let Some(cte) = ctes
-        .iter()
-        .find(|cte| cte.derived && cte.name.eq_ignore_ascii_case(&table.name))
-    {
+    restore_view_table_scoped(table, ctx, ctes, &[])
+}
+
+fn restore_view_table_scoped(
+    table: &TableName,
+    ctx: &mut RestoreCtx,
+    ctes: &[&CommonTableExpression],
+    inlining: &[&str],
+) -> Result<()> {
+    if let Some(cte) = ctes.iter().find(|cte| {
+        cte.derived
+            && cte.name.eq_ignore_ascii_case(&table.name)
+            && !inlining
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&cte.name))
+    }) {
+        // Inline with the enclosing CTE list so nested derived siblings
+        // (`FROM (SELECT … FROM (SELECT …) tb1) tb`) stay nested, instead of
+        // collapsing the inner level to a bare `FROM tb1`. Skip names already
+        // on the inlining stack to avoid self-referential expand loops.
+        let mut nested = inlining.to_vec();
+        nested.push(cte.name.as_str());
         ctx.write_str("(");
-        cte.query.restore(ctx)?;
+        cte.query.restore_view_body_scoped(ctx, ctes, &nested)?;
         for (op, select) in &cte.set_rest {
             ctx.write_str(" ");
             ctx.write_str(op.restore());
             ctx.write_str(" ");
-            select.restore(ctx)?;
+            select.restore_view_body_scoped(ctx, ctes, &nested)?;
         }
         ctx.write_str(") AS ");
         ctx.write_name(&cte.name);
@@ -708,13 +748,14 @@ fn restore_view_table(
     table.restore(ctx)
 }
 
-fn restore_view_from_item(
+fn restore_view_from_item_scoped(
     item: &FromItem,
     ctx: &mut RestoreCtx,
     ctes: &[&CommonTableExpression],
+    inlining: &[&str],
 ) -> Result<()> {
     match item {
-        FromItem::Table(table) => restore_view_table(table, ctx, ctes),
+        FromItem::Table(table) => restore_view_table_scoped(table, ctx, ctes, inlining),
         FromItem::Join {
             left,
             right,
@@ -724,14 +765,14 @@ fn restore_view_from_item(
             natural,
         } => {
             ctx.write_str("(");
-            restore_view_from_item(left, ctx, ctes)?;
+            restore_view_from_item_scoped(left, ctx, ctes, inlining)?;
             ctx.write_str(" ");
             if *natural {
                 ctx.write_str("NATURAL ");
             }
             ctx.write_str(tp.restore());
             ctx.write_str(" ");
-            restore_view_from_item(right, ctx, ctes)?;
+            restore_view_from_item_scoped(right, ctx, ctes, inlining)?;
             if !using_cols.is_empty() {
                 ctx.write_str(" USING (");
                 for (i, col) in using_cols.iter().enumerate() {

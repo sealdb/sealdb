@@ -229,6 +229,13 @@ fn rewrite_apply(
     current_db: &str,
     stats: Option<&sealdb_statistics::Handle>,
 ) -> PhysicalPlan {
+    // `pred OR col IN (SELECT …)`: TiDB decorrelates to a left-outer semi join
+    // whose marker feeds `Selection or(pred, Column#N)` (not a plain Apply).
+    if let Some(rewritten) =
+        rewrite_or_in_left_outer_semi(plan.clone(), &filter, is, current_db, stats)
+    {
+        return rewritten;
+    }
     let mut leftover = Vec::new();
     for item in filter.split_cnf() {
         match try_semi_spec(&plan, &item, is, current_db) {
@@ -367,6 +374,146 @@ fn wrap_leftover(plan: PhysicalPlan, leftover: Vec<ExprNode>) -> PhysicalPlan {
             est_rows: None,
         }
     }
+}
+
+/// `WHERE p OR x IN (SELECT y FROM t)` → Projection → Selection(or(p, marker))
+/// → HashJoin CARTESIAN left outer semi.
+fn rewrite_or_in_left_outer_semi(
+    plan: PhysicalPlan,
+    filter: &ExprNode,
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
+    _stats: Option<&sealdb_statistics::Handle>,
+) -> Option<PhysicalPlan> {
+    let cnf = filter.split_cnf();
+    if cnf.len() != 1 {
+        return None;
+    }
+    let arms = cnf[0].split_dnf();
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut in_arm: Option<&ExprNode> = None;
+    let mut other_arms: Vec<ExprNode> = Vec::new();
+    for arm in &arms {
+        match arm {
+            ExprNode::InSubquery(sub) if !sub.not => {
+                if in_arm.is_some() {
+                    return None;
+                }
+                in_arm = Some(arm);
+            }
+            other if other.has_subquery() => return None,
+            other => other_arms.push(other.clone()),
+        }
+    }
+    let in_expr = in_arm?;
+    if other_arms.is_empty() {
+        return None;
+    }
+    let ExprNode::InSubquery(sub) = in_expr else {
+        return None;
+    };
+    let query = sub.query.as_select()?;
+    let outer_table = plan_table(&plan)?;
+    let spec = from_in(
+        &sub.expr,
+        query,
+        Some(outer_table.as_str()),
+        false,
+        is,
+        current_db,
+    )?;
+    // Rebuild as CARTESIAN left-outer semi with other-cond equality (TiDB's
+    // OR-IN shape), regardless of the plain-IN dedup rewrite.
+    let ExprNode::InSubquery(sub) = in_expr else {
+        return None;
+    };
+    let inner = simple_inner(query)?;
+    let inner_physical = inner.physical.as_deref().unwrap_or(&inner.name);
+    let inner_field = query.fields.first()?.expr.clone();
+    let inner_expr = qualify_table(inner_field, &inner.name);
+    let outer_expr = qualify_table((*sub.expr).clone(), &outer_table);
+    let info = format!(
+        "CARTESIAN left outer semi join, other cond:eq({}, {})",
+        explain_semi_pred(&outer_expr),
+        explain_semi_pred_inner(&inner_expr, &inner.name, inner_physical),
+    );
+    let left_table = outer_table.clone();
+    let join = PhysicalPlan::HashJoin {
+        est_rows: Some(super::explain::est_rows(&plan)),
+        tp: JoinType::Semi,
+        left: Box::new(plan),
+        right: Box::new(spec.right),
+        left_table: left_table.clone(),
+        right_table: spec.right_table,
+        on: ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(info.into_bytes()),
+        }),
+    };
+    // Marker column id: outer schema width + inner schema width + 1.
+    let outer_width = table_schema_width(is, current_db, &left_table).unwrap_or(3);
+    let inner_width = table_schema_width(is, current_db, &inner.name).unwrap_or(3);
+    let marker = outer_width + inner_width + 1;
+    let mut or_arms: Vec<String> = other_arms
+        .iter()
+        .map(|arm| explain_semi_pred(arm))
+        .collect();
+    or_arms.push(format!("Column#{marker}"));
+    let sel_info = if or_arms.len() == 2 {
+        format!("or({}, {})", or_arms[0], or_arms[1])
+    } else {
+        format!("or({})", or_arms.join(", "))
+    };
+    let selection = PhysicalPlan::Selection {
+        child: Box::new(join),
+        filter: ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(sel_info.into_bytes()),
+        }),
+        est_rows: None,
+    };
+    // Project away the marker: TiDB keeps a named Projection of the outer
+    // table's user columns above the Selection.
+    let prefix = if current_db.is_empty() {
+        "select".to_string()
+    } else {
+        current_db.to_string()
+    };
+    let exprs = outer_user_columns(is, current_db, &left_table)
+        .into_iter()
+        .map(|col| format!("{prefix}.{left_table}.{col}"))
+        .collect::<Vec<_>>();
+    if exprs.is_empty() {
+        return Some(selection);
+    }
+    Some(PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(selection),
+        est_rows: None,
+    })
+}
+
+fn table_schema_width(
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
+    table: &str,
+) -> Option<usize> {
+    let info = is?.table_by_name(current_db, table)?;
+    Some(info.columns.len())
+}
+
+fn outer_user_columns(
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
+    table: &str,
+) -> Vec<String> {
+    let Some(info) = is.and_then(|is| is.table_by_name(current_db, table)) else {
+        return Vec::new();
+    };
+    info.columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect()
 }
 
 /// Dual-child Apply shapes for EXPLAIN (NestedLoopApply still evaluates `filter`).

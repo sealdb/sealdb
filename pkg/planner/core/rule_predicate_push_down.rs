@@ -231,6 +231,51 @@ fn push_into(
                     }
                 }
             }
+            let pushed = and_opt(
+                ExprNode::compose_cnf(pushable).map(simplify_or_arms),
+                pushed,
+            );
+            // Fresh push onto a full scan: derive filter_est from the combined
+            // cop filters (`or(eq(a, 1), 0)` → eq NDV = 10, not selectionFactor).
+            // Prefer `explain::filter_selectivity` so builtins with a known
+            // TiDB factor (`json_memberof` → 0.001) win over the generic
+            // pseudo `selectionFactor` (0.8).
+            let filter_est = if range_scan.is_none()
+                && stats_pseudo
+                && let Some(filter) = pushed.as_ref()
+            {
+                let rows = row_count.abs().max(1.0);
+                // Recompute from the combined pushed filter so conflicting
+                // `isnull ∧ ¬isnull` becomes 0 after a second push. Keep a
+                // unique-eq `filter_est` (≤1) over pseudo NDV 10. Skip LIKE
+                // so `est_rows` can use the 5325.33 like+col factor.
+                if crate::core::explain::filter_has_like(filter) {
+                    None
+                } else if let Some(sel) =
+                    crate::core::explain::filter_selectivity(filter).or_else(|| {
+                        sealdb_statistics::pseudo::selectivity(&filter.split_cnf(), rows, None)
+                    })
+                {
+                    let computed = rows * sel;
+                    if computed < 1e-12 {
+                        // `isnull ∧ ¬isnull` (and other empty ranges) win over
+                        // a stale single-conjunct est.
+                        Some(0.0)
+                    } else if let Some(prev) = filter_est.filter(|p| *p > 0.0 && *p <= 100.0) {
+                        // Unique / IN-list ranger est (1, 2, …) stays ahead of
+                        // pseudo NDV products (0.01, 20, …).
+                        Some(prev)
+                    } else {
+                        // Refresh partial pushes (`not(isnull)` → 9990) once
+                        // richer filters arrive (`gt`+`ne` → 3583.33).
+                        Some(computed)
+                    }
+                } else {
+                    filter_est
+                }
+            } else {
+                filter_est
+            };
             wrap_residual(
                 PhysicalPlan::TableReader {
                     table,
@@ -244,10 +289,7 @@ fn push_into(
                     // Newer conjuncts first (TiDB: pushed ON/like before view WHERE).
                     range_scan,
                     keep_order: false,
-                    pushed: and_opt(
-                        ExprNode::compose_cnf(pushable).map(simplify_or_arms),
-                        pushed,
-                    ),
+                    pushed,
                 },
                 residual,
             )
@@ -309,10 +351,13 @@ fn push_into(
             index,
             index_columns,
             partitions,
+            partition_names,
             partition_access,
             row_count,
             selection_info,
             probe_selection_info,
+            push_down,
+            handle_offsets,
             pushed,
             range_scan,
             ..
@@ -478,12 +523,15 @@ fn push_into(
                     index,
                     index_columns,
                     partitions,
+                    partition_names,
                     partition_access,
                     row_count,
                     selection_info,
                     probe_selection_info,
                     probe_est,
                     range_scan: access_range,
+                    push_down,
+                    handle_offsets,
                     pushed: and_opt(
                         pushed,
                         ExprNode::compose_cnf(index_side.into_iter().chain(probe_side).collect()),
@@ -497,6 +545,7 @@ fn push_into(
             index,
             index_columns,
             partitions,
+            partition_names,
             partition_access,
             row_count,
             pushed,
@@ -562,6 +611,7 @@ fn push_into(
                     index,
                     index_columns,
                     partitions,
+                    partition_names,
                     partition_access,
                     row_count,
                     pushed: and_opt(
@@ -784,12 +834,10 @@ fn push_into(
         },
         // The star-order projection only restores column order; filters still
         // belong to the join below it.
-        PhysicalPlan::StarOrderProjection { exprs, child } => {
-            PhysicalPlan::StarOrderProjection {
-                exprs,
-                child: Box::new(push_into(*child, conjuncts, is, current_db)),
-            }
-        }
+        PhysicalPlan::StarOrderProjection { exprs, child } => PhysicalPlan::StarOrderProjection {
+            exprs,
+            child: Box::new(push_into(*child, conjuncts, is, current_db)),
+        },
         PhysicalPlan::Distinct {
             keys,
             fields,
@@ -938,6 +986,37 @@ fn push_into(
                     left_preds.extend(dl);
                     right_preds.extend(dr);
                 }
+                // TiDB `DeriveOtherConditions`: a cross-side comparison in the
+                // ON / residual (`lt(t1.c_str, t2.c_str)`) rejects NULLs on each
+                // side, so push `not(isnull(col))` into the children.
+                if matches!(tp, JoinType::Inner) {
+                    let mut others = keep.clone();
+                    for item in on.split_cnf() {
+                        if let ExprNode::Binary(bin) = &item
+                            && bin.op == Op::Eq
+                            && matches!(
+                                (bin.left.as_ref(), bin.right.as_ref()),
+                                (ExprNode::Column(_), ExprNode::Column(_))
+                            )
+                        {
+                            continue;
+                        }
+                        if !is_true_expr(&item) {
+                            others.push(item);
+                        }
+                    }
+                    let (dl, dr) = derive_other_not_null(
+                        &others,
+                        &left_map,
+                        &right_map,
+                        &left_table,
+                        &right_table,
+                        is,
+                        current_db,
+                    );
+                    left_preds.extend(dl);
+                    right_preds.extend(dr);
+                }
                 residual = keep;
             }
             wrap_residual(
@@ -1006,6 +1085,60 @@ fn push_into(
             pushed,
             ranges: already,
         } => {
+            // Cluster / metrics / inspection extractors fold time-range and
+            // equality filters into MemTableScan operator info (TiDB).
+            let extracted = if super::memtable_extractor::is_metrics_pushed(pushed.as_deref())
+                || matches!(
+                    table.to_ascii_lowercase().as_str(),
+                    "cluster_log"
+                        | "slow_query"
+                        | "cluster_config"
+                        | "inspection_result"
+                        | "inspection_rules"
+                        | "table_storage_stats"
+                        | "inspection_summary"
+                        | "tiflash_tables"
+                        | "tiflash_segments"
+                        | "up"
+                        | "tidb_query_duration"
+                        | "tables"
+                        | "statistics"
+                        | "key_column_usage"
+                        | "referential_constraints"
+                ) {
+                let folded: Vec<_> = conjuncts
+                    .iter()
+                    .cloned()
+                    .map(|c| super::memtable_extractor::fold_database_consts(c, current_db))
+                    .collect();
+                Some(super::memtable_extractor::extract_memtable_predicates(
+                    &table, folded,
+                ))
+            } else {
+                None
+            };
+            if let Some(extracted) = extracted {
+                let mut text = if extracted.replace_pushed {
+                    String::new()
+                } else {
+                    pushed.unwrap_or_default()
+                };
+                if !extracted.parts.is_empty() {
+                    text = merge_memtable_pushed_parts(&text, &extracted.parts);
+                }
+                let mut ranges = already;
+                ranges.extend(extracted.ranges);
+                ranges.sort();
+                ranges.dedup();
+                return wrap_residual(
+                    PhysicalPlan::InfoSchema {
+                        table,
+                        pushed: (!text.is_empty()).then_some(text),
+                        ranges,
+                    },
+                    extracted.residual,
+                );
+            }
             // A range can only answer a predicate on a column the memory table
             // actually exposes; anything else stays above as a `Selection`.
             let columns = sealdb_infoschema::tables::virtual_columns(&table);
@@ -1188,8 +1321,21 @@ pub(crate) fn cop_pushable(expr: &ExprNode, table: &str) -> bool {
     }
     match expr {
         ExprNode::Func(func) => {
-            !func.name.eq_ignore_ascii_case("tidb_shard")
-                && func.args.iter().all(|arg| cop_pushable(arg, table))
+            let name = func.name.to_ascii_lowercase();
+            // TiDB keeps base64 transforms on the tidb side (root Selection
+            // above an IndexReader that only absorbed the LIKE / range).
+            if matches!(name.as_str(), "from_base64" | "to_base64") {
+                return false;
+            }
+            // Binary-charset columns cannot evaluate regexp in coprocessor.
+            if matches!(
+                name.as_str(),
+                "regexp_like" | "regexp_instr" | "regexp_substr" | "regexp_replace" | "regexp"
+            ) && expr_references_binary_charset(expr, table)
+            {
+                return false;
+            }
+            name != "tidb_shard" && func.args.iter().all(|arg| cop_pushable(arg, table))
         }
         ExprNode::Binary(bin) => cop_pushable(&bin.left, table) && cop_pushable(&bin.right, table),
         ExprNode::Unary(unary) => cop_pushable(&unary.expr, table),
@@ -1213,6 +1359,15 @@ pub(crate) fn cop_pushable(expr: &ExprNode, table: &str) -> bool {
         ExprNode::Case(_) => false,
         _ => true,
     }
+}
+
+/// True when `expr` reads a binary-charset column (TiDB keeps regexp on root).
+fn expr_references_binary_charset(expr: &ExprNode, table: &str) -> bool {
+    expr.referenced_columns().iter().any(|(qualifier, name)| {
+        let qualifier = qualifier.as_deref().unwrap_or(table);
+        crate::core::planbuilder::explain_column_type(qualifier, name)
+            .is_some_and(|ft| ft.charset.eq_ignore_ascii_case("binary"))
+    })
 }
 
 /// Does `expr` read an `ENUM` / `SET` column of `table`?
@@ -1355,6 +1510,56 @@ fn mark_mem_table_like_ci(mut expr: ExprNode, columns: &[String]) -> ExprNode {
         _ => {}
     }
     expr
+}
+
+/// Overlay new `col:[…]` fragments onto an existing MemTableScan pushed string,
+/// replacing any prior entry for the same column (multi-step push-down).
+/// Leaves `PromQL:…` prefixes intact — those contain commas that are not part
+/// boundaries.
+fn merge_memtable_pushed_parts(existing: &str, new_parts: &[String]) -> String {
+    if new_parts.is_empty() {
+        return existing.to_string();
+    }
+    // Metrics PromQL text is opaque; only append extractor suffixes.
+    if existing.starts_with("PromQL:") || existing.is_empty() {
+        let mut text = existing.to_string();
+        for part in new_parts {
+            if !text.is_empty() {
+                text.push_str(", ");
+            }
+            text.push_str(part);
+        }
+        return text;
+    }
+    // Split only on `, col:` style boundaries (column fragments), preserving order.
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for part in existing.split(", ").filter(|p| !p.is_empty()) {
+        let key = part
+            .split_once(':')
+            .map(|(c, _)| c.to_string())
+            .unwrap_or_else(|| part.to_string());
+        if let Some(slot) = entries.iter_mut().find(|(k, _)| k == &key) {
+            slot.1 = part.to_string();
+        } else {
+            entries.push((key, part.to_string()));
+        }
+    }
+    for part in new_parts {
+        let key = part
+            .split_once(':')
+            .map(|(c, _)| c.to_string())
+            .unwrap_or_else(|| part.clone());
+        if let Some(slot) = entries.iter_mut().find(|(k, _)| k == &key) {
+            slot.1 = part.clone();
+        } else {
+            entries.push((key, part.clone()));
+        }
+    }
+    entries
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
@@ -2136,6 +2341,128 @@ fn qualify_cross_equality(
 /// filter on both sides of a join. The mirrored column is bound to the alias
 /// that owns it inside the target subtree.
 #[allow(clippy::too_many_arguments)]
+/// TiDB `DeriveOtherConditions` / `deriveNotNullExpr`: a cross-side comparison
+/// (`lt(t1.c_str, t2.c_str)`) rejects NULLs on each nullable column it reads.
+fn derive_other_not_null(
+    others: &[ExprNode],
+    left_map: &std::collections::HashMap<String, Vec<String>>,
+    right_map: &std::collections::HashMap<String, Vec<String>>,
+    left_table: &str,
+    right_table: &str,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> (Vec<ExprNode>, Vec<ExprNode>) {
+    use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, IsNullExpr, UnaryOpExpr};
+    use sealdb_parser::opcode::Op;
+
+    fn not_null(table: &str, name: &str) -> ExprNode {
+        ExprNode::Unary(UnaryOpExpr {
+            op: Op::Not,
+            expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some(table.to_string()),
+                    name: name.to_string(),
+                })),
+                not: false,
+            })),
+        })
+    }
+    fn column_nullable(is: Option<&InfoSchema>, current_db: &str, table: &str, name: &str) -> bool {
+        let Some(is) = is else {
+            return true;
+        };
+        let info = statement_table_info(Some(is), current_db, table).or_else(|| {
+            is.all_schemas()
+                .into_iter()
+                .find_map(|db| is.table_by_name(db.name.o(), table))
+        });
+        let Some(info) = info else {
+            return true;
+        };
+        let in_pk = info.indices.iter().any(|idx| {
+            idx.primary
+                && idx
+                    .columns
+                    .iter()
+                    .any(|c| c.name.o().eq_ignore_ascii_case(name))
+        });
+        if in_pk {
+            return false;
+        }
+        info.columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(name))
+            .is_none_or(|c| c.field_type.flag & 1 == 0)
+    }
+    fn owns(
+        map: &std::collections::HashMap<String, Vec<String>>,
+        name: &str,
+        fallback: &str,
+    ) -> Option<String> {
+        match map.get(&name.to_ascii_lowercase()) {
+            Some(owners) if owners.len() == 1 => Some(owners[0].clone()),
+            Some(_) => None,
+            None if map.is_empty() => Some(fallback.to_string()),
+            None => None,
+        }
+    }
+
+    let mut dl = Vec::new();
+    let mut dr = Vec::new();
+    for expr in others {
+        let ExprNode::Binary(bin) = expr else {
+            continue;
+        };
+        // Only comparisons (`lt` / `gt` / …); equalities are join keys.
+        if !matches!(bin.op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Ne) {
+            continue;
+        }
+        let (ExprNode::Column(a), ExprNode::Column(b)) = (bin.left.as_ref(), bin.right.as_ref())
+        else {
+            continue;
+        };
+        for col in [a, b] {
+            let name = &col.name;
+            let alias = col
+                .table
+                .clone()
+                .or_else(|| owns(left_map, name, left_table))
+                .or_else(|| owns(right_map, name, right_table));
+            let Some(alias) = alias else {
+                continue;
+            };
+            let on_left = alias.eq_ignore_ascii_case(left_table)
+                || left_map
+                    .get(&name.to_ascii_lowercase())
+                    .is_some_and(|owners| owners.iter().any(|o| o.eq_ignore_ascii_case(&alias)));
+            let on_right = alias.eq_ignore_ascii_case(right_table)
+                || right_map
+                    .get(&name.to_ascii_lowercase())
+                    .is_some_and(|owners| owners.iter().any(|o| o.eq_ignore_ascii_case(&alias)));
+            if !column_nullable(is, current_db, &alias, name) {
+                continue;
+            }
+            let reject = not_null(&alias, name);
+            if on_left
+                && !dl
+                    .iter()
+                    .any(|e: &ExprNode| e.restore_string() == reject.restore_string())
+            {
+                dl.push(reject.clone());
+            }
+            if on_right
+                && !dr
+                    .iter()
+                    .any(|e: &ExprNode| e.restore_string() == reject.restore_string())
+            {
+                dr.push(reject);
+            }
+        }
+    }
+    (dl, dr)
+}
+
 fn derive_equal_cond_preds(
     on: &ExprNode,
     left_map: &std::collections::HashMap<String, Vec<String>>,

@@ -148,6 +148,15 @@ pub fn add_index(
         .with_global(index.global)
         .with_invisible(index.invisible)
         .with_where_clause(index.where_clause.clone());
+    // Push then validate so 8264 sees the new UNIQUE on a partitioned table.
+    if built.unique || built.primary {
+        info.indices.push(built.clone());
+        if let Err(err) = crate::partition::validate_unique_indexes_cover_partition_key(&info) {
+            info.indices.pop();
+            return Err(err);
+        }
+        info.indices.pop();
+    }
     for state in INDEX_REORG_STATES {
         built.state = state;
         if is_write_reorg(state) {

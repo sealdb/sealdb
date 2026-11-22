@@ -272,6 +272,7 @@ impl Handle {
                             value_counts: c.value_counts,
                             tot_col_size: c.tot_col_size,
                             part_tot_col_size: c.part_tot_col_size,
+                            ci: false,
                         },
                     )
                 })

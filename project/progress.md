@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-21（green 118 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-22（green 125 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -3353,12 +3353,105 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     单节点集群后全量 gate 从「30+ 分钟无输出」降到 4 分半（实测每轮全量 gate 增长
     约 20 GB，23 GB 时耗时已升到 8 分钟）；已写入 status-report。
 - **下一步**:
-  - 进行中的 `executor/index_lookup_merge_join`：`INL_MERGE_JOIN` 弃用告警（1815）
-    已对齐，剩余差异集中在分区表上的 INL 计划形状（static 模式
-    `PartitionUnion` 构建侧/探针侧、分区统计回退 10000 行 `stats:pseudo`、
-    `IndexHashJoin` 命名与 `Projection` 包裹）。
-  - 之后继续 R7 `executor/index_lookup_*`（`index_lookup_join` /
+  - 已完成 `executor/index_lookup_merge_join` 转绿（见下一条）。
+  - 继续 R7 `executor/index_lookup_*`（`index_lookup_join` /
     `index_lookup_pushdown`）与 `planner/core/indexjoin`。
+
+### 2026-11-21（`executor/index_lookup_merge_join` 转正：弃用 INL_MERGE 回退 HashJoin/MergeJoin）
+
+- **Phase**: R7
+- **完成**:
+  - `INL_MERGE_JOIN(…)` 带表参数时继续发 Warning 1815 并丢弃 hint；EXPLAIN 按
+    TiDB 回退形状对齐，而不是强行走 IndexJoin。
+  - static 分区裁剪：`SELECT *` 在 Build=分区钉扎侧、Probe=`PartitionUnion` 时
+    输出真实 `Projection`；equal 键按 build‖probe 定向（`eq(t2, t1)`）；空分区
+    仍保留 `10000 stats:pseudo`，join est 按「含伪分区的一侧 × 1.25」。
+  - dynamic 分区裁剪：同查询回退为 `MergeJoin`，两侧 TableFullScan
+    `keep order:true`，保留 `other cond` 与 null-reject `Selection`。
+  - 同套件 `INL_JOIN` / `INL_HASH_JOIN` 的 IndexJoin / IndexHashJoin（含
+    PartitionUnion Build、分区侧选择、other-cond `not(isnull)`）此前已对齐。
+  - `join_est_by_ndv`：`PartitionUnion` 任一子树带 `stats_pseudo` 时按伪统计
+    公式估算，避免 `1×9991/NDV` 把 HashJoin estRows 撑成 9991。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t executor/index_lookup_merge_join`
+    → `PASS: memory=1`
+  - 相关回归：`executor/index_merge_reader` / `executor/explain` / `explain_easy` /
+    `executor/index_advise` / `index_join` 全部 PASS
+  - 全量 memory / TiKV gate 见 status-report 复验证据（119 green + 8 local）
+- **下一步**:
+  - 已完成 `executor/index_lookup_join` 转绿（见下一条）。
+  - R7 `executor/index_lookup_pushdown`、`planner/core/indexjoin`。
+
+### 2026-11-22（`executor/index_lookup_pushdown_partition` 转正：分区 ILP / PartitionUnion / GLOBAL 拒绝）
+
+- **Phase**: R3
+- **完成**:
+  - 静态剪枝下 LOCAL index → `PartitionUnion` 每分区 IndexLookUp；扫描侧
+    `partition:pN`；单分区 TopN 在 LocalIndexLookUp 外（Build/Probe）。
+  - GLOBAL index `INDEX_LOOKUP_PUSHDOWN` → Warning 1815 + TableReader；
+    residual Selection 下保留 limit-scaled IndexRangeScan estRows；TopN 子
+    IndexRangeScan 无 `(Build)`。
+  - 动态脏读 `Projection → TopN → UnionScan`；多分区 unordered LIMIT 按
+    分区 id + handle 序截取。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory --status pending -t executor/index_lookup_pushdown_partition`
+    → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -s tikv -k --status pending -t executor/index_lookup_pushdown_partition`
+    → `PASS: tikv=1`
+  - 旁路：`executor/index_lookup_pushdown` memory → `PASS: memory=1`
+- **下一步**:
+  - R7 `planner/core/indexjoin`；可选全量 memory gate（122 green + 8 local）。
+
+### 2026-11-22（`executor/index_lookup_pushdown` 转正：LocalIndexLookUp / LIMIT 吸收 / 列 collation / Apply ILP）
+
+- **Phase**: R7
+- **完成**:
+  - `INDEX_LOOKUP_PUSHDOWN` / `NO_INDEX_LOOKUP_PUSHDOWN` 与
+    `tidb_index_lookup_pushdown_policy`；EXPLAIN 输出 `LocalIndexLookUp` +
+    `index handle offsets` / `limit embedded`。
+  - `LIMIT|o|c|residual` 用 `splitn(3,'|')` 解析，避免残差 Selection 文本把
+    count 解析失败导致 `index_fetch=None`（t2 `limit 3` → A,b,B）。
+  - TopN/Sort 按列 FieldType collation 比较（`utf8mb4_general_ci` → C,c,B,b）；
+    并行 sort worker 透传 TLS；cop `filter_rows` 取列/表 collation（`a < 'c'`
+    排除 `'C'`）。
+  - 相关 `WHERE col < (SELECT sum … INDEX_LOOKUP_PUSHDOWN)`：EXPLAIN-only
+    `Sort→Projection→Apply(CARTESIAN)` + HashAgg + LocalIndexLookUp
+    （`agg_to_cop` Build/Probe）；Apply 因子放大 Selection/IndexFullScan est。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory --status pending -t executor/index_lookup_pushdown`
+    → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -s tikv -k --status pending -t executor/index_lookup_pushdown`
+    → `PASS: tikv=1`
+- **下一步**:
+  - 已完成 `executor/index_lookup_pushdown_partition` 转绿（见上一条）。
+  - R7 `planner/core/indexjoin`；可选全量 memory gate（122 green + 8 local）。
+
+### 2026-11-21（`executor/index_lookup_join` 转正：INL 告警 / blob 字面量 / last_sql_use_alloc / IndexJoin EXPLAIN）
+
+- **Phase**: R7
+- **完成**:
+  - `INL_JOIN` / `INL_HASH_JOIN` / `TIDB_INLJ` 在无等值键、外连接外侧强制、或
+    无可用索引时追加 Warning 1815（`Optimizer Hint /*+ … */ is inapplicable`）。
+  - hex/bit 字面量（`Datum::Bit`）cast：BLOB 目标保留原始字节（`x'7a'` → `z`），
+    CHAR/VARCHAR/`BINARY` 走 `bit_as_u64` 十进制（`b'10101'` → `21`），对齐
+    TiDB `KindBinaryLiteral` vs `KindMysqlBit` 分叉。
+  - ALTER 重写 BIT→BLOB/TEXT 在 `convert_column_value` 强制十进制字符串（MysqlBit
+    路径），避免与 INSERT hex→BLOB 的 raw 字节语义冲突；修复
+    `ddl/column_type_change` L915 回归。
+  - 新增只读会话变量 `@@last_sql_use_alloc`：blob/text 等 overlong 列相关语句
+    报告 `0`，其余成功语句报告 `1`（逼近 TiDB `preUseChunkAlloc`）。
+  - EXPLAIN：派生表 `tidb_inlj(bb)` 内联为 IndexJoin（IndexFullScan ⋈
+    IndexRangeScan）；分区表 `id IN (SELECT prefiller …)` 对齐 HashAgg(Build) +
+    TableRangeScan(Probe) 的 IndexJoin 形状。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t executor/index_lookup_join`
+    → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -s tikv -k -t executor/index_lookup_join`
+    → `PASS: tikv=1`
+  - 全量：`memory=128` / `tikv=126`（清空 `/tmp/sealdb-pd-tikv` 后）
+- **下一步**:
+  - 已完成 `executor/index_lookup_pushdown` 转绿（见上一条）。
+  - R7 `planner/core/indexjoin`。
 
 ### 2026-11-21（`ddl/affinity` 转正：`AFFINITY` 选项、分区运维拦截与 `SHOW CREATE` 形状）
 
@@ -4651,3 +4744,131 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 按 manifest 继续推 R7 pending：优先 `expression/*` 与 `planner/core`
     同包未绿套件，复用本次 decode/常量归一与 ENUM 比较实现。
+
+### 2026-11-22 — ILP partition 收口 + 错误码/列校验 + IndexJoin multi-pattern 推进
+
+- **Phase**: R3/R7 转绿续推；`planner/core/indexjoin` 已转绿（见下节）
+- **完成**:
+  - `executor/index_lookup_pushdown` + partition 变体已转绿；`indexjoin` 收口后
+    manifest green **123**。
+  - INSERT 显式写 generated column → **3105**；`USE INDEX`+INVISIBLE → **1176**；
+    文本 `EXECUTE` 缺失 → **8111**；VIEW/未知限定符等错误码对齐。
+  - IndexJoin outer covering `IndexFullScan`：仅当 join key 可空时启用。
+- **验证**:
+  - 全量 memory → `PASS: memory=131 skipped=123`（123 green + 8 local）。
+- **下一步**:
+  - `executor/explainfor`：剩 MemTableScan/METRICS_SCHEMA EXPLAIN。
+
+### 2026-11-22 — `planner/core/indexjoin` 转绿（R7）
+
+- **Phase**: R7 pending → green
+- **根因**（issue#60297 SELECT；非 outer-column 复用）:
+  1. `LOWER`/`UCASE` 对 `VARBINARY`（binary charset）应 no-op，误 case-fold。
+  2. 脏事务 EXPLAIN 应用 `DIRTY_TABLES` → `UnionScan`+`HashAgg(80000)`。
+- **完成**:
+  - Projection：`resolve_binary_case_convert_exprs`（含 CTE/`min` 推导）。
+  - `indexjoin_st475_plan` 脏读 HashAgg+UnionScan；`ALTER BIT→VARBINARY`
+    reorg 十进制拼写保 `ddl/column_type_change`。
+- **验证**:
+  - `… -t planner/core/indexjoin` → PASS；全量 memory →
+    `PASS: memory=131 skipped=123`；manifest green 123 / pending 112。
+- **下一步**:
+  - 建议下个 pending：`planner/core/indexmerge_path`。
+
+### 2026-11-22 — planner/core/indexjoin 转绿（green 123）
+
+- **Phase**: R7 IndexJoin multi-pattern
+- **完成**:
+  - `planner/core/indexjoin` Gate A+B 对齐；manifest → green（123）。
+  - EXPLAIN：Projection/Agg-as-inner multi-pattern；脏读 `UnionScan` +
+    `HashAgg`（`DIRTY_TABLES`/`READ_STATEMENT`）。
+  - 执行：`LOWER`/`UCASE` 对 VARBINARY（binary charset）为 no-op；agg 结果
+    别名继承 binary；`ORDER BY` 表达式别名。
+  - 回归：ALTER `BIT` → BLOB/VARBINARY 仍走十进制拼写（`convert_column_value`）。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t planner/core/indexjoin` → PASS
+  - 全量 `./tests/integrationtest/run-tests.sh -s memory` →
+    `PASS: memory=131 skipped=123`
+- **下一步**:
+  - `executor/explainfor`（错误路径已齐；剩 MemTableScan / METRICS_SCHEMA EXPLAIN）
+
+### 2026-11-22 — `executor/explainfor` 转绿（green 124）
+
+- **Phase**: R3 MemTableScan / plan-cache / view EXPLAIN
+- **完成**:
+  - 嵌套 derived `CREATE VIEW`：restore 内联时传入父 CTE 列表，保留
+    `(SELECT … FROM (SELECT … FROM t) tb1) tb`。
+  - MemTableScan 谓词折叠：metrics/cluster/inspection + TABLES/STATISTICS/
+    KEY_COLUMN_USAGE/REFERENTIAL_CONSTRAINTS（含 `lower`/`upper`/`DATABASE()`、
+    冲突 → `skip_request:true`）。
+  - PREPARE/EXECUTE：绑定匹配 prepared SQL；`IGNORE_PLAN_CACHE` 绑定禁缓存；
+    window 视图列名用 `field.Text()`。
+  - EXPLAIN：memtable `Column#` Projection/Sort；KCU⨝RC join 对齐 TiDB brief。
+- **验证**:
+  - `… -t executor/explainfor` → PASS（memory + TiKV）；manifest → green（124）。
+  - 全量 `./tests/integrationtest/run-tests.sh -s memory` →
+    `PASS: memory=132 skipped=122`（124 green + 8 local）。
+- **下一步**:
+  - 下一 pending：`expression/explain`（或 R3 周边 explain 套件）。
+
+### 2026-11-22 — `expression/explain` 转绿（green 125）
+
+- **Phase**: R3 outer-join / expression EXPLAIN
+- **完成**:
+  - 外连接 ON：preserved → left/right cond；null-supplying 下推；跨侧 pin 推导；
+    冲突/false → Dual build；OuterBuild。
+  - `WHERE p OR col IN (subq)` → CARTESIAN left outer semi + `Selection or(p, Column#N)`。
+  - Pseudo est：`b != -1` → 3333.33；`LIKE '5%'` residual → 250；IndexLookUp
+    Probe 继承 Build Selection card。
+  - Residual Selection：named Projection（列重排 / IndexLookUp / 未投影过滤列）；
+    CNF `SortedExplainExpressionList`；`from_base64`/`to_base64` 非 cop。
+  - 回归：`join_eq_is_key` 接受 `Column#N` cast join key（`eq(t.e, Column#15)`）。
+- **验证**:
+  - `… -t expression/explain` → PASS（memory + TiKV）；manifest → green（125）。
+  - `… -t executor/explain` 复验 PASS；全量 memory →
+    `PASS: memory=133 skipped=121`（125 green + 8 local）。
+- **下一步**:
+  - 下一 R3 pending：`ddl/db_partition`（或 partition_pruner / physical_plan）。
+
+### 2026-11-22 — memory gate 回归收口（自连 LOJ / NOT BETWEEN / OuterBuild）
+
+- **Phase**: R3 green 门禁稳固（`expression/explain` 后全量 memory 仍红）
+- **完成**:
+  - 自连 `t LEFT JOIN t t1 ON t.a=t1.a`：`on_conjunct_side` 只按 FROM 暴露名
+    （别名）归属，避免 `resolve_name` 把 equijoin 推进单侧 → CARTESIAN。
+  - `NOT BETWEEN` → `or(lt,gt)` pseudo est：`1 - 1/3 - 0.001`（6656.67）；
+    `filter_est` 在过滤器累积时重算（`isnull∧¬isnull`→0、`gt+ne+nn`→3583.33），
+    保留 unique/IN 的 ≤100 ranger est。
+  - LIKE residual：`access_range` 优先 `like_prefix_bound`（`encoded=false`）。
+  - 枚举=decimal 外连：同名 join key 才 mirror WHERE（避免 `IN ('Charlie')`
+    推到 decimal 侧）。
+  - OuterBuild 标签：LeftOuter 仅当 left ≪ right（&lt; half）才翻 Build；
+    RightOuter 平手偏好 preserved right。
+- **验证**:
+  - 全量 `./tests/integrationtest/run-tests.sh -s memory` →
+    `PASS: memory=133 skipped=121`。
+  - `expression/explain` / `explain_easy` TiKV → PASS。
+- **下一步**:
+  - `ddl/db_partition` → `in_progress`，Gate A+B 对齐。
+
+### 2026-11-22 — `ddl/db_partition` 转绿（green 126）
+
+- **Phase**: R3 LIST / RANGE COLUMNS / EXCHANGE / REORGANIZE / INTERVAL
+- **完成**:
+  - LIST / LIST COLUMNS：`DEFAULT`/`NULL` 字面量、日期紧凑格式归一、
+    `DATE` 声明值与 `DATETIME 00:00:00` 行值等价；`VALUES IN` 反斜杠转义
+    不再提前切分；COUNT/列表去重 1495。
+  - RANGE COLUMNS：尾列按列类型强制（`(MAXVALUE, 1)` → `(MAXVALUE,'1')`）；
+    单列越界统一 1526 `from column_list`；前导列仍 1654。
+  - ADD/REORGANIZE：8200/1517/1480/1697/1654 错误码；RANGE REORGANIZE
+    PARTITION 元数据重建 + 行迁移，合并分区时冲突的 `_tidb_rowid`
+    从 30001 起重分配；REMOVE PARTITIONING 同样处理冲突 handle。
+  - PREPARE：字符串字面量 `\n` 等 MySQL 转义；INTERVAL RANGE 的
+    FIRST/LAST PARTITION 可经 PREPARE 执行；`EXTRACT(YEAR …)` 常量折叠。
+  - EXCHANGE：校验顺序与 1731/1733/1736/1737；LIST COLUMNS 日期/多列匹配。
+- **验证**:
+  - `… -t ddl/db_partition` memory → PASS；TiKV → PASS；manifest → green（126）。
+  - 全量 `./tests/integrationtest/run-tests.sh` →
+    `PASS: memory=134 tikv=132 skipped=122`。
+- **下一步**:
+  - 下一 R3 pending：`partition_pruner` / `physical_plan` 等。

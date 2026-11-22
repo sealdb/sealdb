@@ -6,8 +6,8 @@ use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_CTE_MAX_RECURSION_DEPTH, ERR_CTE_RECURSIVE_FORBIDDEN_OPERATOR,
-    ERR_DUP_FIELDNAME, ERR_INVALID_REQUIRES_SINGLE_REFERENCE, ERR_UNSUPPORTED,
-    ERR_VIEW_WRONG_LIST, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
+    ERR_DUP_FIELDNAME, ERR_INVALID_REQUIRES_SINGLE_REFERENCE, ERR_UNSUPPORTED, ERR_VIEW_WRONG_LIST,
+    ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
 };
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::ddl::TableName;
@@ -841,11 +841,15 @@ fn expr_has_agg_or_window(expr: &ExprNode) -> bool {
         ExprNode::Like(l) => expr_has_agg_or_window(&l.expr) || expr_has_agg_or_window(&l.pattern),
         ExprNode::IsNull(i) => expr_has_agg_or_window(&i.expr),
         ExprNode::Case(c) => {
-            c.operand.as_ref().is_some_and(|e| expr_has_agg_or_window(e))
+            c.operand
+                .as_ref()
+                .is_some_and(|e| expr_has_agg_or_window(e))
                 || c.when_then
                     .iter()
                     .any(|(w, t)| expr_has_agg_or_window(w) || expr_has_agg_or_window(t))
-                || c.else_expr.as_ref().is_some_and(|e| expr_has_agg_or_window(e))
+                || c.else_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_has_agg_or_window(e))
         }
         ExprNode::Row(r) => r.exprs.iter().any(expr_has_agg_or_window),
         ExprNode::Exists(_)

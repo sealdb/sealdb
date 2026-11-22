@@ -169,11 +169,12 @@ impl Executor for HashJoinV1Exec {
                 )?;
                 return Ok(());
             }
-            if matches!(self.join.tp, JoinType::LeftOuter | JoinType::RightOuter)
-                && !is_trivial_on_true(&self.join.on)
-            {
+            if matches!(self.join.tp, JoinType::LeftOuter | JoinType::RightOuter) {
                 // No equality keys: evaluate ON per candidate pair, then
                 // null-extend the preserved side when nothing matched.
+                // Also covers `ON TRUE` with an empty Dual build (planner
+                // rewrites `ON 1=0` → Dual null-supplying + trivial ON): a
+                // plain cross product would drop every preserved row.
                 self.rows = probe_outer_non_equi(
                     self.join.tp,
                     &left_rows,
@@ -1323,7 +1324,8 @@ pub(crate) fn hash_join_pairs(
     // every row and let the caller evaluate the `ON` conjuncts.
     let (left_key, right_key) = match split_join_eq(&join.on, &join.left.name, &join.right.name) {
         Ok(keys) => keys,
-        Err(_) if join.tp == JoinType::Inner => {            let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
+        Err(_) if join.tp == JoinType::Inner => {
+            let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
             for i in 0..left_rows.len() {
                 for j in 0..right_rows.len() {
                     out.push((Some(i), Some(j)));

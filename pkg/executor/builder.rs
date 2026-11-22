@@ -134,6 +134,9 @@ impl ExecutorBuilder {
                 // The output names were derived from the original fields, so
                 // the display label keeps `collation(…)`.
                 let exprs = resolve_collation_exprs(&domain, select, current_db, exprs)?;
+                // MySQL/TiDB: LOWER/UPPER on a binary-charset value (VARBINARY /
+                // BINARY / BLOB) is a no-op — binary has no case mapping.
+                let exprs = resolve_binary_case_convert_exprs(&domain, select, current_db, exprs);
                 // A covering read over an expression index only carries the
                 // hidden key column, so the SELECT expressions re-evaluate
                 // against it (`plus(t.a, 1)` → the stored `(a+1)` value).
@@ -153,8 +156,10 @@ impl ExecutorBuilder {
                 let by = stmt_order_by(stmt)
                     .or_else(|| order_by_from_plan_info(by_info))
                     .ok_or_else(|| Error::unsupported("sort without ORDER BY"))?;
-                Ok(Box::new(SortExec::new(
+                let collations = order_by_collations(&domain, stmt, current_db, &by);
+                Ok(Box::new(SortExec::with_collations(
                     by,
+                    collations,
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
@@ -165,11 +170,13 @@ impl ExecutorBuilder {
                 let by = stmt_order_by(stmt)
                     .or_else(|| order_by_from_plan_info(by_info))
                     .ok_or_else(|| Error::unsupported("topn without ORDER BY"))?;
+                let collations = order_by_collations(&domain, stmt, current_db, &by);
                 let (limit, offset) =
                     stmt_limit(stmt).ok_or_else(|| Error::unsupported("topn without LIMIT"))?;
                 let limit = limit.ok_or_else(|| Error::unsupported("topn without LIMIT"))?;
-                Ok(Box::new(TopNExec::new(
+                Ok(Box::new(TopNExec::with_collations(
                     by,
+                    collations,
                     limit,
                     offset,
                     Self::build(child, stmt, domain, current_db, txn)?,
@@ -283,12 +290,23 @@ impl ExecutorBuilder {
             PhysicalPlan::InfoSchema {
                 table,
                 ranges: pushed_ranges,
+                pushed,
                 ..
             } => {
                 let (columns, rows) = if table.eq_ignore_ascii_case("bind_info") {
                     domain.bind_info_rows()
                 } else {
                     sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?
+                };
+                // Contradictory extractors (`skip_request` / `skip_inspection`)
+                // keep a MemTableScan shape for EXPLAIN but yield no rows.
+                let rows = if pushed
+                    .as_deref()
+                    .is_some_and(|p| p.contains("skip_request") || p.contains("skip_inspection"))
+                {
+                    Vec::new()
+                } else {
+                    rows
                 };
                 let mut exec = MemTableExec::new(columns, rows);
                 exec.filter_ranges(pushed_ranges);
@@ -324,9 +342,72 @@ impl ExecutorBuilder {
                 partitions,
                 pushed,
                 range_scan,
+                selection_info,
+                push_down,
                 ..
+            } => {
+                // TiDB's probe-side `TableRowIDScan` batches the build handles
+                // into one `BatchGet` (key order) unless the read must keep the
+                // index-key order (`keep order:true`) for an ORDER BY.
+                let keep_order = range_scan.as_ref().is_some_and(|range| range.keep_order)
+                    || keep_order_pushed(pushed.as_ref());
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("index lookup without select"))?;
+                // The reader may belong to any table of a joined SELECT (index
+                // join / applied subquery), not only the leading FROM factor.
+                let from = index_reader_table(select, table)
+                    .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
+                let access =
+                    index_access(&domain, current_db, &from, index, select.selection.as_ref())
+                        .ok_or_else(|| Error::unsupported("index lookup without access path"))?;
+                // IndexLookUp push-down: Build collects `offset+count` matching
+                // index keys (Selection before Limit) before the table probe;
+                // the root Limit applies the original offset/count.
+                // `LIMIT|<offset>|<count>[|<residual Selection info>]` — only
+                // the first two pipe fields are the fetch size; residual text
+                // after count must not be parsed as the count.
+                let index_fetch = if *push_down {
+                    selection_info.as_deref().and_then(|sel| {
+                        let rest = sel.strip_prefix("LIMIT|")?;
+                        let mut parts = rest.splitn(3, '|');
+                        let o = parts.next()?.parse::<u64>().ok()?;
+                        let c = parts.next()?.parse::<u64>().ok()?;
+                        Some(o + c)
+                    })
+                } else {
+                    None
+                };
+                // Residual filters under an absorbed Limit live on the SELECT
+                // (and optionally in `pushed`); keep them so fetch-cap counts
+                // only rows that pass Selection.
+                let lookup_filter = keep_order_filter(pushed).or_else(|| {
+                    if index_fetch.is_some() {
+                        select.selection.clone()
+                    } else {
+                        None
+                    }
+                });
+                Ok(Box::new(
+                    IndexLookUpExecutor::new(
+                        domain,
+                        from,
+                        index.clone(),
+                        access,
+                        current_db.to_string(),
+                        txn,
+                        select_row_lock(select),
+                        select_lock_wait(select),
+                        partitions.clone(),
+                        lookup_filter,
+                        false,
+                        keep_order,
+                        Self::select_references_tidb_rowid(select),
+                    )
+                    .with_index_fetch_limit(index_fetch),
+                ))
             }
-            | PhysicalPlan::IndexReader {
+            PhysicalPlan::IndexReader {
                 table,
                 index,
                 partitions,
@@ -334,18 +415,11 @@ impl ExecutorBuilder {
                 range_scan,
                 ..
             } => {
-                let covering = matches!(plan, PhysicalPlan::IndexReader { .. });
-                // TiDB's probe-side `TableRowIDScan` batches the build handles
-                // into one `BatchGet` (key order) unless the read must keep the
-                // index-key order (`keep order:true`) for an ORDER BY.
-                let keep_order = !covering
-                    && (range_scan.as_ref().is_some_and(|range| range.keep_order)
-                        || keep_order_pushed(pushed.as_ref()));
+                let keep_order = range_scan.as_ref().is_some_and(|range| range.keep_order)
+                    || keep_order_pushed(pushed.as_ref());
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("index lookup without select"))?;
-                // The reader may belong to any table of a joined SELECT (index
-                // join / applied subquery), not only the leading FROM factor.
                 let from = index_reader_table(select, table)
                     .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
                 let access =
@@ -362,7 +436,7 @@ impl ExecutorBuilder {
                     select_lock_wait(select),
                     partitions.clone(),
                     keep_order_filter(pushed),
-                    covering,
+                    true,
                     keep_order,
                     Self::select_references_tidb_rowid(select),
                 )))
@@ -733,26 +807,35 @@ impl ExecutorBuilder {
                 if first.with.is_none() {
                     first.with = set.with.clone();
                 }
-                let mut exec = Self::build_select_arm(
-                    &first,
-                    Arc::clone(&domain),
-                    current_db,
-                    Arc::clone(&txn),
-                )?;
+                let mut arms: Vec<(sealdb_parser::ast::SetOprType, Box<dyn Executor>)> =
+                    Vec::with_capacity(set.rest.len() + 1);
+                arms.push((
+                    sealdb_parser::ast::SetOprType::UnionAll,
+                    Self::build_select_arm(
+                        &first,
+                        Arc::clone(&domain),
+                        current_db,
+                        Arc::clone(&txn),
+                    )?,
+                ));
                 for (op, select) in &set.rest {
                     let mut select = select.clone();
                     if select.with.is_none() {
                         select.with = set.with.clone();
                     }
-                    let right = Self::build_select_arm(
-                        &select,
-                        Arc::clone(&domain),
-                        current_db,
-                        Arc::clone(&txn),
-                    )?;
-                    exec = Box::new(UnionExec::new(exec, right, *op));
+                    arms.push((
+                        *op,
+                        Self::build_select_arm(
+                            &select,
+                            Arc::clone(&domain),
+                            current_db,
+                            Arc::clone(&txn),
+                        )?,
+                    ));
                 }
-                Ok(exec)
+                // Match planner precedence: INTERSECT binds tighter than
+                // UNION/EXCEPT (`a UNION ALL b INTERSECT c`).
+                Ok(fold_mixed_set_execs(arms))
             }
             PhysicalPlan::Apply {
                 child,
@@ -1154,7 +1237,43 @@ impl ExecutorBuilder {
         )?;
         Self::build(&plan, &stmt, domain, current_db, txn)
     }
+}
 
+/// Fold set-op arms with TiDB precedence: reduce `INTERSECT` first, then
+/// left-fold `UNION`/`EXCEPT`.
+fn fold_mixed_set_execs(
+    arms: Vec<(sealdb_parser::ast::SetOprType, Box<dyn Executor>)>,
+) -> Box<dyn Executor> {
+    use sealdb_parser::ast::SetOprType;
+    let mut plans: Vec<Box<dyn Executor>> = Vec::with_capacity(arms.len());
+    let mut ops: Vec<SetOprType> = Vec::with_capacity(arms.len().saturating_sub(1));
+    for (i, (op, plan)) in arms.into_iter().enumerate() {
+        if i == 0 {
+            plans.push(plan);
+        } else {
+            ops.push(op);
+            plans.push(plan);
+        }
+    }
+    while let Some(i) = ops
+        .iter()
+        .position(|op| matches!(op, SetOprType::Intersect | SetOprType::IntersectAll))
+    {
+        let op = ops.remove(i);
+        let right = plans.remove(i + 1);
+        let left = plans.remove(i);
+        plans.insert(i, Box::new(UnionExec::new(left, right, op)));
+    }
+    let mut iter = plans.into_iter();
+    let mut exec = iter.next().expect("set op arm");
+    for (op, right) in ops.into_iter().zip(iter) {
+        exec = Box::new(UnionExec::new(exec, right, op));
+    }
+    exec
+}
+
+// Re-open ExecutorBuilder inherent impl for the remaining helpers.
+impl ExecutorBuilder {
     pub fn build_select(
         plan: &PhysicalPlan,
         select: &sealdb_parser::ast::SelectStmt,
@@ -1282,6 +1401,37 @@ fn stmt_order_by(stmt: &Statement) -> Option<Vec<ByItem>> {
         Statement::SetOpr(set) if !set.order_by.is_empty() => Some(set.order_by.clone()),
         _ => None,
     }
+}
+
+/// Per-key collations for ORDER BY / TopN: prefer the column's FieldType
+/// collation (e.g. table `utf8mb4_general_ci`) over the connection default.
+fn order_by_collations(
+    domain: &Domain,
+    stmt: &Statement,
+    current_db: &str,
+    by: &[ByItem],
+) -> Vec<sealdb_util::collate::CollateMode> {
+    let select = stmt.as_select();
+    let is = domain.infoschema();
+    let info = select.and_then(|s| s.from.as_ref()).and_then(|from| {
+        let (db, table) = from.qualified(current_db);
+        is.table_by_name(&db, &table)
+    });
+    by.iter()
+        .map(|item| {
+            let mode = match &item.expr {
+                ExprNode::Column(col) => info
+                    .and_then(|info| {
+                        info.columns
+                            .iter()
+                            .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+                    })
+                    .map(|c| sealdb_util::collate::CollateMode::from_name(&c.field_type.collate)),
+                _ => None,
+            };
+            mode.unwrap_or_else(sealdb_expression::collation_mode)
+        })
+        .collect()
 }
 
 /// Synthetic Sort keys for MergeJoin sides: `by_info` holds TiDB join-key
@@ -1801,7 +1951,7 @@ fn ast_join_type(tp: JoinType) -> sealdb_parser::ast::JoinType {
 /// MySQL/TiDB `MaxAliasIdentifierLen` — truncate projection field names.
 const MAX_ALIAS_IDENTIFIER_LEN: usize = 256;
 
-fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {
+pub(crate) fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {
     let raw = if let Some(name) = &field.as_name
         && !name.is_empty()
     {
@@ -1972,6 +2122,206 @@ fn expand_projection_fields(
 }
 
 /// Fold `COLLATION(expr)` in a SELECT list into its static collation name.
+/// Rewrite `LOWER`/`UPPER`/`LCASE`/`UCASE` of a binary-charset argument to the
+/// argument itself (MySQL binary charset has no case mapping).
+fn resolve_binary_case_convert_exprs(
+    domain: &Domain,
+    select: &SelectStmt,
+    current_db: &str,
+    exprs: Vec<ExprNode>,
+) -> Vec<ExprNode> {
+    if !exprs.iter().any(contains_case_convert) {
+        return exprs;
+    }
+    exprs
+        .into_iter()
+        .map(|expr| fold_binary_case_convert(expr, domain, select, current_db))
+        .collect()
+}
+
+fn contains_case_convert(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Func(func) => {
+            is_case_convert_name(&func.name) || func.args.iter().any(contains_case_convert)
+        }
+        ExprNode::Cast(cast) => contains_case_convert(&cast.expr),
+        ExprNode::Binary(binary) => {
+            contains_case_convert(&binary.left) || contains_case_convert(&binary.right)
+        }
+        ExprNode::Unary(unary) => contains_case_convert(&unary.expr),
+        _ => false,
+    }
+}
+
+fn is_case_convert_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "lower" | "lcase" | "upper" | "ucase"
+    )
+}
+
+fn fold_binary_case_convert(
+    expr: ExprNode,
+    domain: &Domain,
+    select: &SelectStmt,
+    current_db: &str,
+) -> ExprNode {
+    match expr {
+        ExprNode::Func(mut func) if is_case_convert_name(&func.name) && func.args.len() == 1 => {
+            let arg = fold_binary_case_convert(func.args.remove(0), domain, select, current_db);
+            if expr_has_binary_charset(&arg, domain, select, current_db) {
+                arg
+            } else {
+                func.args.push(arg);
+                ExprNode::Func(func)
+            }
+        }
+        ExprNode::Func(mut func) => {
+            func.args = func
+                .args
+                .into_iter()
+                .map(|arg| fold_binary_case_convert(arg, domain, select, current_db))
+                .collect();
+            ExprNode::Func(func)
+        }
+        ExprNode::Cast(mut cast) => {
+            cast.expr = Box::new(fold_binary_case_convert(
+                *cast.expr, domain, select, current_db,
+            ));
+            ExprNode::Cast(cast)
+        }
+        ExprNode::Binary(mut binary) => {
+            binary.left = Box::new(fold_binary_case_convert(
+                *binary.left,
+                domain,
+                select,
+                current_db,
+            ));
+            binary.right = Box::new(fold_binary_case_convert(
+                *binary.right,
+                domain,
+                select,
+                current_db,
+            ));
+            ExprNode::Binary(binary)
+        }
+        ExprNode::Unary(mut unary) => {
+            unary.expr = Box::new(fold_binary_case_convert(
+                *unary.expr,
+                domain,
+                select,
+                current_db,
+            ));
+            ExprNode::Unary(unary)
+        }
+        other => other,
+    }
+}
+
+/// True when `expr` evaluates to a binary-charset string (VARBINARY/BINARY/BLOB
+/// columns, or MIN/MAX/IFNULL of those).
+fn expr_has_binary_charset(
+    expr: &ExprNode,
+    domain: &Domain,
+    select: &SelectStmt,
+    current_db: &str,
+) -> bool {
+    match expr {
+        ExprNode::Column(col) => column_has_binary_charset(col, domain, select, current_db),
+        ExprNode::Func(func)
+            if matches!(
+                func.name.to_ascii_lowercase().as_str(),
+                "min" | "max" | "ifnull" | "coalesce" | "any_value" | "firstrow"
+            ) =>
+        {
+            func.args
+                .first()
+                .is_some_and(|arg| expr_has_binary_charset(arg, domain, select, current_db))
+        }
+        ExprNode::Cast(cast)
+            if cast.target.to_ascii_uppercase().contains("BINARY")
+                || cast.target.eq_ignore_ascii_case("BLOB") =>
+        {
+            true
+        }
+        ExprNode::Cast(cast) => expr_has_binary_charset(&cast.expr, domain, select, current_db),
+        _ => false,
+    }
+}
+
+fn column_has_binary_charset(
+    col: &sealdb_parser::ast::expressions::ColumnNameExpr,
+    domain: &Domain,
+    select: &SelectStmt,
+    current_db: &str,
+) -> bool {
+    let is = domain.infoschema();
+    // Derived-table / CTE alias: resolve the projected field's expression.
+    if let Some(table) = col.table.as_deref()
+        && let Some(with) = &select.with
+        && let Some(cte) = with.find(table)
+    {
+        if let Some(field) = cte_field_for_name(cte.query.as_ref(), &col.name) {
+            return expr_has_binary_charset(&field.expr, domain, cte.query.as_ref(), current_db);
+        }
+    }
+    // Physical / aliased base tables in FROM / join chain.
+    for table in select_source_tables(select) {
+        if let Some(wanted) = col.table.as_deref() {
+            let alias = table.name.as_str();
+            let physical = table.resolve_name();
+            if !alias.eq_ignore_ascii_case(wanted) && !physical.eq_ignore_ascii_case(wanted) {
+                continue;
+            }
+        }
+        let (db, name) = table.qualified(current_db);
+        let Some(info) = is.table_by_name(&db, &name) else {
+            continue;
+        };
+        if let Some(c) = info
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+        {
+            return c.field_type.charset == "binary" || c.field_type.collate == "binary";
+        }
+        if col.table.is_some() {
+            return false;
+        }
+    }
+    false
+}
+
+fn cte_field_for_name<'a>(
+    query: &'a SelectStmt,
+    name: &str,
+) -> Option<&'a sealdb_parser::ast::SelectField> {
+    query.fields.iter().find(|field| {
+        field
+            .as_name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            || matches!(&field.expr, ExprNode::Column(c) if c.name.eq_ignore_ascii_case(name))
+    })
+}
+
+fn select_source_tables(select: &SelectStmt) -> Vec<&sealdb_parser::ast::TableName> {
+    let mut out = Vec::new();
+    if let Some(from) = &select.from {
+        out.push(from);
+    }
+    for join in &select.joins {
+        out.push(&join.left);
+        out.push(&join.right);
+    }
+    if let Some(item) = &select.from_item {
+        out.extend(item.tables());
+    }
+    // CTE bodies referenced as join sides are physical names equal to the CTE
+    // alias; their columns are resolved via `select.with` above.
+    out
+}
+
 fn resolve_collation_exprs(
     domain: &Domain,
     select: &SelectStmt,

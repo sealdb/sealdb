@@ -80,6 +80,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_INFO_SCHEMA_EXPIRED => "ErrInfoSchemaExpired",
         errcode::ERR_INFO_SCHEMA_CHANGED => "ErrInfoSchemaChanged",
         errcode::ERR_UNKNOWN_STMT_HANDLER => "ErrUnknownStmtHandler",
+        errcode::ERR_PREPARED_STMT_NOT_FOUND => "ErrPreparedStmtNotFound",
         errcode::ERR_UNKNOWN_CHARACTER_SET => "ErrUnknownCharacterSet",
         errcode::ERR_UNKNOWN_COLLATION => "ErrUnknownCollation",
         errcode::ERR_COLLATION_CHARSET_MISMATCH => "ErrCollationCharsetMismatch",
@@ -198,6 +199,9 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_LOCK_DEADLOCK => "40001",
         errcode::ERR_UNKNOWN_CHARACTER_SET => "42000",
         errcode::ERR_COLLATION_CHARSET_MISMATCH => "42000",
+        // TiDB reports the EXCHANGE PARTITION "Can't open table" (1177) error
+        // with SQLSTATE 42000.
+        1177 => "42000",
         _ => "HY000",
     }
 }

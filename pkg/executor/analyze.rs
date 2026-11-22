@@ -485,6 +485,10 @@ fn collect_column_stats(
         if !indexed.contains(&name) && skip_types.iter().any(|tp| *tp == base_type) {
             continue;
         }
+        // TiDB collects string statistics under the column collation: a
+        // `*_ci` column folds `'a'`/`'A'` into one NDV bucket.
+        let ci = col.field_type.eval_type() == sealdb_types::field_type::EvalType::String
+            && sealdb_util::collate::CollateMode::from_name(&col.field_type.collate).is_ci();
         let mut distinct = HashSet::new();
         let mut null_count = 0;
         let mut values = Vec::new();
@@ -512,7 +516,12 @@ fn collect_column_stats(
             match value {
                 Datum::Null => null_count += 1,
                 other => {
-                    let key = datum_key(other);
+                    let raw = datum_key(other);
+                    let key = if ci && matches!(other, Datum::Bytes(_)) {
+                        sealdb_types::ci_fold_str(&raw)
+                    } else {
+                        raw
+                    };
                     distinct.insert(key.clone());
                     values.push(key.clone());
                     *freq.entry(key).or_default() += 1;
@@ -555,6 +564,7 @@ fn collect_column_stats(
                 value_counts,
                 tot_col_size,
                 part_tot_col_size,
+                ci,
             },
         ));
     }

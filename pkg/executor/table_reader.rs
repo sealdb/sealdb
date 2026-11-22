@@ -81,6 +81,7 @@ impl Executor for TableReaderExec {
                 format!("Table '{schema}.{name}' doesn't exist"),
             )
         })?;
+        sealdb_expression::note_binary_columns_from_table(&info);
         self.schema = info
             .columns
             .iter()

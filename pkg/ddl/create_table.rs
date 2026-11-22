@@ -1088,7 +1088,17 @@ pub fn build_table_info_with_defaults(
             .and_then(|default| origin_default_for(&info.field_type, default));
         info.auto_increment = col.auto_increment;
         info.auto_random = col.auto_random;
-        info.comment = col.comment.clone();
+        // Parser rewrites `ZEROFILL` → UNSIGNED + marker comment.
+        if col.comment.as_deref()
+            == Some(sealdb_parser::sqlparser_bridge::lower::ZEROFILL_COMMENT_MARKER)
+        {
+            info.field_type.flag |= 64; // MySQL zerofillFlag
+            info.field_type.unsigned = true;
+            info.field_type.flag |= 32;
+            info.comment = None;
+        } else {
+            info.comment = col.comment.clone();
+        }
         validate_display_width(info.name.o(), &info.field_type)?;
         // TiDB `CheckDisplayWidth`: MySQL 8 deprecates the integer display width
         // (`int(11)`); a bare `int` declares none and stays silent.
@@ -1123,6 +1133,15 @@ pub fn build_table_info_with_defaults(
     let names: Vec<String> = columns.iter().map(|c| c.name.o().to_string()).collect();
     crate::alter::check_generated_order(&names, &columns)?;
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
+    info.checks = stmt
+        .checks
+        .iter()
+        .map(|(expr, enforced)| sealdb_meta::CheckConstraint {
+            expr: expr.clone(),
+            enforced: *enforced,
+        })
+        .collect();
+    info.placement_policy = stmt.placement_policy.clone();
     // TiDB `SHARD_ROW_ID_BITS` / `PRE_SPLIT_REGIONS` table options.
     if let Some(bits) = stmt.shard_row_id_bits {
         info.shard_row_id_bits = bits.min(63) as u8;
@@ -1498,9 +1517,20 @@ fn select_sources(
 /// expression's `Text()` form. Names longer than 64 characters (or with no
 /// derivable name) fall back to `name_exp_<position>`.
 pub(crate) fn select_field_name(field: &sealdb_parser::ast::SelectField, offset: usize) -> String {
+    use sealdb_parser::ast::expressions::ExprNode;
     let name = match &field.as_name {
         Some(name) if !name.is_empty() => name.clone(),
-        _ => field.expr.name(),
+        // Column / literal names come from `expr.name()` (unquoted content).
+        // Complex exprs (window / func) prefer the original select-list snippet
+        // so TiDB `field.Text()` casing is preserved.
+        _ => match &field.expr {
+            ExprNode::Column(_) | ExprNode::Value(_) => field.expr.name(),
+            _ => field
+                .orig_text
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| field.expr.name()),
+        },
     };
     // TiDB falls back to `name_exp_<pos>` when the derived name cannot be a
     // column identifier (empty or longer than 64 characters).

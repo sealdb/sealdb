@@ -21,6 +21,12 @@ pub struct TableName {
     pub partition_names: Vec<String>,
     /// `FROM t AS OF TIMESTAMP <expr>` stale read: raw expression text.
     pub as_of_ts: Option<String>,
+    /// `/*+ INDEX_LOOKUP_PUSHDOWN(t, idx…) */` selected a supported index path
+    /// that should render as TiDB `LocalIndexLookUp` under `IndexLookUp`.
+    pub index_lookup_pushdown: bool,
+    /// `/*+ NO_INDEX_LOOKUP_PUSHDOWN(t) */` forbids push-down for this table
+    /// (wins over the hint and over `tidb_index_lookup_pushdown_policy`).
+    pub no_index_lookup_pushdown: bool,
 }
 
 impl TableName {
@@ -35,6 +41,8 @@ impl TableName {
             ignore_index_hint: false,
             partition_names: Vec::new(),
             as_of_ts: None,
+            index_lookup_pushdown: false,
+            no_index_lookup_pushdown: false,
         }
     }
 
@@ -445,6 +453,23 @@ pub enum PartitionType {
     Key,
 }
 
+/// One scalar inside a LIST / LIST COLUMNS value row.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ListLiteral {
+    Null,
+    /// Numeric literal text (`6`, `-1`, `18446744073709551615`).
+    Number(String),
+    /// Unescaped string / date-like literal content.
+    String(String),
+}
+
+/// One `VALUES IN` entry: `DEFAULT` or a value row (length 1 for plain LIST).
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ListInEntry {
+    Default,
+    Row(Vec<ListLiteral>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartitionDef {
     pub name: String,
@@ -453,8 +478,34 @@ pub struct PartitionDef {
     pub less_than: Option<String>,
     /// RANGE COLUMNS extra bounds after the first `less_than` (`None` = MAXVALUE).
     pub extra_bounds: Vec<Option<String>>,
-    /// LIST `VALUES IN (...)` integers.
-    pub in_values: Vec<Option<i64>>,
+    /// LIST / LIST COLUMNS `VALUES IN (...)` entries (`DEFAULT` or value rows).
+    pub in_values: Vec<ListInEntry>,
+    /// `PARTITION p DEFAULT` shorthand (same as `VALUES IN (DEFAULT)`).
+    pub list_default: bool,
+    /// `ADD PARTITION (PARTITION p)` with no VALUES / DEFAULT clause.
+    pub missing_bound: bool,
+    /// `PARTITION p HISTORY` / `VALUES HISTORY` (SYSTEM_TIME only; TiDB 1480).
+    pub values_history: bool,
+    /// Optional `COMMENT '…'` on a HASH/KEY named partition.
+    pub comment: Option<String>,
+    /// Optional `PLACEMENT POLICY name` on a HASH/KEY named partition.
+    pub placement_policy: Option<String>,
+}
+
+impl PartitionDef {
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            less_than: None,
+            extra_bounds: Vec::new(),
+            in_values: Vec::new(),
+            list_default: false,
+            missing_bound: false,
+            values_history: false,
+            comment: None,
+            placement_policy: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -472,6 +523,15 @@ pub struct PartitionOption {
     /// TiDB accepts `SUBPARTITION BY` under RANGE/LIST then strips it; true when
     /// that clause was present so DDL can ignore it (HASH/KEY reject instead).
     pub subpartition_ignored: bool,
+    /// TiDB RANGE INTERVAL metadata (syntactic sugar expanded into `defs`).
+    pub interval_expr: Option<String>,
+    pub interval_first: Option<String>,
+    pub interval_last: Option<String>,
+    pub interval_null: bool,
+    pub interval_maxvalue: bool,
+    /// TiDB 8200 raised while expanding FIRST/LAST into partitions; DDL
+    /// re-reports this message once the column types are known.
+    pub interval_error: Option<String>,
 }
 
 impl PartitionOption {
@@ -525,17 +585,13 @@ impl PartitionOption {
                     }
                     ctx.write_str(")");
                 } else if self.tp == PartitionType::List {
-                    ctx.write_str(" VALUES IN (");
-                    for (j, v) in def.in_values.iter().enumerate() {
-                        if j > 0 {
-                            ctx.write_str(", ");
-                        }
-                        match v {
-                            Some(v) => ctx.write_str(&v.to_string()),
-                            None => ctx.write_str("NULL"),
-                        }
+                    if def.list_default && def.in_values.is_empty() {
+                        ctx.write_str(" DEFAULT");
+                    } else {
+                        ctx.write_str(" VALUES IN (");
+                        write_list_in_values(ctx, &def.in_values);
+                        ctx.write_str(")");
                     }
-                    ctx.write_str(")");
                 }
             }
             ctx.write_str(")");
@@ -594,6 +650,10 @@ pub struct CreateTableStmt {
     pub shard_row_id_bits: Option<u32>,
     /// TiDB `PRE_SPLIT_REGIONS = n` table option.
     pub pre_split_regions: Option<u32>,
+    /// `CHECK (expr) [NOT] ENFORCED` constraints stripped from the CREATE text.
+    pub checks: Vec<(String, bool)>,
+    /// `PLACEMENT POLICY [=] 'name'` table option (TiDB).
+    pub placement_policy: Option<String>,
 }
 
 impl CreateTableStmt {
@@ -1005,9 +1065,11 @@ pub enum AlterTableSpec {
         name: String,
         value: String,
     },
-    /// `ADD PARTITION (PARTITION ...)` for RANGE/LIST tables.
+    /// `ADD PARTITION (PARTITION ...)` / `ADD PARTITION PARTITIONS n`.
     AddPartition {
         defs: Vec<PartitionDef>,
+        /// `ADD PARTITION PARTITIONS n` (HASH/KEY); `None` for a definition list.
+        count: Option<u64>,
     },
     /// `ALTER TABLE t PARTITION BY ...` — repartition an existing table.
     Repartition(PartitionOption),
@@ -1038,9 +1100,22 @@ pub enum AlterTableSpec {
     /// `REMOVE PARTITIONING`.
     RemovePartitioning,
     /// `REORGANIZE PARTITION ... INTO (...)` (partitioned tables only).
-    ReorganizePartition,
+    ReorganizePartition {
+        names: Vec<String>,
+        defs: Vec<PartitionDef>,
+    },
     /// `COALESCE PARTITION n`.
     CoalescePartition(u64),
+    /// Unsupported partition maintenance (`CHECK`/`OPTIMIZE`/…) → DDL 8200.
+    UnsupportedPartitionOp(String),
+    /// `FIRST PARTITION LESS THAN (bound)` (INTERVAL tables).
+    FirstPartition {
+        bound: String,
+    },
+    /// `LAST PARTITION LESS THAN (bound)` (INTERVAL tables).
+    LastPartition {
+        bound: String,
+    },
     /// `REMOVE TTL`.
     RemoveTtl,
     /// `ALTER [COLUMN] col SET DEFAULT <expr>` / `ALTER [COLUMN] col DROP DEFAULT`.
@@ -1249,7 +1324,12 @@ impl AlterTableSpec {
                 ctx.write_str(value);
                 Ok(())
             }
-            AlterTableSpec::AddPartition { defs } => {
+            AlterTableSpec::AddPartition { defs, count } => {
+                if let Some(n) = count {
+                    ctx.write_str("ADD PARTITION PARTITIONS ");
+                    ctx.write_str(&n.to_string());
+                    return Ok(());
+                }
                 ctx.write_str("ADD PARTITION (");
                 for (i, def) in defs.iter().enumerate() {
                     if i > 0 {
@@ -1257,19 +1337,15 @@ impl AlterTableSpec {
                     }
                     ctx.write_str("PARTITION ");
                     ctx.write_name(&def.name);
-                    if !def.in_values.is_empty() {
+                    if def.values_history {
+                        ctx.write_str(" HISTORY");
+                    } else if def.list_default && def.in_values.is_empty() {
+                        ctx.write_str(" DEFAULT");
+                    } else if !def.in_values.is_empty() {
                         ctx.write_str(" VALUES IN (");
-                        for (j, v) in def.in_values.iter().enumerate() {
-                            if j > 0 {
-                                ctx.write_str(", ");
-                            }
-                            match v {
-                                Some(v) => ctx.write_str(&v.to_string()),
-                                None => ctx.write_str("NULL"),
-                            }
-                        }
+                        write_list_in_values(ctx, &def.in_values);
                         ctx.write_str(")");
-                    } else {
+                    } else if !def.missing_bound {
                         ctx.write_str(" VALUES LESS THAN (");
                         match &def.less_than {
                             Some(v) => write_partition_bound(ctx, v),
@@ -1362,13 +1438,60 @@ impl AlterTableSpec {
                 ctx.write_str("REMOVE PARTITIONING");
                 Ok(())
             }
-            AlterTableSpec::ReorganizePartition => {
-                ctx.write_str("REORGANIZE PARTITION");
+            AlterTableSpec::ReorganizePartition { names, defs } => {
+                ctx.write_str("REORGANIZE PARTITION ");
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_name(name);
+                }
+                ctx.write_str(" INTO (");
+                for (i, def) in defs.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_str("PARTITION ");
+                    ctx.write_name(&def.name);
+                    if def.list_default && def.in_values.is_empty() {
+                        ctx.write_str(" DEFAULT");
+                    } else if !def.in_values.is_empty() {
+                        ctx.write_str(" VALUES IN (");
+                        write_list_in_values(ctx, &def.in_values);
+                        ctx.write_str(")");
+                    } else if def.less_than.is_some() || !def.extra_bounds.is_empty() {
+                        ctx.write_str(" VALUES LESS THAN (");
+                        match &def.less_than {
+                            Some(v) => write_partition_bound(ctx, v),
+                            None => ctx.write_str("MAXVALUE"),
+                        }
+                        ctx.write_str(")");
+                    }
+                }
+                ctx.write_str(")");
                 Ok(())
             }
             AlterTableSpec::CoalescePartition(num) => {
                 ctx.write_str("COALESCE PARTITION ");
                 ctx.write_str(&num.to_string());
+                Ok(())
+            }
+            AlterTableSpec::UnsupportedPartitionOp(msg) => {
+                ctx.write_str("/* unsupported partition op: ");
+                ctx.write_str(msg);
+                ctx.write_str(" */");
+                Ok(())
+            }
+            AlterTableSpec::FirstPartition { bound } => {
+                ctx.write_str("FIRST PARTITION LESS THAN (");
+                ctx.write_str(bound);
+                ctx.write_str(")");
+                Ok(())
+            }
+            AlterTableSpec::LastPartition { bound } => {
+                ctx.write_str("LAST PARTITION LESS THAN (");
+                ctx.write_str(bound);
+                ctx.write_str(")");
                 Ok(())
             }
             AlterTableSpec::AddForeignKey(fk) => {
@@ -1467,5 +1590,39 @@ fn write_partition_bound(ctx: &mut RestoreCtx, bound: &str) {
         ctx.write_str("\"");
         ctx.write_str(bound);
         ctx.write_str("\"");
+    }
+}
+
+fn write_list_in_values(ctx: &mut RestoreCtx, entries: &[ListInEntry]) {
+    for (j, entry) in entries.iter().enumerate() {
+        if j > 0 {
+            ctx.write_str(",");
+        }
+        match entry {
+            ListInEntry::Default => ctx.write_str("DEFAULT"),
+            ListInEntry::Row(row) => {
+                let multi = row.len() > 1;
+                if multi {
+                    ctx.write_str("(");
+                }
+                for (k, lit) in row.iter().enumerate() {
+                    if k > 0 {
+                        ctx.write_str(",");
+                    }
+                    match lit {
+                        ListLiteral::Null => ctx.write_str("NULL"),
+                        ListLiteral::Number(n) => ctx.write_str(n),
+                        ListLiteral::String(s) => {
+                            ctx.write_str("'");
+                            ctx.write_str(&s.replace('\'', "''"));
+                            ctx.write_str("'");
+                        }
+                    }
+                }
+                if multi {
+                    ctx.write_str(")");
+                }
+            }
+        }
     }
 }

@@ -257,13 +257,27 @@ pub struct ColumnStats {
     /// range selectivity is exact (TiDB leans on CMSketch here). `None` when
     /// the column is too wide to retain.
     pub value_counts: Option<Vec<(String, u64)>>,
+    /// Column collation is case-insensitive (`*_ci`): values are folded to the
+    /// collation sort key before counting, so `'a'` and `'A'` share a bucket.
+    pub ci: bool,
 }
 
 impl ColumnStats {
+    /// Statistics key for `value`: `datum_key`, folded under the column's
+    /// collation for `*_ci` string columns.
+    pub fn value_key(&self, value: &Datum) -> String {
+        let raw = datum_key(value);
+        if self.ci && matches!(value, Datum::Bytes(_)) {
+            sealdb_types::ci_fold_str(&raw)
+        } else {
+            raw
+        }
+    }
+
     /// Exact rows equal to `value` (integer, string and temporal keys alike —
     /// the store keeps per-value counts keyed by `datum_key`).
     pub fn exact_point_count(&self, value: &Datum) -> Option<u64> {
-        let key = datum_key(value);
+        let key = self.value_key(value);
         let raw = self.value_counts.as_ref()?;
         Some(raw.iter().filter(|(k, _)| *k == key).map(|(_, c)| *c).sum())
     }
@@ -277,8 +291,8 @@ impl ColumnStats {
         upper: Option<(&Datum, bool)>,
     ) -> Option<u64> {
         let raw = self.value_counts.as_ref()?;
-        let lo = lower.map(|(d, inc)| (datum_key(d), inc));
-        let hi = upper.map(|(d, inc)| (datum_key(d), inc));
+        let lo = lower.map(|(d, inc)| (self.value_key(d), inc));
+        let hi = upper.map(|(d, inc)| (self.value_key(d), inc));
         let order = key_order(raw, lo.as_ref(), hi.as_ref());
         let mut total = 0u64;
         for (key, count) in raw {
@@ -304,7 +318,7 @@ impl ColumnStats {
         let raw = self.value_counts.as_ref()?;
         let mut total = 0u64;
         for value in values {
-            let key = datum_key(value);
+            let key = self.value_key(value);
             total += raw
                 .iter()
                 .filter(|(k, _)| *k == key)
@@ -327,8 +341,8 @@ impl ColumnStats {
         let Some(topn) = &self.topn else {
             return 0.0;
         };
-        let lo = lower.map(|(d, inc)| (datum_key(d), inc));
-        let hi = upper.map(|(d, inc)| (datum_key(d), inc));
+        let lo = lower.map(|(d, inc)| (self.value_key(d), inc));
+        let hi = upper.map(|(d, inc)| (self.value_key(d), inc));
         let order = key_order(&topn.items, lo.as_ref(), hi.as_ref());
         topn.items
             .iter()
@@ -434,10 +448,9 @@ impl Table {
 
     /// Equality estimate preferring TopN when the constant is a frequent value.
     pub fn eq_row_count_value(&self, column: &str, value: &Datum) -> u64 {
-        let key = datum_key(value);
         if let Some(col) = self.column(column)
             && let Some(topn) = &col.topn
-            && let Some(cnt) = topn.lookup(&key)
+            && let Some(cnt) = topn.lookup(&col.value_key(value))
         {
             return cnt;
         }
@@ -457,8 +470,8 @@ impl Table {
         let Some(hist) = &col.histogram else {
             return self.count / 2;
         };
-        let lo = lower.map(datum_key);
-        let hi = upper.map(datum_key);
+        let lo = lower.map(|d| col.value_key(d));
+        let hi = upper.map(|d| col.value_key(d));
         let frac = hist.range_fraction(lo.as_deref(), hi.as_deref());
         ((self.count as f64) * frac).round() as u64
     }

@@ -9,9 +9,10 @@ pub use meta::{
     parse_db_key, parse_table_key, table_key,
 };
 pub use model::{
-    ClusteredIndexMode, ColumnInfo, DBInfo, ForeignKeyInfo, IndexColumn, IndexInfo, Job, JobState,
-    PartitionDefinition, PartitionInfo, PartitionType, STATE_DELETE_ONLY,
-    STATE_DELETE_REORGANIZATION, STATE_NONE, STATE_PUBLIC, STATE_WRITE_ONLY,
-    STATE_WRITE_REORGANIZATION, SchemaState, SequenceInfo, TableInfo, TtlInfo, ViewInfo,
-    clustered_index_mode, with_clustered_index_mode,
+    CheckConstraint, ClusteredIndexMode, ColumnInfo, DBInfo, ForeignKeyInfo, IndexColumn,
+    IndexInfo, Job, JobState, ListInEntry, ListLiteral, PartitionDefinition, PartitionInfo,
+    PartitionType, STATE_DELETE_ONLY, STATE_DELETE_REORGANIZATION, STATE_NONE, STATE_PUBLIC,
+    STATE_WRITE_ONLY, STATE_WRITE_REORGANIZATION, SchemaState, SequenceInfo, TableInfo, TtlInfo,
+    ViewInfo, clustered_index_mode, enable_check_constraint, escape_mysql_string,
+    unescape_mysql_string, with_clustered_index_mode, with_enable_check_constraint,
 };

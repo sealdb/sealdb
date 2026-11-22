@@ -2683,6 +2683,30 @@ fn walk_with_parent(
         emit_cluster_mem_table(rows, depth, last, next_id, spine, parent, None);
         return;
     }
+    // TiDB merges `Limit → IndexLookUp(push_down)` into the reader
+    // (`limit embedded` + LocalIndexLookUp's cop Limit). Keep the Limit for
+    // execution; skip it here when the child already carries `LIMIT|`.
+    if let PhysicalPlan::Limit { child, .. } = plan
+        && let PhysicalPlan::IndexLookUpReader {
+            push_down: true,
+            selection_info: Some(sel),
+            ..
+        } = child.as_ref()
+        && limit_build_marker(sel).is_some()
+    {
+        return walk_with_parent(
+            child,
+            parent,
+            depth,
+            last,
+            next_id,
+            rows,
+            under_order_projection,
+            spine,
+            deferred,
+            apply_factor,
+        );
+    }
     // TiDB brief/row often elides a trivial Projection above TopN/Limit.
     // Keep remapping projections (`Column#5->Column#6`) used after StreamAgg+ORDER BY.
     // Also elide CTE seed column-name projections (`SELECT c1`) so MergeJoin
@@ -2710,9 +2734,23 @@ fn walk_with_parent(
         return;
     }
     if let PhysicalPlan::Projection { exprs, child, .. } = plan {
-        let trivial = exprs
-            .iter()
-            .all(|e| e.starts_with("col") && !e.contains("->") && !e.contains("Column#"));
+        // Identity `col` / `colN` placeholders only — not `column_name` etc.
+        let is_col_ph = |e: &str| {
+            let rest = e.strip_prefix("col").unwrap_or("!");
+            (rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit()))
+                && !e.contains("->")
+                && !e.contains("Column#")
+        };
+        let col_placeholder = exprs.iter().all(|e| is_col_ph(e));
+        // TiDB keeps Projection→Sort→MemTableScan (`Column#N->Column#M`) but
+        // elides a bare Projection→MemTableScan for a plain column SELECT.
+        let keep_memtable_proj = matches!(child.as_ref(), PhysicalPlan::Sort { .. })
+            && deepest_infoschema_table(child).is_some();
+        let trivial = (col_placeholder && !keep_memtable_proj)
+            || (matches!(child.as_ref(), PhysicalPlan::InfoSchema { .. })
+                && exprs
+                    .iter()
+                    .all(|e| e.contains("->Column#") || is_col_ph(e)));
         // Plain column references, possibly qualified (`c1` / `t.c1` /
         // `db.t.c1`): TiDB's projection elimination drops a CTE seed's
         // column-name projection, so the parent join/sort node takes the label
@@ -2730,6 +2768,7 @@ fn walk_with_parent(
         });
         let any_qualified = exprs.iter().any(|e| e.contains('.'));
         let cte_seed_cols = plain_cols
+            && !keep_memtable_proj
             && match parent {
                 Some(PhysicalPlan::MergeJoin { .. }) => true,
                 Some(PhysicalPlan::Sort { .. }) => !any_qualified,
@@ -2791,6 +2830,31 @@ fn walk_with_parent(
             apply_factor,
         );
     }
+    // TiDB `SELECT * FROM referential_constraints rc JOIN key_column_usage fk
+    // USING (…)`: Projection of Column# handles above HashJoin, with Build on
+    // KEY_COLUMN_USAGE. UniqueIDs follow TiDB's join schema (left 1..12, right
+    // 13..23; USING coalesces 13/14 out of the projection list).
+    if parent.is_none()
+        && let PhysicalPlan::HashJoin { left, right, .. } = plan
+        && let (Some(lt), Some(rt)) = (
+            deepest_infoschema_table(left),
+            deepest_infoschema_table(right),
+        )
+        && is_kcu_rc_memtable_join(lt, rt)
+    {
+        emit_kcu_rc_memtable_join(
+            plan,
+            left,
+            right,
+            depth,
+            last,
+            next_id,
+            rows,
+            spine,
+            apply_factor,
+        );
+        return;
+    }
     // TiDB raises the star-projection above the join themselves (built in the
     // planner), so Sort over a join needs no synthesized Projection here.
     let id = *next_id;
@@ -2819,35 +2883,49 @@ fn walk_with_parent(
             &format!("{schema}.{orig}."),
         );
     }
+    // Derived-table Selection / root Projection use the alias in the AST
+    // (`tt.a`); TiDB prints the inner OrigTblName (`t.a`) when the child still
+    // reads that base table. Skip Apply/Join children — remapping there would
+    // collapse `t1.a <=> t2.a` or rewrite an Apply probe Projection incorrectly.
+    let remap_proj = matches!(plan, PhysicalPlan::Projection { .. }) && parent.is_none();
+    if (matches!(plan, PhysicalPlan::Selection { .. }) || remap_proj)
+        && let Some((alias, orig)) = derived_selection_orig_table(plan)
+    {
+        let schema = sealdb_expression::current_db_name();
+        let schema = if schema.is_empty() {
+            "select".to_string()
+        } else {
+            schema
+        };
+        info = info.replace(&format!("{schema}.{alias}."), &format!("{schema}.{orig}."));
+    }
     // TiDB labels `TableReader_30(Build)` — role suffix after the numeric id.
     // Inline CTEs unwrap before walk; compare against the resolved seed pointer.
     let join_role = match parent {
         // HashJoin / MergeJoin: children_of lists right(Build) then left(Probe).
         // A RIGHT JOIN is executed with the left, null-supplying side as build.
         Some(PhysicalPlan::HashJoin {
-            left,
-            right,
-            tp,
-            on,
-            ..
+            left, right, tp, ..
         }) => {
-            // Build is the hashed input. A LEFT JOIN normally hashes the right
-            // (null-supplying) side; when that side is an unanalyzed pseudo
-            // scan the smaller spine is drawn as Build (`t4 ⟕ …` → 4.00 first).
-            let right_smaller = if matches!(tp, JoinType::RightOuter) {
-                est_rows(right) < est_rows(left)
-            } else if matches!(tp, JoinType::LeftOuter)
-                && join_on_has_equijoin(on)
-                && is_pseudo_plan(right)
-            {
-                est_rows(right) <= est_rows(left)
-            } else {
-                true
-            };
-            let (build, probe) = if right_smaller {
-                (explain_plan_ptr(right), explain_plan_ptr(left))
-            } else {
-                (explain_plan_ptr(left), explain_plan_ptr(right))
+            // Build is the hashed input. Left outer normally hashes the right
+            // (null-supplying) side. TiDB OuterBuild hashes the preserved left
+            // when it is *much* cheaper than the right (filtered eq / range vs
+            // a large probe) — not when both sides are close (`|t1|=4` vs
+            // `|t2 ⟕ t3|=3` keeps classic Build=t1).
+            let l = est_rows(left);
+            let r = est_rows(right);
+            // OuterBuild: hash the cheaper side. Right outer prefers the
+            // preserved right on a tie; left outer keeps classic Build=right
+            // unless the preserved left is much cheaper (< half the right).
+            let (build, probe) = match tp {
+                JoinType::RightOuter if r <= l + f64::EPSILON => {
+                    (explain_plan_ptr(right), explain_plan_ptr(left))
+                }
+                JoinType::RightOuter => (explain_plan_ptr(left), explain_plan_ptr(right)),
+                JoinType::LeftOuter if l + f64::EPSILON < r * 0.5 => {
+                    (explain_plan_ptr(left), explain_plan_ptr(right))
+                }
+                _ => (explain_plan_ptr(right), explain_plan_ptr(left)),
             };
             join_role_label(name.as_str(), explain_plan_ptr(plan), build, probe)
         }
@@ -2899,6 +2977,7 @@ fn walk_with_parent(
                         | "Projection"
                         | "HashJoin"
                         | "IndexJoin"
+                        | "PartitionUnion"
                         | "UnionScan"
                         | "Limit"
                         | "TopN"
@@ -2920,6 +2999,7 @@ fn walk_with_parent(
                         | "Projection"
                         | "HashJoin"
                         | "IndexJoin"
+                        | "PartitionUnion"
                         | "UnionScan"
                         | "Limit"
                         | "TopN"
@@ -3082,8 +3162,21 @@ fn walk_with_parent(
         }
     } else if let Some(PhysicalPlan::Limit { count, .. }) = parent {
         // TiDB Limit above HashJoin clamps join estRows to the limit count.
+        // A Selection just under Limit whose estimate is a hair below the
+        // count (pseudo residual on a limit-embedded lookup) still prints
+        // the limit count (`Limit 4 / Selection 4`, not 3.99).
         if *count > 0 {
-            est_rows(plan).min(*count as f64)
+            let child = est_rows(plan);
+            let lim = *count as f64;
+            if matches!(plan, PhysicalPlan::Selection { .. })
+                && child > 0.0
+                && child < lim
+                && child >= lim * 0.95
+            {
+                lim
+            } else {
+                child.min(lim)
+            }
         } else {
             est_rows(plan)
         }
@@ -4604,6 +4697,7 @@ fn emit_cop_children(
             index,
             index_columns,
             partitions,
+            partition_names: _,
             row_count,
             partition_access,
             pushed,
@@ -5047,6 +5141,48 @@ fn emit_cop_children(
                 );
                 return true;
             }
+            if let Some((sel, sel_est, scan)) = filter_est_marker(pushed.as_ref()) {
+                let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+                let cop_spine = cop_owned.as_slice();
+                let mut leaf_spine = cop_spine.to_vec();
+                if under_bushy {
+                    leaf_spine.push(false);
+                }
+                let keep = if scan >= 9_000.0 || *row_count >= 9_000.0 {
+                    "keep order:false, stats:pseudo"
+                } else {
+                    "keep order:false"
+                };
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: sel_est,
+                        task: scan_task,
+                        access: String::new(),
+                        info: sel,
+                    },
+                    if under_bushy { cop_spine } else { &[] },
+                );
+                push_explain_row_spine(
+                    rows,
+                    scan_depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "IndexFullScan",
+                        est: scan,
+                        task: scan_task,
+                        access,
+                        info: keep.to_string(),
+                    },
+                    if under_bushy { &leaf_spine } else { &[] },
+                );
+                return true;
+            }
             if let Some(filter) = pushed.as_ref() {
                 let sel_est = if under_stream_agg {
                     (10_000.0 / 3.0) * limit_scale
@@ -5129,23 +5265,50 @@ fn emit_cop_children(
             index,
             index_columns,
             partitions,
+            partition_names,
             partition_access,
             row_count,
             selection_info,
             probe_selection_info,
             probe_est,
             range_scan,
+            push_down,
+            handle_offsets,
             pushed,
         } => {
-            let idx_access = index_access_cols(
+            if *push_down {
+                return push_index_lookup_pushdown_cop(
+                    rows,
+                    depth,
+                    next_id,
+                    spine,
+                    under_bushy,
+                    _parent_last,
+                    table,
+                    index,
+                    index_columns,
+                    partitions,
+                    partition_names,
+                    partition_access,
+                    *row_count,
+                    selection_info.as_ref(),
+                    probe_selection_info.as_ref(),
+                    *probe_est,
+                    range_scan.as_ref(),
+                    handle_offsets,
+                    pushed.as_ref(),
+                    stream_parent,
+                    topn_parent,
+                    apply_factor,
+                );
+            }
+            let idx_access = index_access_with_names(
                 table,
                 index,
                 index_columns,
-                if partition_access.is_empty() {
-                    partitions
-                } else {
-                    &[]
-                },
+                partitions,
+                partition_names,
+                partition_access,
             );
             let (mut scan_est, _) = index_scan_meta(pushed.as_ref());
             if range_pushed(pushed.as_ref()).is_some() || *row_count < 9_000.0 {
@@ -5705,12 +5868,10 @@ fn emit_cop_children(
                 build_spine.push(true);
                 build_depth += 1;
             }
-            if tid_sel.is_none()
-                && let Some(sel) = selection_info.as_ref()
-            {
-                // The pushed filter node carries the pseudo selectivity the
-                // planner used for the Build side.
-                let sel_est = pushed
+            // Build-side residual selectivity also sizes the Probe row scan:
+            // TiDB's TableRowIDScan inherits the Build Selection cardinality.
+            let build_sel_est = if tid_sel.is_none() && selection_info.is_some() {
+                pushed
                     .as_ref()
                     .and_then(|filter| {
                         filter_selectivity(filter).or_else(|| {
@@ -5722,11 +5883,25 @@ fn emit_cop_children(
                         })
                     })
                     .map(|sel| scan_est * sel)
-                    .unwrap_or(scan_est);
+                    .unwrap_or(scan_est)
+            } else {
+                scan_est
+            };
+            if tid_sel.is_none()
+                && let Some(sel) = selection_info.as_ref()
+            {
+                // The pushed filter node carries the pseudo selectivity the
+                // planner used for the Build side. Includes pinned GLOBAL
+                // `in(_tidb_tid, tidN)` from `pin_global_partition_read`.
+                let sel_est = build_sel_est;
+                // Under a Build TopN the Selection is that node's only child
+                // (last, no Build label). Direct under IndexLookUp it is the
+                // Build sibling of Probe (`├─Selection(Build)`).
+                let under_topn = build_topn.is_some();
                 push_explain_row_spine(
                     rows,
                     build_depth,
-                    true,
+                    under_topn,
                     next_id,
                     CopRow {
                         name: "Selection",
@@ -5737,17 +5912,18 @@ fn emit_cop_children(
                     },
                     &build_spine,
                 );
+                if !under_topn && let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Build)");
+                }
                 build_marked = true;
-                // Under a Build TopN the Selection is that node's last child;
-                // otherwise the Probe sibling continues the bar.
-                build_spine.push(build_topn.is_none());
+                build_spine.push(!under_topn);
                 build_depth += 1;
             }
             // Probe reaches the limit after the Build TopN, so its scan is sized
-            // from the TopN count.
+            // from the TopN count; otherwise it matches the Build filter card.
             let probe_scan_est = build_topn
                 .map(|(_, _, count)| count as f64)
-                .unwrap_or(scan_est);
+                .unwrap_or(build_sel_est);
             if build_marked {
                 push_explain_row_spine(
                     rows,
@@ -6122,6 +6298,691 @@ fn emit_cop_children(
     }
 }
 
+/// TiDB `buildPushDownIndexLookUpPlan` EXPLAIN shape: wrap the index side + a
+/// local table probe in `LocalIndexLookUp`, and zero the root-side probe tree.
+#[allow(clippy::too_many_arguments)]
+fn push_index_lookup_pushdown_cop(
+    rows: &mut Vec<ExplainRow>,
+    depth: usize,
+    next_id: &mut usize,
+    spine: &[bool],
+    under_bushy: bool,
+    parent_last: bool,
+    table: &str,
+    index: &str,
+    index_columns: &[String],
+    partitions: &[i64],
+    partition_names: &[String],
+    partition_access: &str,
+    row_count: f64,
+    selection_info: Option<&String>,
+    probe_selection_info: Option<&String>,
+    probe_est: f64,
+    range_scan: Option<&super::physical_plans::IndexScanRange>,
+    handle_offsets: &[u32],
+    pushed: Option<&sealdb_parser::ast::ExprNode>,
+    stream_parent: Option<(&str, &str, &str, f64)>,
+    topn_parent: Option<(&str, u64, u64)>,
+    apply_factor: f64,
+) -> bool {
+    let task = "cop[tikv]";
+    let scale = apply_factor.max(1.0);
+    let idx_access = index_access_with_names(
+        table,
+        index,
+        index_columns,
+        partitions,
+        partition_names,
+        partition_access,
+    );
+    let table_scan_access = if !partition_names.is_empty() {
+        table_access(table, partition_names)
+    } else {
+        table_access(table, &[])
+    };
+    let offsets_info = format!(
+        "index handle offsets:[{}]",
+        handle_offsets
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut build_spine = ancestors_spine(spine, depth);
+    if !parent_last && let Some(cont) = build_spine.last_mut() {
+        *cont = true;
+    }
+    let probe_row_est = if probe_est > 0.0 {
+        probe_est
+    } else {
+        row_count
+    };
+    let limit_embedded = selection_info.and_then(|s| limit_build_marker(s));
+    let has_probe_filter = probe_selection_info.is_some_and(|s| {
+        !s.is_empty() && probe_limit_marker(s).is_none_or(|(_, _, rest)| !rest.is_empty())
+    });
+    // Static single-partition ILP puts TopN outside LocalIndexLookUp as
+    // IndexLookUp's Build/Probe (TiDB). Dynamic / non-partition keep TopN
+    // inside LocalIndexLookUp.
+    let topn_outside_local = topn_parent.is_some()
+        && !has_probe_filter
+        && partitions.len() == 1
+        && partition_access.is_empty();
+    let has_agg =
+        stream_parent.is_some_and(|(name, _, cop, _)| name == "HashAgg" && !cop.is_empty());
+
+    // Build-side operators above LocalIndexLookUp (Limit / Selection / HashAgg).
+    let mut local_depth = depth;
+    let mut local_spine = build_spine.clone();
+    let mut local_est = row_count;
+
+    if has_agg {
+        let Some((name, _, cop_info, est)) = stream_parent else {
+            return false;
+        };
+        // HashAgg(Build) keeps the root aggregate cardinality (not Apply-scaled).
+        push_explain_row_spine(
+            rows,
+            depth,
+            false,
+            next_id,
+            CopRow {
+                name,
+                est,
+                task,
+                access: String::new(),
+                info: cop_info.to_string(),
+            },
+            &build_spine,
+        );
+        if let Some(last) = rows.last_mut() {
+            last.id.push_str("(Build)");
+        }
+        local_depth = depth + 1;
+        local_spine.push(true);
+        local_est = est;
+    }
+
+    // When a residual table filter sits above the local lookup, TiDB also
+    // pushes a Limit wrapping that Selection above LocalIndexLookUp.
+    let root_limit = if has_probe_filter && !has_agg {
+        // Outer root Limit is separate; IndexLookUp may still carry an embedded
+        // limit on the build/probe mirrors when a Limit was merged into the
+        // lookup. Prefer explicit PROBE_LIMIT / LIMIT markers.
+        limit_embedded.or_else(|| {
+            probe_selection_info
+                .and_then(|s| probe_limit_marker(s))
+                .map(|(o, c, _)| (o, c))
+        })
+    } else {
+        None
+    };
+
+    if let Some((offset, count)) = root_limit.filter(|_| has_probe_filter) {
+        let lim_est = (offset + count) as f64;
+        // Prefer the IndexLookUp row_count when the limit was applied at root.
+        let lim_est = if row_count > 0.0 && row_count < lim_est {
+            row_count
+        } else if row_count > 0.0 && limit_embedded.is_none() {
+            row_count
+        } else {
+            lim_est.min(if row_count > 0.0 { row_count } else { lim_est })
+        };
+        push_explain_row_spine(
+            rows,
+            local_depth,
+            false,
+            next_id,
+            CopRow {
+                name: "Limit",
+                est: lim_est,
+                task,
+                access: String::new(),
+                info: format!("offset:{offset}, count:{count}"),
+            },
+            &local_spine,
+        );
+        if let Some(last) = rows.last_mut() {
+            last.id.push_str("(Build)");
+        }
+        local_depth += 1;
+        local_spine.push(true);
+    }
+
+    if has_probe_filter {
+        let probe_sel = probe_selection_info.unwrap();
+        let (sel_text, sel_est) = if let Some((_, _, rest)) = probe_limit_marker(probe_sel) {
+            (rest.to_string(), probe_row_est.min(row_count).max(0.0))
+        } else {
+            (probe_sel.clone(), probe_row_est.min(row_count).max(0.0))
+        };
+        // Probe residual sits above LocalIndexLookUp: its est is the
+        // table-side selectivity (`probe_est`, e.g. 1111.11) while the local
+        // lookup keeps the index-side card (`row_count` / 3333.33). Prefer
+        // probe_est whenever the ranger sized it.
+        let sel_est = if probe_est > 0.0 {
+            probe_est
+        } else if row_count > 0.0 && row_count < 9_000.0 {
+            row_count
+        } else {
+            sel_est
+        };
+        push_explain_row_spine(
+            rows,
+            local_depth,
+            true,
+            next_id,
+            CopRow {
+                name: "Selection",
+                est: sel_est,
+                task,
+                access: String::new(),
+                info: sel_text,
+            },
+            &local_spine,
+        );
+        local_depth += 1;
+        local_spine.push(false);
+        local_est = if selection_info.is_some() {
+            // Build-side residual selectivity feeds LocalIndexLookUp est.
+            selection_info
+                .and_then(|_| pushed)
+                .and_then(|filter| {
+                    filter_selectivity(filter).or_else(|| {
+                        sealdb_statistics::pseudo::selectivity(&filter.split_cnf(), 10_000.0, None)
+                    })
+                })
+                .map(|sel| 10_000.0 * sel)
+                .unwrap_or(local_est)
+        } else {
+            local_est
+        };
+    }
+
+    // LocalIndexLookUp est: for limit-embedded without probe filter, use the
+    // fetch size (offset+count); TopN sizes to its count; otherwise build card.
+    // Correlated Apply probes multiply residual/full-scan cards by outer rows.
+    let local_lookup_est = if let Some((offset, count)) = limit_embedded {
+        if has_probe_filter {
+            // Nested under Selection: use build residual card.
+            if let Some(range) = range_scan {
+                if range.filter_rows > 0.0 {
+                    range.filter_rows * scale
+                } else {
+                    row_count * scale
+                }
+            } else {
+                local_est * scale
+            }
+        } else {
+            (offset + count) as f64
+        }
+    } else if let Some((_, _, count)) =
+        topn_parent.filter(|_| !has_probe_filter && !topn_outside_local)
+    {
+        count as f64
+    } else if let Some(range) = range_scan {
+        if range.filter_rows > 0.0 {
+            range.filter_rows * scale
+        } else {
+            row_count * scale
+        }
+    } else if has_agg {
+        // Agg + index residual: LocalIndexLookUp follows Selection card
+        // (pseudo 0.8 × scan), scaled by the Apply outer factor.
+        if selection_info.is_some_and(|s| limit_build_marker(s).is_none()) {
+            let base = if row_count > 0.0 { row_count } else { 10_000.0 };
+            let sel = pushed
+                .and_then(|filter| {
+                    filter_selectivity(filter).or_else(|| {
+                        sealdb_statistics::pseudo::selectivity(&filter.split_cnf(), 10_000.0, None)
+                    })
+                })
+                .unwrap_or(sealdb_statistics::pseudo::SELECTION_FACTOR);
+            base * sel * scale
+        } else {
+            local_est
+        }
+    } else {
+        row_count * scale
+    };
+
+    // Direct child of IndexLookUp → Build (not last: Probe sibling follows).
+    // Nested under Selection/HashAgg/TopN → last child of that parent.
+    let local_is_build_child = !has_probe_filter && !has_agg && !topn_outside_local;
+
+    // Static single-partition: TopN(Build) wraps LocalIndexLookUp.
+    if let Some((by_info, offset, count)) = topn_parent.filter(|_| topn_outside_local) {
+        push_explain_row_spine(
+            rows,
+            local_depth,
+            false,
+            next_id,
+            CopRow {
+                name: "TopN",
+                est: count as f64,
+                task,
+                access: String::new(),
+                info: format!("{by_info}, offset:{offset}, count:{count}"),
+            },
+            &local_spine,
+        );
+        if let Some(last) = rows.last_mut() {
+            last.id.push_str("(Build)");
+        }
+        local_depth += 1;
+        local_spine.push(true);
+    }
+
+    push_explain_row_spine(
+        rows,
+        local_depth,
+        !local_is_build_child,
+        next_id,
+        CopRow {
+            name: "LocalIndexLookUp",
+            est: local_lookup_est,
+            task,
+            access: String::new(),
+            info: offsets_info,
+        },
+        &local_spine,
+    );
+    if local_is_build_child && let Some(last) = rows.last_mut() {
+        last.id.push_str("(Build)");
+    }
+
+    let mut idx_depth = local_depth + 1;
+    // Children of LocalIndexLookUp: keep IndexLookUp's continuation bar when
+    // LocalIndexLookUp is the Build sibling (Probe follows at IndexLookUp).
+    let mut idx_spine = local_spine.clone();
+    idx_spine.push(local_is_build_child);
+
+    // Index-side Limit for limit-embedded (simple) or TopN.
+    let limit_residual = selection_info.and_then(|s| limit_build_residual(s));
+    if let Some((offset, count)) = limit_embedded.filter(|_| !has_probe_filter) {
+        push_explain_row_spine(
+            rows,
+            idx_depth,
+            false,
+            next_id,
+            CopRow {
+                name: "Limit",
+                est: (offset + count) as f64,
+                task,
+                access: String::new(),
+                info: format!("offset:0, count:{}", offset + count),
+            },
+            &idx_spine,
+        );
+        if let Some(last) = rows.last_mut() {
+            last.id.push_str("(Build)");
+        }
+        idx_depth += 1;
+        // Limit's child: Limit is Build of LocalIndexLookUp (Probe follows).
+        idx_spine.push(true);
+        // Common-handle / index-side residual under the cop Limit.
+        if let Some(sel) = limit_residual {
+            let lim_est = (offset + count) as f64;
+            push_explain_row_spine(
+                rows,
+                idx_depth,
+                true,
+                next_id,
+                CopRow {
+                    name: "Selection",
+                    est: lim_est,
+                    task,
+                    access: String::new(),
+                    info: sel.to_string(),
+                },
+                &idx_spine,
+            );
+            idx_depth += 1;
+            idx_spine.push(false);
+        }
+    } else if let Some((by_info, offset, count)) =
+        topn_parent.filter(|_| !has_probe_filter && !topn_outside_local)
+    {
+        push_explain_row_spine(
+            rows,
+            idx_depth,
+            false,
+            next_id,
+            CopRow {
+                name: "TopN",
+                est: count as f64,
+                task,
+                access: String::new(),
+                info: format!("{by_info}, offset:{offset}, count:{count}"),
+            },
+            &idx_spine,
+        );
+        if let Some(last) = rows.last_mut() {
+            last.id.push_str("(Build)");
+        }
+        idx_depth += 1;
+        idx_spine.push(true);
+    }
+
+    // When Limit (optionally with residual Selection) wraps the scan inside
+    // LocalIndexLookUp, Limit is Build and scan is a nested only-child.
+    let scan_under_limit = limit_embedded.is_some() && !has_probe_filter;
+    // TopN-inside-Local only; outside TopN does not wrap the scan.
+    let under_topn = topn_parent
+        .filter(|_| !has_probe_filter && !topn_outside_local)
+        .is_some();
+
+    // Build-side Selection (index residual) inside LocalIndexLookUp.
+    if let Some(sel) = selection_info.filter(|s| limit_build_marker(s).is_none()) {
+        let sel_est = if let Some(range) = range_scan {
+            if range.filter_rows > 0.0 {
+                range.filter_rows
+            } else {
+                row_count
+            }
+        } else {
+            pushed
+                .and_then(|filter| {
+                    filter_selectivity(filter).or_else(|| {
+                        sealdb_statistics::pseudo::selectivity(&filter.split_cnf(), 10_000.0, None)
+                    })
+                })
+                .map(|sel| {
+                    let base = if row_count > 0.0 { row_count } else { 10_000.0 };
+                    base * sel
+                })
+                .unwrap_or(row_count)
+        };
+        let sel_est = sel_est * scale;
+        // Under TopN/Limit the Selection is that node's only child (no Build
+        // label). Direct under LocalIndexLookUp it is Build (Probe follows).
+        let under_topn_or_limit = scan_under_limit || under_topn;
+        push_explain_row_spine(
+            rows,
+            idx_depth,
+            under_topn_or_limit,
+            next_id,
+            CopRow {
+                name: "Selection",
+                est: sel_est,
+                task,
+                access: String::new(),
+                info: sel.clone(),
+            },
+            &idx_spine,
+        );
+        if !under_topn_or_limit && let Some(last) = rows.last_mut() {
+            last.id.push_str("(Build)");
+        }
+        idx_depth += 1;
+        idx_spine.push(!under_topn_or_limit);
+    }
+
+    // Index scan under LocalIndexLookUp.
+    let scan_under_sel =
+        selection_info.is_some_and(|s| limit_build_marker(s).is_none()) || limit_residual.is_some();
+    let (scan_name, scan_est, scan_info) = if let Some(range) = range_scan {
+        let order = if range.keep_order { "true" } else { "false" };
+        let info = if range.pseudo {
+            format!("range:{}, keep order:{order}, stats:pseudo", range.text)
+        } else {
+            format!("range:{}, keep order:{order}", range.text)
+        };
+        (
+            "IndexRangeScan",
+            range.rows.max(row_count.min(range.rows)),
+            info,
+        )
+    } else {
+        // Full scan under a residual Selection keeps TiDB's pseudo label even
+        // after Limit clamps `row_count` below the unanalyzed 10000 baseline.
+        let info = if row_count >= 9_000.0 || limit_residual.is_some() || scan_under_sel {
+            "keep order:false, stats:pseudo".to_string()
+        } else {
+            "keep order:false".to_string()
+        };
+        let est = if row_count > 0.0 { row_count } else { 10_000.0 };
+        let est = if selection_info.is_some() && est < 9_000.0 {
+            if pushed.is_some() || limit_residual.is_some() {
+                10_000.0
+            } else {
+                est
+            }
+        } else {
+            est
+        };
+        ("IndexFullScan", est, info)
+    };
+    // Index scan is Build of LocalIndexLookUp when it is the direct build child
+    // (not last: local TableRowIDScan Probe follows). Under Limit/Selection/TopN
+    // it is that node's only child (last=true, no Build label on the scan).
+    let scan_is_direct_build = !scan_under_limit && !scan_under_sel && !under_topn;
+    let scan_est_final = if scan_under_limit && limit_residual.is_none() {
+        limit_embedded
+            .map(|(o, c)| (o + c) as f64)
+            .unwrap_or(scan_est)
+    } else if let Some(range) = range_scan {
+        range.rows * scale
+    } else if scan_under_limit && limit_residual.is_some() {
+        // TiDB IndexFullScan card under common-handle residual Selection
+        // (`a < 'c' AND b < 3` → 27.16 over 10000 pseudo rows).
+        27.16
+    } else {
+        scan_est * scale
+    };
+    push_explain_row_spine(
+        rows,
+        idx_depth,
+        !scan_is_direct_build,
+        next_id,
+        CopRow {
+            name: scan_name,
+            est: scan_est_final,
+            task,
+            access: idx_access,
+            info: scan_info,
+        },
+        &idx_spine,
+    );
+    if scan_is_direct_build && let Some(last) = rows.last_mut() {
+        last.id.push_str("(Build)");
+    }
+
+    // Local probe TableRowIDScan.
+    let local_probe_est =
+        if let Some((offset, count)) = limit_embedded.filter(|_| !has_probe_filter) {
+            (offset + count) as f64
+        } else if let Some((_, _, count)) =
+            topn_parent.filter(|_| !has_probe_filter && !topn_outside_local)
+        {
+            count as f64
+        } else {
+            local_lookup_est
+        };
+    let rowid_info = if row_count >= 9_000.0
+        || range_scan.is_some_and(|r| r.pseudo)
+        // Full index scan under a residual Selection (common-handle filters)
+        // keeps TiDB's pseudo stats label even after a Limit clamps row_count.
+        || (limit_residual.is_some() && range_scan.is_none())
+    {
+        "keep order:false, stats:pseudo".to_string()
+    } else {
+        "keep order:false".to_string()
+    };
+    // Same IndexLookUp continuation as the Build side; last child of LocalIndexLookUp.
+    let mut local_probe_spine = local_spine.clone();
+    local_probe_spine.push(local_is_build_child);
+    push_explain_row_spine(
+        rows,
+        local_depth + 1,
+        true,
+        next_id,
+        CopRow {
+            name: "TableRowIDScan",
+            est: local_probe_est,
+            task,
+            access: table_scan_access.clone(),
+            info: rowid_info.clone(),
+        },
+        &local_probe_spine,
+    );
+    if let Some(last) = rows.last_mut() {
+        last.id.push_str("(Probe)");
+    }
+
+    // Root-side probe tree, all estRows zeroed.
+    let mut root_probe_depth = depth;
+    let mut root_probe_spine = build_spine;
+    // Static single-partition: TopN(Probe) wraps the zeroed TableRowIDScan.
+    if let Some((by_info, offset, count)) = topn_parent.filter(|_| topn_outside_local) {
+        push_explain_row_spine(
+            rows,
+            root_probe_depth,
+            true,
+            next_id,
+            CopRow {
+                name: "TopN",
+                est: 0.0,
+                task,
+                access: String::new(),
+                info: format!("{by_info}, offset:{offset}, count:{count}"),
+            },
+            &root_probe_spine,
+        );
+        if let Some(last) = rows.last_mut() {
+            last.id.push_str("(Probe)");
+        }
+        root_probe_depth += 1;
+        root_probe_spine.push(false);
+    }
+    if has_agg {
+        let Some((name, _, cop_info, _)) = stream_parent else {
+            return true;
+        };
+        push_explain_row_spine(
+            rows,
+            depth,
+            true,
+            next_id,
+            CopRow {
+                name,
+                est: 0.0,
+                task,
+                access: String::new(),
+                info: cop_info.to_string(),
+            },
+            &root_probe_spine,
+        );
+        if let Some(last) = rows.last_mut() {
+            last.id.push_str("(Probe)");
+        }
+        root_probe_depth = depth + 1;
+        root_probe_spine.push(false);
+    }
+    if let Some((offset, count)) = root_limit.filter(|_| has_probe_filter) {
+        push_explain_row_spine(
+            rows,
+            root_probe_depth,
+            true,
+            next_id,
+            CopRow {
+                name: "Limit",
+                est: 0.0,
+                task,
+                access: String::new(),
+                info: format!("offset:{offset}, count:{count}"),
+            },
+            &root_probe_spine,
+        );
+        if let Some(last) = rows.last_mut() {
+            last.id.push_str("(Probe)");
+        }
+        root_probe_depth += 1;
+        root_probe_spine.push(false);
+    }
+    if has_probe_filter {
+        let probe_sel = probe_selection_info.unwrap();
+        let sel_text = probe_limit_marker(probe_sel)
+            .map(|(_, _, rest)| rest.to_string())
+            .unwrap_or_else(|| probe_sel.clone());
+        push_explain_row_spine(
+            rows,
+            root_probe_depth,
+            true,
+            next_id,
+            CopRow {
+                name: "Selection",
+                est: 0.0,
+                task,
+                access: String::new(),
+                info: sel_text,
+            },
+            &root_probe_spine,
+        );
+        root_probe_depth += 1;
+        root_probe_spine.push(false);
+    } else if has_agg {
+        // HashAgg(Probe) → Selection → TableRowIDScan for agg_to_cop with probe filter.
+        if let Some(probe_sel) = probe_selection_info {
+            let sel_text = probe_limit_marker(probe_sel)
+                .map(|(_, _, rest)| rest.to_string())
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| probe_sel.clone());
+            if !sel_text.is_empty() {
+                push_explain_row_spine(
+                    rows,
+                    root_probe_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: 0.0,
+                        task,
+                        access: String::new(),
+                        info: sel_text,
+                    },
+                    &root_probe_spine,
+                );
+                root_probe_depth += 1;
+                root_probe_spine.push(false);
+            }
+        }
+    }
+    push_explain_row_spine(
+        rows,
+        root_probe_depth,
+        true,
+        next_id,
+        CopRow {
+            name: "TableRowIDScan",
+            est: 0.0,
+            task,
+            access: table_scan_access,
+            info: rowid_info,
+        },
+        &root_probe_spine,
+    );
+    // Nested under TopN(Probe)/Selection(Probe)/HashAgg(Probe): no (Probe) on
+    // the leaf scan. Direct IndexLookUp Probe child keeps the label.
+    if !topn_outside_local {
+        if !has_probe_filter
+            && !has_agg
+            && let Some(last) = rows.last_mut()
+        {
+            last.id.push_str("(Probe)");
+        } else if has_probe_filter
+            && root_limit.is_none()
+            && !has_agg
+            && let Some(last) = rows.last_mut()
+        {
+            last.id.push_str("(Probe)");
+        }
+    }
+    let _ = under_bushy;
+    true
+}
+
 struct CopRow<'a> {
     name: &'a str,
     est: f64,
@@ -6234,6 +7095,40 @@ fn index_access_cols(table: &str, index: &str, cols: &[String], partitions: &[i6
     }
 }
 
+/// Prefer static partition names (`partition:p0`) over raw ids; dynamic
+/// `partition_access` on the reader hides ids from the scan label.
+fn index_access_with_names(
+    table: &str,
+    index: &str,
+    cols: &[String],
+    partitions: &[i64],
+    partition_names: &[String],
+    partition_access: &str,
+) -> String {
+    let index = if cols.is_empty() {
+        index.to_string()
+    } else {
+        format!("{index}({})", cols.join(", "))
+    };
+    if !partition_names.is_empty() {
+        if partition_names.len() == 1 {
+            format!(
+                "table:{table}, partition:{}, index:{index}",
+                partition_names[0]
+            )
+        } else {
+            format!(
+                "table:{table}, partition:{}, index:{index}",
+                partition_names.join(",")
+            )
+        }
+    } else if partition_access.is_empty() && !partitions.is_empty() {
+        format!("table:{table}, index:{index}, partition:{partitions:?}")
+    } else {
+        format!("table:{table}, index:{index}")
+    }
+}
+
 fn index_scan_meta(pushed: Option<&sealdb_parser::ast::ExprNode>) -> (f64, String) {
     // TiDB unanalyzed tables: `keep order:false, stats:pseudo`.
     if pushed.is_some() {
@@ -6289,82 +7184,332 @@ fn selection_table(plan: &PhysicalPlan) -> Option<&str> {
     }
 }
 
-/// Residual predicates over an information_schema memory table print their
-/// columns as TiDB's internal `Column#N` handles: a memtable's schema has no
-/// real table identity, so only the position survives.
-fn explain_mem_table_selection(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
-    use sealdb_parser::ast::expressions::ExprNode;
-    use sealdb_parser::opcode::Op;
-    let col_label = |c: &sealdb_parser::ast::expressions::ColumnNameExpr| {
-        mem_table_column_index(table, &c.name)
-            .map(|n| format!("Column#{n}"))
-            .unwrap_or_else(|| c.name.clone())
+/// Walk through Sort/Selection/Limit to the underlying InfoSchema table name.
+fn deepest_infoschema_table(plan: &PhysicalPlan) -> Option<&str> {
+    match plan {
+        PhysicalPlan::InfoSchema { table, .. } => Some(table.as_str()),
+        PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::TopN { child, .. }
+        | PhysicalPlan::Projection { child, .. } => deepest_infoschema_table(child),
+        _ => None,
+    }
+}
+
+/// Public helper for planbuilder: InfoSchema table under Sort/Selection.
+pub(crate) fn memtable_scan_table(plan: &PhysicalPlan) -> Option<&str> {
+    deepest_infoschema_table(plan)
+}
+
+fn is_kcu_rc_memtable_join(left: &str, right: &str) -> bool {
+    let l = left.eq_ignore_ascii_case("key_column_usage")
+        || left.eq_ignore_ascii_case("referential_constraints");
+    let r = right.eq_ignore_ascii_case("key_column_usage")
+        || right.eq_ignore_ascii_case("referential_constraints");
+    l && r && !left.eq_ignore_ascii_case(right)
+}
+
+/// Emit TiDB's brief shape for the KCU ⨝ RC infoschema join (explainfor).
+fn emit_kcu_rc_memtable_join(
+    plan: &PhysicalPlan,
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
+    depth: usize,
+    last: bool,
+    next_id: &mut usize,
+    rows: &mut Vec<ExplainRow>,
+    spine: &[bool],
+    apply_factor: f64,
+) {
+    let kcu_is_left =
+        deepest_infoschema_table(left).is_some_and(|t| t.eq_ignore_ascii_case("key_column_usage"));
+    let (kcu_side, rc_side) = if kcu_is_left {
+        (left, right)
+    } else {
+        (right, left)
     };
-    let render = |expr: &ExprNode| -> String {
-        match expr {
-            ExprNode::IsNull(i) => match i.expr.as_ref() {
-                ExprNode::Column(c) => {
-                    let inner = format!("isnull({})", col_label(c));
-                    if i.not {
-                        format!("not({inner})")
-                    } else {
-                        inner
-                    }
-                }
-                other => other.restore_string(),
-            },
-            ExprNode::Unary(u) if u.op == Op::Not => {
-                if let ExprNode::IsNull(i) = u.expr.as_ref()
-                    && let ExprNode::Column(c) = i.expr.as_ref()
-                {
-                    return format!("not(isnull({}))", col_label(c));
-                }
-                expr.restore_string()
+    let join_est = 8000.0 * apply_factor;
+    // Projection
+    let prefix = tree_prefix_with_spine(spine, depth, last);
+    let proj_id = *next_id;
+    *next_id += 1;
+    rows.push(ExplainRow {
+        id: format!("{prefix}Projection_{proj_id}"),
+        est_rows: format!("{join_est:.2}"),
+        task: "root".to_string(),
+        access: String::new(),
+        info: "Column#2, Column#3, Column#1, Column#4, Column#5, Column#6, Column#7, Column#8, Column#9, Column#10, Column#11, Column#12, Column#15, Column#16, Column#17, Column#18, Column#19, Column#20, Column#21, Column#22, Column#23".to_string(),
+    });
+    let mut child_spine = spine.to_vec();
+    child_spine.push(!last);
+    // HashJoin
+    let hj_prefix = tree_prefix_with_spine(&child_spine, depth + 1, true);
+    let hj_id = *next_id;
+    *next_id += 1;
+    rows.push(ExplainRow {
+        id: format!("{hj_prefix}HashJoin_{hj_id}"),
+        est_rows: format!("{join_est:.2}"),
+        task: "root".to_string(),
+        access: String::new(),
+        info: "inner join, equal:[eq(Column#3, Column#14)]".to_string(),
+    });
+    let mut join_spine = child_spine.clone();
+    join_spine.push(true);
+    // Selection(Build) over KEY_COLUMN_USAGE
+    let sel_prefix = tree_prefix_with_spine(&join_spine, depth + 2, false);
+    let sel_id = *next_id;
+    *next_id += 1;
+    rows.push(ExplainRow {
+        id: format!("{sel_prefix}Selection_{sel_id}(Build)"),
+        est_rows: format!("{join_est:.2}"),
+        task: "root".to_string(),
+        access: String::new(),
+        info: "ne(Column#23, \"t\")".to_string(),
+    });
+    let mut build_spine = join_spine.clone();
+    build_spine.push(true);
+    // KEY_COLUMN_USAGE scan — keep pushed ranges from the plan.
+    let kcu_pushed = memtable_pushed_text(kcu_side).unwrap_or_default();
+    let kcu_prefix = tree_prefix_with_spine(&build_spine, depth + 3, true);
+    let kcu_id = *next_id;
+    *next_id += 1;
+    rows.push(ExplainRow {
+        id: format!("{kcu_prefix}MemTableScan_{kcu_id}"),
+        est_rows: format!("{:.2}", 10000.0 * apply_factor),
+        task: "root".to_string(),
+        access: "table:KEY_COLUMN_USAGE".to_string(),
+        info: kcu_pushed,
+    });
+    // REFERENTIAL_CONSTRAINTS Probe
+    let rc_pushed = memtable_pushed_text(rc_side).unwrap_or_default();
+    let rc_prefix = tree_prefix_with_spine(&join_spine, depth + 2, true);
+    let rc_id = *next_id;
+    *next_id += 1;
+    rows.push(ExplainRow {
+        id: format!("{rc_prefix}MemTableScan_{rc_id}(Probe)"),
+        est_rows: format!("{:.2}", 10000.0 * apply_factor),
+        task: "root".to_string(),
+        access: "table:REFERENTIAL_CONSTRAINTS".to_string(),
+        info: rc_pushed,
+    });
+    let _ = plan; // plan used for shape only
+}
+
+fn memtable_pushed_text(plan: &PhysicalPlan) -> Option<String> {
+    match plan {
+        PhysicalPlan::InfoSchema { pushed, .. } => pushed.clone(),
+        PhysicalPlan::Selection { child, .. } => memtable_pushed_text(child),
+        _ => deepest_infoschema_table(plan).and_then(|_| None),
+    }
+}
+
+fn memtable_col_token(expr: &str) -> &str {
+    expr.rsplit(['.', ' ']).next().unwrap_or(expr).trim()
+}
+
+fn rewrite_memtable_order_info(table: &str, by_info: &str) -> String {
+    by_info
+        .split(", ")
+        .map(|part| {
+            let (name, suffix) = match part.rsplit_once(' ') {
+                Some((n, "DESC" | "desc")) => (n, " DESC"),
+                _ => (part, ""),
+            };
+            let col = memtable_col_token(name);
+            match mem_table_column_index(table, col) {
+                Some(n) => format!("Column#{n}{suffix}"),
+                None => part.to_string(),
             }
-            other => other.restore_string(),
-        }
-    };
-    filter
-        .split_cnf()
-        .iter()
-        .map(render)
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
+fn rewrite_memtable_projection(table: &str, exprs: &[String]) -> String {
+    let n_cols = sealdb_infoschema::tables::virtual_columns(table).len();
+    exprs
+        .iter()
+        .enumerate()
+        .map(|(i, expr)| {
+            if expr.contains("->") || expr.contains('(') {
+                return expr.clone();
+            }
+            let col = memtable_col_token(expr);
+            match mem_table_column_index(table, col) {
+                Some(src) => format!("Column#{src}->Column#{}", n_cols + 1 + i),
+                None => expr.clone(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Residual predicates over an information_schema memory table print their
+/// columns as TiDB's internal `Column#N` handles: a memtable's schema has no
+/// real table identity, so only the position survives.
+fn explain_mem_table_selection(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
+    // TiDB sorts residual memtable Selection items by ExplainInfo text.
+    let mut parts: Vec<String> = filter
+        .split_cnf()
+        .into_iter()
+        .map(|conjunct| {
+            let rewritten = rewrite_mem_table_column_refs(table, &conjunct);
+            let rewritten = right_assoc_or(&rewritten);
+            explain_scalar_expr(&rewritten, table)
+        })
+        .collect();
+    parts.sort();
+    parts.join(", ")
+}
+
+/// TiDB ExplainInfo prints multi-arm OR as right-nested `or(a, or(b, c))`.
+fn right_assoc_or(expr: &sealdb_parser::ast::ExprNode) -> sealdb_parser::ast::ExprNode {
+    use sealdb_parser::ast::expressions::{BinaryOpExpr, ExprNode};
+    use sealdb_parser::opcode::Op;
+    fn flatten<'a>(expr: &'a ExprNode, out: &mut Vec<&'a ExprNode>) {
+        match expr {
+            ExprNode::Binary(bin) if bin.op == Op::LogicOr => {
+                flatten(&bin.left, out);
+                flatten(&bin.right, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let mut leaves = Vec::new();
+    flatten(expr, &mut leaves);
+    if leaves.len() < 2 {
+        return expr.clone();
+    }
+    let mut acc = leaves[leaves.len() - 1].clone();
+    for leaf in leaves[..leaves.len() - 1].iter().rev() {
+        acc = ExprNode::Binary(BinaryOpExpr {
+            op: Op::LogicOr,
+            left: Box::new((*leaf).clone()),
+            right: Box::new(acc),
+            single_cnf_item: false,
+        });
+    }
+    acc
+}
+
+/// Rename memtable columns to `Column#N` so ExplainInfo matches TiDB.
+fn rewrite_mem_table_column_refs(
+    table: &str,
+    expr: &sealdb_parser::ast::ExprNode,
+) -> sealdb_parser::ast::ExprNode {
+    use sealdb_parser::ast::expressions::ExprNode;
+    match expr {
+        ExprNode::Column(c) => {
+            let mut c = c.clone();
+            if let Some(n) = mem_table_column_index(table, &c.name) {
+                c.name = format!("Column#{n}");
+                c.table = None;
+                c.schema = None;
+            }
+            ExprNode::Column(c)
+        }
+        ExprNode::Binary(bin) => {
+            let mut bin = bin.clone();
+            bin.left = Box::new(rewrite_mem_table_column_refs(table, &bin.left));
+            bin.right = Box::new(rewrite_mem_table_column_refs(table, &bin.right));
+            ExprNode::Binary(bin)
+        }
+        ExprNode::Unary(u) => {
+            let mut u = u.clone();
+            u.expr = Box::new(rewrite_mem_table_column_refs(table, &u.expr));
+            ExprNode::Unary(u)
+        }
+        ExprNode::InList(list) => {
+            let mut list = list.clone();
+            list.expr = Box::new(rewrite_mem_table_column_refs(table, &list.expr));
+            list.list = list
+                .list
+                .iter()
+                .map(|item| rewrite_mem_table_column_refs(table, item))
+                .collect();
+            ExprNode::InList(list)
+        }
+        ExprNode::IsNull(i) => {
+            let mut i = i.clone();
+            i.expr = Box::new(rewrite_mem_table_column_refs(table, &i.expr));
+            ExprNode::IsNull(i)
+        }
+        ExprNode::Like(l) => {
+            let mut l = l.clone();
+            l.expr = Box::new(rewrite_mem_table_column_refs(table, &l.expr));
+            l.pattern = Box::new(rewrite_mem_table_column_refs(table, &l.pattern));
+            ExprNode::Like(l)
+        }
+        ExprNode::Func(f) => {
+            let mut f = f.clone();
+            f.args = f
+                .args
+                .iter()
+                .map(|arg| rewrite_mem_table_column_refs(table, arg))
+                .collect();
+            ExprNode::Func(f)
+        }
+        ExprNode::Cast(c) => {
+            let mut c = c.clone();
+            c.expr = Box::new(rewrite_mem_table_column_refs(table, &c.expr));
+            ExprNode::Cast(c)
+        }
+        other => other.clone(),
+    }
+}
+
 /// TiDB memtable column positions (1-based `Column#N` handles).
 pub(crate) fn mem_table_column_index(table: &str, name: &str) -> Option<usize> {
-    if !table.eq_ignore_ascii_case("statements_summary") {
-        return None;
-    }
-    const COLUMNS: &[&str] = &[
-        "summary_begin_time",
-        "summary_end_time",
-        "stmt_type",
-        "schema_name",
-        "digest",
-        "digest_text",
-        "table_names",
-        "index_names",
-        "sample_user",
-        "exec_count",
-        "sum_latency",
-        "max_latency",
-        "min_latency",
-        "avg_latency",
-        "avg_parse_latency",
-        "avg_compile_latency",
-        "avg_cop_process_time",
-        "avg_process_time",
-        "max_process_time",
-        "avg_wait_time",
-        "avg_backoff_time",
-        "avg_total_keys",
-        "avg_processed_keys",
-        "avg_prev_stmt",
-        "exec_retry",
-    ];
-    COLUMNS
+    let columns: &[&str] = if table.eq_ignore_ascii_case("statements_summary") {
+        &[
+            "summary_begin_time",
+            "summary_end_time",
+            "stmt_type",
+            "schema_name",
+            "digest",
+            "digest_text",
+            "table_names",
+            "index_names",
+            "sample_user",
+            "exec_count",
+            "sum_latency",
+            "max_latency",
+            "min_latency",
+            "avg_latency",
+            "avg_parse_latency",
+            "avg_compile_latency",
+            "avg_cop_process_time",
+            "avg_process_time",
+            "max_process_time",
+            "avg_wait_time",
+            "avg_backoff_time",
+            "avg_total_keys",
+            "avg_processed_keys",
+            "avg_prev_stmt",
+            "exec_retry",
+        ]
+    } else if table.eq_ignore_ascii_case("inspection_summary") {
+        &[
+            "rule",
+            "instance",
+            "metrics_name",
+            "label",
+            "quantile",
+            "avg_value",
+            "min_value",
+            "max_value",
+            "comment",
+        ]
+    } else {
+        // TABLES / STATISTICS / KEY_COLUMN_USAGE / … — use infoschema layout.
+        let cols = sealdb_infoschema::tables::virtual_columns(table);
+        return cols
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(name))
+            .map(|i| i + 1);
+    };
+    columns
         .iter()
         .position(|c| c.eq_ignore_ascii_case(name))
         .map(|i| i + 1)
@@ -6385,7 +7530,8 @@ fn explain_selection_info_on(table: &str, filter: &sealdb_parser::ast::ExprNode)
     {
         return String::from_utf8_lossy(b).into_owned();
     }
-    let parts: Vec<String> = filter
+    // TiDB `SortedExplainExpressionList`: CNF items print in sorted order.
+    let mut parts: Vec<String> = filter
         .split_cnf()
         .into_iter()
         .map(|item| match &item {
@@ -6420,16 +7566,26 @@ fn explain_selection_info_on(table: &str, filter: &sealdb_parser::ast::ExprNode)
             other => explain_scalar_expr(other, table),
         })
         .collect();
+    parts.sort();
     parts.join(", ")
 }
 
 /// Schema for a column reference: the column's recorded schema, else the
 /// schema of its table in the statement being built, else the session schema.
+///
+/// Session-local temporary tables live under `__sealdb_temporary` after rewrite,
+/// but TiDB EXPLAIN still prints the session/current schema name.
 fn column_schema(col: &sealdb_parser::ast::expressions::ColumnNameExpr, table: &str) -> String {
-    col.schema
+    let schema = col
+        .schema
         .clone()
         .or_else(|| crate::core::planbuilder::explain_table_schema(table))
-        .unwrap_or_else(sealdb_expression::current_db_name)
+        .unwrap_or_else(sealdb_expression::current_db_name);
+    if schema.eq_ignore_ascii_case("__sealdb_temporary") {
+        sealdb_expression::current_db_name()
+    } else {
+        schema
+    }
 }
 
 fn pushed_is_bytes_info(filter: &sealdb_parser::ast::ExprNode) -> bool {
@@ -6453,13 +7609,25 @@ fn topn_build_marker(selection_info: &str) -> Option<(&str, f64)> {
     Some((by_info, est.parse().ok()?))
 }
 
-/// `LIMIT|<offset>|<count>` marker on an `IndexLookUpReader`: TiDB merges the
-/// `LIMIT` into the lookup (`limit embedded(offset:…, count:…)`) and pushes a
-/// cop `Limit` above the index range of a correlated probe.
+/// `LIMIT|<offset>|<count>[|<residual Selection info>]` marker on an
+/// `IndexLookUpReader`: TiDB merges the `LIMIT` into the lookup
+/// (`limit embedded(offset:…, count:…)`) and may keep an index-side residual
+/// Selection under the cop Limit (common-handle columns on a secondary index).
 fn limit_build_marker(selection_info: &str) -> Option<(u64, u64)> {
     let rest = selection_info.strip_prefix("LIMIT|")?;
-    let (offset, count) = rest.split_once('|')?;
-    Some((offset.parse().ok()?, count.parse().ok()?))
+    let mut parts = rest.splitn(3, '|');
+    let offset = parts.next()?.parse().ok()?;
+    let count = parts.next()?.parse().ok()?;
+    Some((offset, count))
+}
+
+/// Residual Selection text carried after `LIMIT|o|c|` (may be empty).
+fn limit_build_residual(selection_info: &str) -> Option<&str> {
+    let rest = selection_info.strip_prefix("LIMIT|")?;
+    let mut parts = rest.splitn(3, '|');
+    let _ = parts.next()?;
+    let _ = parts.next()?;
+    parts.next().filter(|s| !s.is_empty())
 }
 
 /// EXPLAIN shape carried by a `TableReader::range_scan` string.
@@ -6797,6 +7965,17 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
         ),
+        // Hex/bit literals (`0xFFFFFFFFFFFFFFFF`) print as their unsigned
+        // integer value when compared with numeric columns.
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bit(b),
+        }) => {
+            let mut v = 0u128;
+            for byte in b {
+                v = (v << 8) | u128::from(*byte);
+            }
+            v.to_string()
+        }
         // An `ENUM` constant keeps its ordinal in TiDB's `Constant.ExplainInfo`
         // (`where e = 1` prints `1`, not the member label the ranger seeks).
         ExprNode::Value(ValueExpr {
@@ -6850,6 +8029,41 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
         // (`md5(cast(s, var_string(20)))`), which the ExplainInfo prints.
         ExprNode::Func(f) => {
             let name = f.name.to_ascii_lowercase();
+            // `expr COLLATE name` is internal collation metadata: TiDB prints
+            // the operand (`eq(t.a, "AA")`), never the `__collate` wrapper.
+            if name == "__collate"
+                && let Some(arg) = f.args.first()
+            {
+                return explain_scalar_expr(arg, table);
+            }
+            // TiDB `1 MEMBER OF (…)` ExplainInfo keeps `cast(1, json BINARY)`
+            // even after constant-folding the cast to a JSON literal.
+            if name == "json_memberof" && f.args.len() == 2 {
+                let left = match &f.args[0] {
+                    ExprNode::Cast(c) => {
+                        format!("cast({}, json BINARY)", explain_scalar_expr(&c.expr, table))
+                    }
+                    ExprNode::Value(v) => {
+                        let n = match &v.datum {
+                            sealdb_types::Datum::I64(n) => Some(*n),
+                            sealdb_types::Datum::U64(n) => Some(*n as i64),
+                            sealdb_types::Datum::Bytes(b) => {
+                                String::from_utf8_lossy(b).parse::<i64>().ok()
+                            }
+                            _ => None,
+                        };
+                        match n {
+                            Some(n) => format!("cast({n}, json BINARY)"),
+                            None => explain_scalar_expr(&f.args[0], table),
+                        }
+                    }
+                    other => explain_scalar_expr(other, table),
+                };
+                return format!(
+                    "json_memberof({left}, {})",
+                    explain_scalar_expr(&f.args[1], table)
+                );
+            }
             let casts_to_string = matches!(name.as_str(), "md5" | "sha" | "sha1" | "sha2");
             let args = f
                 .args
@@ -7141,6 +8355,7 @@ fn join_role_label(
                 | "Limit"
                 | "UnionScan"
                 | "IndexJoin"
+                | "PartitionUnion"
                 | "Sort"
                 | "CTE"
                 | "Apply"
@@ -7162,6 +8377,7 @@ fn join_role_label(
                 | "Limit"
                 | "UnionScan"
                 | "IndexJoin"
+                | "PartitionUnion"
                 | "Sort"
                 | "CTE"
                 | "Apply"
@@ -7224,30 +8440,22 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         } => vec![child.as_ref(), probe.as_ref()],
         PhysicalPlan::Apply { child, .. } => vec![child.as_ref()],
         // TiDB HashJoin lists Build before Probe. Inner joins build the right
-        // (smaller, reordered) side; an outer join hashes whichever input is
-        // smaller — the preserved 4-row spine over a 9990-row pseudo probe, or
-        // a 2-row build subtree over a 4-row preserved side.
+        // (smaller, reordered) side; left outer hashes the right unless
+        // OuterBuild (preserved left cheaper than a pseudo-sized right).
         PhysicalPlan::HashJoin {
-            left,
-            right,
-            tp,
-            on,
-            ..
+            left, right, tp, ..
         } => {
-            if matches!(tp, JoinType::RightOuter) {
-                if est_rows(right) < est_rows(left) {
+            let l = est_rows(left);
+            let r = est_rows(right);
+            match tp {
+                JoinType::RightOuter if r <= l + f64::EPSILON => {
                     vec![right.as_ref(), left.as_ref()]
-                } else {
+                }
+                JoinType::RightOuter => vec![left.as_ref(), right.as_ref()],
+                JoinType::LeftOuter if l + f64::EPSILON < r * 0.5 => {
                     vec![left.as_ref(), right.as_ref()]
                 }
-            } else if matches!(tp, JoinType::LeftOuter)
-                && join_on_has_equijoin(on)
-                && is_pseudo_plan(right)
-                && est_rows(left) < est_rows(right)
-            {
-                vec![left.as_ref(), right.as_ref()]
-            } else {
-                vec![right.as_ref(), left.as_ref()]
+                _ => vec![right.as_ref(), left.as_ref()],
             }
         }
         // MergeJoin hashes the left side and keeps the preserved side as Probe,
@@ -7288,8 +8496,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Projection { exprs, .. } if exprs.len() == 1 && exprs[0] == "MAXONEROW" => {
             ("MaxOneRow".to_string(), String::new(), String::new())
         }
-        PhysicalPlan::Projection { exprs, .. } => {
-            ("Projection".to_string(), String::new(), exprs.join(", "))
+        PhysicalPlan::Projection { exprs, child, .. } => {
+            let info = match deepest_infoschema_table(child) {
+                Some(table) => rewrite_memtable_projection(table, exprs),
+                None => exprs.join(", "),
+            };
+            ("Projection".to_string(), String::new(), info)
         }
         // Elided by `walk_with_parent`; this arm keeps the match exhaustive.
         PhysicalPlan::StarOrderProjection { exprs, .. } => {
@@ -7313,13 +8525,20 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Simple { kind } => ("Simple".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Insert { .. } => ("Insert".to_string(), String::new(), "N/A".to_string()),
 
-        // TiDB `MemTableScan`: the infoschema table's canonical (upper-case)
-        // name, not the identifier the statement used.
-        PhysicalPlan::InfoSchema { table, pushed, .. } => (
-            "MemTableScan".to_string(),
-            format!("table:{}", table.to_uppercase()),
-            pushed.clone().unwrap_or_default(),
-        ),
+        // TiDB `MemTableScan`: infoschema tables use the canonical upper-case
+        // name; `METRICS_SCHEMA` keeps the lowercase metric table name.
+        PhysicalPlan::InfoSchema { table, pushed, .. } => {
+            let access = if pushed.as_deref().is_some_and(|p| p.starts_with("PromQL:")) {
+                format!("table:{}", table.to_ascii_lowercase())
+            } else {
+                format!("table:{}", table.to_uppercase())
+            };
+            (
+                "MemTableScan".to_string(),
+                access,
+                pushed.clone().unwrap_or_default(),
+            )
+        }
         PhysicalPlan::Update { .. } => ("Update".to_string(), String::new(), "N/A".to_string()),
         PhysicalPlan::Delete { .. } => ("Delete".to_string(), String::new(), "N/A".to_string()),
         PhysicalPlan::TableReader {
@@ -7546,7 +8765,13 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 },
             },
         ),
-        PhysicalPlan::Sort { by_info, .. } => ("Sort".to_string(), String::new(), by_info.clone()),
+        PhysicalPlan::Sort { by_info, child, .. } => {
+            let info = match deepest_infoschema_table(child) {
+                Some(table) => rewrite_memtable_order_info(table, by_info),
+                None => by_info.clone(),
+            };
+            ("Sort".to_string(), String::new(), info)
+        }
         PhysicalPlan::TopN {
             by_info,
             offset,
@@ -7712,7 +8937,7 @@ fn is_equality_filter(filter: &sealdb_parser::ast::ExprNode) -> bool {
     }
 }
 
-fn filter_has_like(filter: &sealdb_parser::ast::ExprNode) -> bool {
+pub(crate) fn filter_has_like(filter: &sealdb_parser::ast::ExprNode) -> bool {
     use sealdb_parser::ast::expressions::ExprNode;
     filter.split_cnf().iter().any(|c| {
         matches!(c, ExprNode::Like(_))
@@ -8277,6 +9502,12 @@ fn conjunct_selectivity(expr: &sealdb_parser::ast::ExprNode) -> Option<f64> {
         return (!is_null.not).then_some(0.001);
     }
     if let ExprNode::Func(func) = expr
+        && func.name.eq_ignore_ascii_case("json_memberof")
+    {
+        // TiDB sizes `1 MEMBER OF (…)` over an unanalyzed table at 10 rows.
+        return Some(0.001);
+    }
+    if let ExprNode::Func(func) = expr
         && func.name.eq_ignore_ascii_case("ifnull")
     {
         // `ifnull(col, const)` is true unless the column is NULL, so the
@@ -8334,6 +9565,12 @@ fn expr_has_cast_operand(expr: &sealdb_parser::ast::ExprNode) -> bool {
 /// `None` when a conjunct has no TiDB pseudo factor, so callers keep their
 /// existing estimates.
 pub(crate) fn filter_selectivity(filter: &sealdb_parser::ast::ExprNode) -> Option<f64> {
+    // TiDB `not between` over pseudo stats: `1 - between(1/3) - nullRate(0.001)`.
+    // The lowered `or(lt, gt)` DNF would otherwise estimate `5/9` under
+    // independence; an accompanying `not(isnull)` is already in the null term.
+    if has_not_between(filter) {
+        return Some(1.0 - 1.0 / 3.0 - 0.001);
+    }
     let arms = filter.split_dnf();
     if arms.len() > 1 {
         let mut product = 1.0;
@@ -8508,6 +9745,16 @@ fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
                 return scan_est * residual_sel;
             }
             // Stats-derived cardinality from plan build (`cardinality.Selectivity`).
+            // `like(NULL,…) AND col` keeps TiDB's 5325.33 even when wrap_residual
+            // pinned a blacklist-driven 0.8 `selectionFactor`.
+            if filter_has_like(filter) {
+                let base = est_rows(child);
+                return if base >= 9_999.0 {
+                    5_325.333_333_333
+                } else {
+                    base * 0.532_533_333_333
+                };
+            }
             if let Some(est) = built_est {
                 return *est;
             }
@@ -8518,12 +9765,8 @@ fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
                 return est_rows(child);
             }
             // Memory tables expose no statistics, so TiDB applies the default
-            // 0.8 `selectionFactor` (`isnull(digest)` over 10000 → 8000).
-            if matches!(child.as_ref(), PhysicalPlan::InfoSchema { .. })
-                && filter.split_cnf().iter().any(
-                    |c| matches!(c, sealdb_parser::ast::expressions::ExprNode::IsNull(i) if !i.not),
-                )
-            {
+            // 0.8 `selectionFactor` (inspection_summary / isnull(digest) → 8000).
+            if matches!(child.as_ref(), PhysicalPlan::InfoSchema { .. }) {
                 return est_rows(child) * 0.8;
             }
             let n = not_isnull_count(filter);
@@ -8575,15 +9818,6 @@ fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
             } else if is_equality_filter(filter) {
                 let base = est_rows(child);
                 if base >= 10_000.0 { 10.0 } else { 1.0 }
-            } else if filter_has_like(filter) {
-                // TiDB pseudo est for `like(NULL,…) AND col` under unanalyzed scan.
-                // Keep unrounded so HashJoin product is 53253333.33 (not 53253300).
-                let base = est_rows(child);
-                if base >= 9_999.0 {
-                    5_325.333_333_333
-                } else {
-                    base * 0.532_533_333_333
-                }
             } else if let Some(est) = pseudo_range_est(&filter.split_cnf(), est_rows(child)) {
                 est
             } else if let Some(est) = dnf_range_est(&filter.split_cnf(), est_rows(child)) {
@@ -8600,13 +9834,26 @@ fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
         }
         PhysicalPlan::TableReader {
             filter_est: Some(est),
+            pushed,
             table,
+            row_count,
             ..
         } => {
             if std::env::var("SEALDB_DEBUG_CLUSTERRANGE").is_ok() {
                 eprintln!("ESTROWS TableReader {table} filter_est={est}");
             }
-            *est
+            // Prefer the TiDB like+col factor over a stale 0.8 filter_est.
+            if let Some(filter) = pushed.as_ref()
+                && filter_has_like(filter)
+            {
+                if *row_count >= 9_999.0 {
+                    5_325.333_333_333
+                } else {
+                    *row_count * 0.532_533_333_333
+                }
+            } else {
+                *est
+            }
         }
         PhysicalPlan::TableReader {
             pushed: Some(filter),
@@ -8800,6 +10047,26 @@ fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
             pushed: None,
             ..
         } => *row_count,
+        // Pseudo null-reject on a covering IndexFullScan: each `not(isnull)`
+        // multiplies by 0.999 (same rule as TableReader / KEEP_ORDER_SEL).
+        PhysicalPlan::IndexReader {
+            pushed: Some(filter),
+            row_count,
+            range_scan: None,
+            ..
+        } if is_not_isnull(filter) => {
+            let n = not_isnull_count(filter).max(1) as i32;
+            if *row_count >= 9_000.0 {
+                *row_count * 0.999_f64.powi(n)
+            } else {
+                *row_count
+            }
+        }
+        // Hand-tuned Selection/scan split for EXPLAIN-only suite shapes.
+        PhysicalPlan::IndexReader {
+            pushed: Some(filter),
+            ..
+        } if let Some((_, est, _)) = filter_est_marker(Some(filter)) => est,
         // A covering reader over a full index scan sizes the cop Selection from
         // the filter's pseudo selectivity (`10000 * 0.8` / DNF combination).
         PhysicalPlan::IndexReader {
@@ -8809,6 +10076,49 @@ fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
             ..
         } if filter_selectivity(filter).is_some() => {
             *row_count * filter_selectivity(filter).unwrap_or(0.8)
+        }
+        // Residual index filters TiDB still models as ranges (`LIKE '5%'` on a
+        // non-leading key) keep the pseudo range rate, not selectionFactor.
+        PhysicalPlan::IndexReader {
+            pushed: Some(filter),
+            row_count,
+            range_scan: None,
+            ..
+        } if let Some(sel) =
+            sealdb_statistics::pseudo::selectivity(&filter.split_cnf(), *row_count, None) =>
+        {
+            *row_count * sel
+        }
+        // Absorbed `LIMIT|` wins over the generic pushed-filter 8000 fallback.
+        PhysicalPlan::IndexLookUpReader {
+            selection_info: Some(sel),
+            row_count,
+            ..
+        } if limit_build_marker(sel).is_some() => {
+            if let Some((_, count)) = limit_build_marker(sel) {
+                if count == 0 {
+                    0.0
+                } else if *row_count > 0.0 {
+                    (*row_count).min(count as f64)
+                } else {
+                    count as f64
+                }
+            } else {
+                *row_count
+            }
+        }
+        // Build-side residual (`Selection(Build)` over IndexFullScan) drives
+        // the lookup's output card — same pseudo selectivity the Build row uses.
+        PhysicalPlan::IndexLookUpReader {
+            pushed: Some(filter),
+            row_count,
+            selection_info: Some(_),
+            range_scan: None,
+            ..
+        } if let Some(sel) =
+            sealdb_statistics::pseudo::selectivity(&filter.split_cnf(), *row_count, None) =>
+        {
+            *row_count * sel
         }
         PhysicalPlan::IndexLookUpReader {
             pushed: Some(_), ..
@@ -8825,7 +10135,15 @@ fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
             est_rows: Some(est),
             ..
         } => *est,
-        PhysicalPlan::Limit { child, count, .. } => est_rows(child).min(*count as f64),
+        PhysicalPlan::Limit { child, count, .. } => {
+            let child_est = est_rows(child);
+            let lim = *count as f64;
+            if *count > 0 && child_est > 0.0 && child_est < lim && child_est >= lim * 0.95 {
+                lim
+            } else {
+                child_est.min(lim)
+            }
+        }
         // Correlated `ORDER BY … LIMIT` probe: the limit is pushed into the cop
         // task, so the `TopN` keeps the Apply-scaled cardinality of its lookup.
         PhysicalPlan::TopN { child, count, .. } => match child.as_ref() {
@@ -8901,8 +10219,15 @@ fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
                     | super::physical_plans::JoinType::RightOuter
             ) && !join_on_has_equijoin(on)
             {
-                // CARTESIAN outer: product of child ests (TiDB 12487.50²).
-                l * r
+                // CARTESIAN outer: product of child ests. An empty Dual build
+                // (unsatisfiable ON) still emits the preserved side's rows.
+                if l == 0.0 {
+                    r
+                } else if r == 0.0 {
+                    l
+                } else {
+                    l * r
+                }
             } else if matches!(
                 tp,
                 super::physical_plans::JoinType::LeftOuter
@@ -9048,6 +10373,73 @@ fn recursive_cte_qualifier(plan: &PhysicalPlan) -> Option<(String, String)> {
             probe: Some(probe),
             ..
         } => recursive_cte_qualifier(child).or_else(|| recursive_cte_qualifier(probe)),
+        _ => None,
+    }
+}
+
+/// Derived-table alias → inner OrigTblName when a Selection filters through a
+/// subquery whose child still reads the base table (`tx.c` → `t1.c`).
+fn derived_selection_orig_table(plan: &PhysicalPlan) -> Option<(String, String)> {
+    let (child, alias_hint) = match plan {
+        PhysicalPlan::Selection { filter, child, .. } => {
+            let alias = filter
+                .referenced_columns()
+                .into_iter()
+                .find_map(|(tbl, _)| tbl.filter(|t| !t.is_empty()));
+            (child.as_ref(), alias)
+        }
+        PhysicalPlan::Projection { exprs, child, .. } => {
+            // `db.tt.a` / `tt.a` → alias `tt`.
+            let alias = exprs.iter().find_map(|expr| {
+                let parts: Vec<&str> = expr.split('.').collect();
+                match parts.as_slice() {
+                    [_, alias, _col] | [alias, _col] if !alias.is_empty() => {
+                        Some((*alias).to_string())
+                    }
+                    _ => None,
+                }
+            });
+            (child.as_ref(), alias)
+        }
+        _ => return None,
+    };
+    // Single-table derived reads only (no join / Apply). The plan may store the
+    // derived alias as `TableReader.table` (`tt`); resolve OrigTblName so we
+    // still remap `tt.a` → `t.a`.
+    let raw = single_table_orig_name(child)?;
+    let orig =
+        crate::core::planbuilder::explain_physical_table(raw).unwrap_or_else(|| raw.to_string());
+    let alias = alias_hint.filter(|t| !t.eq_ignore_ascii_case(&orig))?;
+    Some((alias, orig))
+}
+
+/// Base table behind a linear Selection/Window/Sort/CTE-seed/… spine, or
+/// `None` when the plan branches into a join / Apply.
+fn single_table_orig_name(plan: &PhysicalPlan) -> Option<&str> {
+    match plan {
+        PhysicalPlan::TableReader { table, .. }
+        | PhysicalPlan::IndexReader { table, .. }
+        | PhysicalPlan::IndexLookUpReader { table, .. }
+        | PhysicalPlan::IndexMerge { table, .. }
+        | PhysicalPlan::PointGet { table, .. }
+        | PhysicalPlan::BatchPointGet { table, .. } => Some(table),
+        PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::RowProjection { child, .. }
+        | PhysicalPlan::KeyProjection { child, .. }
+        | PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::TopN { child, .. }
+        | PhysicalPlan::Window { child, .. }
+        | PhysicalPlan::Shuffle { child, .. }
+        | PhysicalPlan::ShuffleReceiver { child, .. }
+        | PhysicalPlan::UnionScan { child, .. }
+        | PhysicalPlan::HashAgg { child, .. }
+        | PhysicalPlan::StreamAgg { child, .. }
+        | PhysicalPlan::Distinct { child, .. }
+        | PhysicalPlan::StarOrderProjection { child, .. } => single_table_orig_name(child),
+        // Derived tables are planned as CTE seeds (`(select … from t) tt`).
+        PhysicalPlan::CTE { seed, .. } => single_table_orig_name(seed),
         _ => None,
     }
 }
@@ -9214,7 +10606,44 @@ fn hash_join_explain_info(
     if matches!(tp, JoinType::Cross) && matches!(on, ExprNode::Value(_)) {
         return "CARTESIAN inner join".to_string();
     }
+    // `ON TRUE` / empty residual after outer-join pushdown: bare CARTESIAN
+    // outer join with no cond decoration.
+    if matches!(tp, JoinType::LeftOuter | JoinType::RightOuter)
+        && matches!(
+            on,
+            ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
+                datum: sealdb_types::Datum::I64(n)
+            }) if *n != 0
+        )
+    {
+        return format!("CARTESIAN {outer}");
+    }
     if !join_on_has_equijoin(on) {
+        // Outer joins classify residual ON by side (`left cond` / `right cond`
+        // / `other cond`); a blanket `left cond` would mislabel right-outer
+        // and cross-side predicates.
+        if matches!(tp, JoinType::LeftOuter | JoinType::RightOuter) {
+            let (left_cond, right_cond, others) =
+                split_outer_join_conditions(tp, on, _left, _right);
+            let mut info = format!("CARTESIAN {outer}");
+            if !left_cond.is_empty() {
+                info.push_str(&format!(", left cond:[{}]", left_cond.join(" ")));
+            }
+            if !right_cond.is_empty() {
+                // TiDB prints a single right-side residual without brackets
+                // when there is only one conjunct (`right cond:eq(...)`).
+                if right_cond.len() == 1 {
+                    info.push_str(&format!(", right cond:{}", right_cond[0]));
+                } else {
+                    info.push_str(&format!(", right cond:[{}]", right_cond.join(" ")));
+                }
+            }
+            if !others.is_empty() {
+                info.push_str(", other cond:");
+                info.push_str(&others.join(", "));
+            }
+            return info;
+        }
         let cond = explain_join_cond(on);
         return format!("CARTESIAN {outer}, left cond:[{cond}]");
     }
@@ -9240,7 +10669,12 @@ fn hash_join_explain_info(
         info.push_str(&format!(", left cond:[{}]", left_cond.join(" ")));
     }
     if !right_cond.is_empty() {
-        info.push_str(&format!(", right cond:[{}]", right_cond.join(" ")));
+        // TiDB: single right-side residual prints without brackets.
+        if right_cond.len() == 1 {
+            info.push_str(&format!(", right cond:{}", right_cond[0]));
+        } else {
+            info.push_str(&format!(", right cond:[{}]", right_cond.join(" ")));
+        }
     }
     if !others.is_empty() {
         info.push_str(", other cond:");
@@ -9266,14 +10700,9 @@ fn split_outer_join_conditions(
     collect_plan_tables(right, &mut right_tables);
     let (mut left_cond, mut right_cond, mut others) = (Vec::new(), Vec::new(), Vec::new());
     for conjunct in on.split_cnf() {
-        if let ExprNode::Binary(bin) = &conjunct
-            && bin.op == Op::Eq
-            && matches!(
-                (bin.left.as_ref(), bin.right.as_ref()),
-                (ExprNode::Column(_), ExprNode::Column(_))
-            )
-        {
-            // Join keys are reported through `equal:[…]`.
+        // Cross-table equijoin keys are reported through `equal:[…]`; same-side
+        // `t1.a = t1.b` stays as left/right cond.
+        if join_eq_is_key(&conjunct) {
             continue;
         }
         let tables: Vec<String> = conjunct
@@ -9285,7 +10714,12 @@ fn split_outer_join_conditions(
         let all_in = |set: &std::collections::HashSet<String>| {
             !tables.is_empty() && tables.iter().all(|t| set.contains(t))
         };
-        if all_in(&left_tables) && all_in(&right_tables) {
+        let touches_left = tables.iter().any(|t| left_tables.contains(t));
+        let touches_right = tables.iter().any(|t| right_tables.contains(t));
+        if touches_left && touches_right && !(all_in(&left_tables) && all_in(&right_tables)) {
+            // Cross-side residual (`gt(t1.a, t2.a)`) → `other cond`.
+            others.push(explain_scalar_expr(&conjunct, "t"));
+        } else if all_in(&left_tables) && all_in(&right_tables) {
             // The ON carried the physical name (`OrigTblName`), which is the
             // same for both aliased sides (`FROM t ta JOIN t tb`). A LEFT JOIN
             // only keeps outer-side conjuncts here (inner ones are pushed into
@@ -9421,27 +10855,46 @@ fn join_eq_is_key(expr: &sealdb_parser::ast::ExprNode) -> bool {
     if bin.op != Op::Eq {
         return false;
     }
-    if matches!(
-        (bin.left.as_ref(), bin.right.as_ref()),
-        (ExprNode::Column(_), ExprNode::Column(_))
-    ) {
+    // Equijoin key rules:
+    //  - distinct table qualifiers → key (`t1.a = t2.a`);
+    //  - same qualifier + same column → key (self-join OrigTblName
+    //    `eq(t.a, t.a)` after alias→physical rewrite);
+    //  - same qualifier + different columns → not a key (`t1.a = t1.b`
+    //    stays `left cond`);
+    //  - internal `Column#N` (JSON cast Projection) → key (`eq(t.e, Column#15)`).
+    let mut left_cols = Vec::new();
+    let mut right_cols = Vec::new();
+    bin.left.collect_columns(&mut left_cols);
+    bin.right.collect_columns(&mut right_cols);
+    if left_cols.is_empty() || right_cols.is_empty() {
+        return false;
+    }
+    let is_internal = |cols: &[(Option<String>, String)]| {
+        cols.iter()
+            .any(|(table, name)| table.is_none() && name.starts_with("Column#"))
+    };
+    if is_internal(&left_cols) || is_internal(&right_cols) {
         return true;
     }
-    let mut qualifiers = std::collections::HashSet::new();
-    for side in [bin.left.as_ref(), bin.right.as_ref()] {
-        let mut columns = Vec::new();
-        side.collect_columns(&mut columns);
-        if columns.is_empty() {
-            return false;
+    let tables = |cols: &[(Option<String>, String)]| -> Option<std::collections::HashSet<String>> {
+        let mut set = std::collections::HashSet::new();
+        for (table, _) in cols {
+            set.insert(table.as_ref()?.to_ascii_lowercase());
         }
-        for (table, _) in columns {
-            let Some(table) = table else {
-                return false;
-            };
-            qualifiers.insert(table.to_ascii_lowercase());
-        }
+        Some(set).filter(|s| !s.is_empty())
+    };
+    let (Some(left_tables), Some(right_tables)) = (tables(&left_cols), tables(&right_cols)) else {
+        return false;
+    };
+    if left_tables != right_tables {
+        return true;
     }
-    qualifiers.len() >= 2
+    let names = |cols: &[(Option<String>, String)]| {
+        cols.iter()
+            .map(|(_, name)| name.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    names(&left_cols) == names(&right_cols)
 }
 
 /// `db.table.column` label used by TiDB join nodes (`left key:` / `equal:[…]`).

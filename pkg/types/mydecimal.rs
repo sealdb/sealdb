@@ -496,7 +496,10 @@ fn umul(a: &str, b: &str) -> String {
             out[pos - 1] += cur / 10;
         }
     }
-    let text: String = out.iter().map(|d| (d + u32::from(b'0')) as u8 as char).collect();
+    let text: String = out
+        .iter()
+        .map(|d| (d + u32::from(b'0')) as u8 as char)
+        .collect();
     strip_leading_zeros(&text)
 }
 
@@ -551,7 +554,10 @@ mod arith_tests {
 
     #[test]
     fn exact_div_uses_frac_increment() {
-        assert_eq!(d("1").checked_div(&d("3"), 4).unwrap().to_string(), "0.3333");
+        assert_eq!(
+            d("1").checked_div(&d("3"), 4).unwrap().to_string(),
+            "0.3333"
+        );
         let one = format!("1.{}", "0".repeat(30));
         let three = format!("3.{}", "0".repeat(30));
         assert_eq!(

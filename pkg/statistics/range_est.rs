@@ -614,7 +614,7 @@ impl ColumnStats {
 
     fn eq_from_topn(&self, value: &Datum) -> Option<f64> {
         let topn = self.topn.as_ref()?;
-        let key = crate::table::datum_key(value);
+        let key = self.value_key(value);
         topn.lookup(&key).map(|c| c as f64)
     }
 }

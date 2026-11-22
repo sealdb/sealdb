@@ -4,7 +4,7 @@ use sealdb_errno::{Error, Result};
 use sealdb_executor::{DDLExec, ExecutorBuilder, QueryResult};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::IsolationLevel;
-use sealdb_meta::{ClusteredIndexMode, with_clustered_index_mode};
+use sealdb_meta::{ClusteredIndexMode, with_clustered_index_mode, with_enable_check_constraint};
 use sealdb_parser::Parser;
 use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode};
@@ -94,6 +94,14 @@ impl Drop for TempTablesGuard {
     }
 }
 
+/// Text-protocol prepared statement (TiDB `PreparedStatement`).
+#[derive(Clone)]
+struct PreparedStmt {
+    sql: String,
+    /// Default database when the statement was prepared.
+    db: String,
+}
+
 pub struct Session {
     parser: Parser,
     planner: PlanBuilder,
@@ -107,7 +115,9 @@ pub struct Session {
     schema_snap: Mutex<Option<SchemaSnap>>,
     isolation: Mutex<IsolationLevel>,
     read_only: Mutex<bool>,
-    prepared: Mutex<HashMap<String, String>>,
+    /// Prepared statement text + the default database at PREPARE time (TiDB
+    /// resolves unqualified names against that schema on every EXECUTE).
+    prepared: Mutex<HashMap<String, PreparedStmt>>,
     cache_plans: Mutex<bool>,
     /// When set, Domain plan-cache lookup/insert uses this key instead of
     /// restored bound SQL (prepared `?` template).
@@ -130,6 +140,9 @@ pub struct Session {
     /// TiDB `tidb_enable_clustered_index` (default ON). Read by CREATE TABLE to
     /// pick the row handle for an unannotated PRIMARY KEY.
     clustered_index: Mutex<ClusteredIndexMode>,
+    /// TiDB `tidb_enable_check_constraint` (default ON): EXCHANGE PARTITION
+    /// validates ENFORCED CHECK expressions when enabled.
+    enable_check_constraint: Mutex<bool>,
     /// TiDB `foreign_key_checks` (default ON). Gates the `Foreign_Key_Check` /
     /// `Foreign_Key_Cascade` plan nodes under DML.
     foreign_key_checks: Mutex<bool>,
@@ -189,9 +202,15 @@ pub struct Session {
     /// TiDB `last_plan_from_binding`: whether the last statement's plan came
     /// from a `CREATE BINDING` rewrite.
     last_plan_from_binding: Mutex<bool>,
+    /// TiDB `last_sql_use_alloc` (`preUseChunkAlloc`): whether the previous
+    /// statement used the chunk allocator. Blob/text ("overlong") queries
+    /// report 0 under the default memory limit; other statements report 1.
+    last_sql_use_alloc: Mutex<bool>,
     /// Bind SQL used by the current `EXPLAIN`, reported as
     /// `Note 1105 Using the bindSQL: …` once the statement finishes.
     binding_note: Mutex<Option<String>>,
+    /// Last applied binding's `USING` text carried `/*+ IGNORE_PLAN_CACHE() */`.
+    binding_ignore_plan_cache: Mutex<bool>,
     /// Raw text of the single statement being executed (empty for multi-
     /// statement input). Binding matching keys on the text the client sent
     /// (TiDB `parser.Normalize`), not on the restored plan AST.
@@ -252,6 +271,7 @@ impl Session {
                     .unwrap_or(PartitionPruneMode::Dynamic),
             ),
             clustered_index: Mutex::new(ClusteredIndexMode::On),
+            enable_check_constraint: Mutex::new(true),
             foreign_key_checks: Mutex::new(true),
             active_roles: Mutex::new(Vec::new()),
             enable_auto_analyze: Mutex::new(globals.enable_auto_analyze),
@@ -276,7 +296,9 @@ impl Session {
             plan_cache_stmts: Mutex::new(HashSet::new()),
             last_warnings: Mutex::new(Vec::new()),
             last_plan_from_binding: Mutex::new(false),
+            last_sql_use_alloc: Mutex::new(false),
             binding_note: Mutex::new(None),
+            binding_ignore_plan_cache: Mutex::new(false),
             current_stmt_sql: Mutex::new(String::new()),
             sysvar_overrides: Mutex::new(HashMap::new()),
             stmt_sysvar_overrides: Mutex::new(HashMap::new()),
@@ -369,6 +391,8 @@ impl Session {
             return Ok(vec![result]);
         }
         let mode = self.sql_mode.lock().expect("session sql_mode lock").clone();
+        // `SHOW CREATE TABLE` quotes identifiers with `"` under `ANSI_QUOTES`.
+        sealdb_parser::set_ansi_quotes(sql_mode_has(&mode, "ANSI_QUOTES"));
         reject_create_table_func_call(sql, &mode)?;
         // `group_concat_max_len` lives in an executor thread-local; publish the
         // session value at the start of every statement so a following
@@ -646,6 +670,12 @@ impl Session {
     ) -> Result<QueryResult> {
         if create.select.is_some() {
             return Err(Error::unsupported("CREATE TEMPORARY TABLE ... AS SELECT"));
+        }
+        if create.partition.is_some() {
+            return Err(Error::new(
+                1562,
+                "Cannot create temporary table with partitions",
+            ));
         }
         if create.affinity.is_some() {
             return Err(Error::new(
@@ -1345,29 +1375,65 @@ impl Session {
                     *self.isolation.lock().expect("session isolation lock") =
                         map_isolation(isolation);
                 }
+                // `SET TRANSACTION … AS OF TIMESTAMP …`: the next statement's
+                // autocommit txn is a stale read (TiDB StmtCtx / TxnCtx).
+                // AS OF + READ ONLY is a real stale-read setup (not the READ
+                // ONLY noop), so skip the noop gate when AS OF is present.
+                let sql = self
+                    .current_stmt_sql
+                    .lock()
+                    .expect("session current stmt sql lock")
+                    .clone();
+                let has_as_of = sql.to_ascii_lowercase().contains("as of");
                 if let Some(read_only) = set.read_only {
-                    // `SET TRANSACTION READ ONLY` is a TiDB noop: it does not
-                    // change the session default.
-                    if read_only && let Some(warning) = check_noop_feature(self, "READ ONLY")? {
-                        let mut result = empty_result();
-                        result.warnings.push(warning);
-                        *self
-                            .last_warnings
-                            .lock()
-                            .expect("session last_warnings lock") = result.warnings.clone();
-                        return Ok(result);
+                    if read_only && !has_as_of {
+                        // `SET TRANSACTION READ ONLY` is a TiDB noop: it does not
+                        // change the session default.
+                        if let Some(warning) = check_noop_feature(self, "READ ONLY")? {
+                            let mut result = empty_result();
+                            result.warnings.push(warning);
+                            *self
+                                .last_warnings
+                                .lock()
+                                .expect("session last_warnings lock") = result.warnings.clone();
+                            return Ok(result);
+                        }
                     }
                     if !read_only {
                         *self.read_only.lock().expect("session read_only lock") = false;
                     }
                 }
+                if has_as_of {
+                    self.sysvar_overrides
+                        .lock()
+                        .expect("session sysvar overrides lock")
+                        .insert("__sealdb_stale_txn".to_string(), "1".to_string());
+                }
                 return Ok(empty_result());
             }
             Statement::Prepare(prepare) => {
-                self.prepared
+                let db = self
+                    .current_db
                     .lock()
-                    .expect("session prepared lock")
-                    .insert(prepare.name.to_ascii_lowercase(), prepare.sql.clone());
+                    .expect("session current_db lock")
+                    .clone();
+                self.prepared.lock().expect("session prepared lock").insert(
+                    prepare.name.to_ascii_lowercase(),
+                    PreparedStmt {
+                        sql: prepare.sql.clone(),
+                        db: db.clone(),
+                    },
+                );
+                // TiDB probes plan-cache eligibility at PREPARE; a recursive CTE
+                // name is looked up as a base table and fails, so the prepared
+                // plan is not cached and `SHOW WARNINGS` reports the skip.
+                // Prepared templates keep `?` markers that the parser rejects as
+                // literals; probe from the SQL text (TiDB still resolves CTEs).
+                let warnings = prepared_plan_cache_skip_warnings_sql(&prepare.sql, &db);
+                *self
+                    .last_warnings
+                    .lock()
+                    .expect("session last_warnings lock") = warnings;
                 return Ok(empty_result());
             }
             Statement::Deallocate(dealloc) => {
@@ -1480,20 +1546,21 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::Execute(exec) => {
-                let sql = self
+                let prepared = self
                     .prepared
                     .lock()
                     .expect("session prepared lock")
                     .get(&exec.name.to_ascii_lowercase())
                     .cloned()
                     .ok_or_else(|| {
+                        // TiDB text-protocol EXECUTE uses 8111; COM_STMT keeps 1243.
                         sealdb_errno::Error::new(
-                            sealdb_errno::ERR_UNKNOWN_STMT_HANDLER,
-                            format!("Unknown prepared statement handler ({})", exec.name),
+                            sealdb_errno::ERR_PREPARED_STMT_NOT_FOUND,
+                            "Prepared statement not found".to_string(),
                         )
                     })?;
                 let using = resolve_exec_params(self, &exec.using)?;
-                let bound = bind_sql(&sql, &using)?;
+                let bound = bind_sql(&prepared.sql, &using)?;
                 let inner = self.parser.parse_one_stmt(&bound)?;
                 // MVB: still plan/execute the bound SQL, but cache under the
                 // unbound `?` template so different USING literals share one entry.
@@ -1503,13 +1570,48 @@ impl Session {
                 // unlike PointGet/index lookups those literals are not re-read
                 // from the current statement, so a cached plan would answer a
                 // later EXECUTE with the first USING values.
-                let cacheable = !sql.to_ascii_lowercase().contains("(select");
+                // Static partition prune mode also skips the prepared plan cache
+                // (TiDB: partition layout is baked into the plan).
+                let static_prune = matches!(
+                    *self
+                        .partition_prune_mode
+                        .lock()
+                        .expect("session partition prune mode lock"),
+                    PartitionPruneMode::Static
+                );
+                let cacheable = !prepared.sql.to_ascii_lowercase().contains("(select")
+                    && !static_prune
+                    && prepared_plan_cache_skip_warnings_sql(&prepared.sql, &prepared.db)
+                        .is_empty();
                 *self.cache_plans.lock().expect("session cache flag lock") = cacheable;
                 *self
                     .plan_cache_key
                     .lock()
-                    .expect("session plan cache key lock") = Some(normalize_prep_cache_key(&sql));
+                    .expect("session plan cache key lock") =
+                    Some(normalize_prep_cache_key(&prepared.sql));
+                // Resolve unqualified names against the PREPARE-time database.
+                let prev_db = self
+                    .current_db
+                    .lock()
+                    .expect("session current_db lock")
+                    .clone();
+                *self.current_db.lock().expect("session current_db lock") = prepared.db.clone();
+                // Bindings match the prepared template, not the EXECUTE text.
+                let prev_stmt_sql = self
+                    .current_stmt_sql
+                    .lock()
+                    .expect("session current stmt sql lock")
+                    .clone();
+                *self
+                    .current_stmt_sql
+                    .lock()
+                    .expect("session current stmt sql lock") = prepared.sql.clone();
                 let result = self.execute_one(&inner);
+                *self
+                    .current_stmt_sql
+                    .lock()
+                    .expect("session current stmt sql lock") = prev_stmt_sql;
+                *self.current_db.lock().expect("session current_db lock") = prev_db;
                 *self.cache_plans.lock().expect("session cache flag lock") = false;
                 *self
                     .plan_cache_key
@@ -1544,6 +1646,17 @@ impl Session {
                     Some(raw) => Some(as_of_raw_millis(self, raw)?),
                     None => external_ts_snapshot(self),
                 };
+                {
+                    let mut overrides = self
+                        .sysvar_overrides
+                        .lock()
+                        .expect("session sysvar overrides lock");
+                    if stale_at.is_some() && begin.as_of_ts.is_some() {
+                        overrides.insert("__sealdb_stale_txn".to_string(), "1".to_string());
+                    } else {
+                        overrides.remove("__sealdb_stale_txn");
+                    }
+                }
                 let mut txn = self.txn.lock().expect("session txn lock");
                 if begin.pessimistic {
                     txn.enter_begin_pessimistic(
@@ -1589,6 +1702,10 @@ impl Session {
                     txn.commit()?;
                 }
                 drop(txn);
+                self.sysvar_overrides
+                    .lock()
+                    .expect("session sysvar overrides lock")
+                    .remove("__sealdb_stale_txn");
                 self.wipe_temp_tables_on_commit()?;
                 self.domain.mdl_unlock_session(self.session_id);
                 return Ok(empty_result());
@@ -1609,6 +1726,11 @@ impl Session {
                 } else {
                     txn.rollback()?;
                 }
+                drop(txn);
+                self.sysvar_overrides
+                    .lock()
+                    .expect("session sysvar overrides lock")
+                    .remove("__sealdb_stale_txn");
                 self.domain.mdl_unlock_session(self.session_id);
                 return Ok(empty_result());
             }
@@ -1752,6 +1874,35 @@ impl Session {
                 });
             }
         }
+        // TiDB `ALTER TABLE ... EXCHANGE PARTITION ... WITH TABLE tmp` rejects a
+        // temporary table with 1733 before any catalog lookup.
+        if let Statement::AlterTable(alter) = stmt {
+            let with_tables: Vec<&sealdb_parser::ast::TableName> = alter
+                .specs
+                .iter()
+                .filter_map(|spec| match spec {
+                    sealdb_parser::ast::AlterTableSpec::ExchangePartition { table, .. } => {
+                        Some(table)
+                    }
+                    _ => None,
+                })
+                .collect();
+            for with_table in with_tables {
+                let (schema, table) = with_table.qualified(&current_db);
+                let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+                if self
+                    .temp_tables
+                    .lock()
+                    .expect("session temp tables lock")
+                    .contains_key(&key)
+                {
+                    return Err(Error::new(
+                        1733,
+                        format!("Table to exchange with partition is temporary: '{table}'"),
+                    ));
+                }
+            }
+        }
         // TiDB `DROP TABLE` drops a same-named session-local temporary table
         // (it shadows the permanent one); the remaining names keep the
         // persisted DDL path.
@@ -1837,6 +1988,9 @@ impl Session {
         if !temp_tables.is_empty() {
             rewrite_temp_table_refs(&mut expanded, &temp_tables, &current_db);
         }
+        // After temp-table rewrite so `tmp1` resolves under `__sealdb_temporary`
+        // and INDEX_LOOKUP_PUSHDOWN is rejected as unsupported.
+        let ilp_warnings = apply_index_lookup_pushdown_hints(self, &mut expanded, &is, &current_db);
         let priv_mgr = self.domain.privilege();
         let view_priv = ViewPrivCtx {
             mgr: priv_mgr.as_ref(),
@@ -1849,6 +2003,9 @@ impl Session {
             explain: matches!(stmt, Statement::Explain(_)),
         };
         expand_views(&mut expanded, &is, &current_db, &view_priv)?;
+        // Refuse unknown table qualifiers (`xxxxx.a`, or bare `t.a` when the
+        // FROM item is aliased as `tmp`) with TiDB's 1054 clause wording.
+        validate_statement_column_refs(&expanded)?;
         // `ENUM`/`SET` numeric constants become member labels before planning so
         // index point gets encode the stored label (`a = 1` → `a = 'a'`).
         sealdb_planner::normalize_enum_constants(&mut expanded, Some(&is), &current_db);
@@ -1928,7 +2085,24 @@ impl Session {
             .expect("session plan cache key lock")
             .clone()
             .unwrap_or_else(|| restore_sql(stmt));
-        let use_cache = *self.cache_plans.lock().expect("session cache flag lock");
+        // TiDB `/*+ IGNORE_PLAN_CACHE() */`: skip the prepared plan cache and
+        // keep `@@last_plan_from_cache = 0` for every EXECUTE. Binding rewrites
+        // carry the hint on the raw `USING` text (display restore drops
+        // `/*+ … */`), so inspect the rebound statement's source via the
+        // still-applied binding note's companion: `bind_sql` is parsed into
+        // `expanded` below — detect the hint on the original bind template
+        // stored alongside the note.
+        let ignore_from_binding = binding_used
+            && self
+                .binding_ignore_plan_cache
+                .lock()
+                .expect("session binding ignore plan cache lock")
+                .clone();
+        let ignore_plan_cache = stmt_has_ignore_plan_cache_hint(stmt)
+            || cache_key.to_ascii_uppercase().contains("IGNORE_PLAN_CACHE")
+            || ignore_from_binding;
+        let use_cache =
+            *self.cache_plans.lock().expect("session cache flag lock") && !ignore_plan_cache;
         let prune_mode = *self
             .partition_prune_mode
             .lock()
@@ -1994,6 +2168,15 @@ impl Session {
             .ordered_result_mode
             .lock()
             .expect("session ordered result mode lock");
+        let ilp_policy = match read_session_sysvar(self, "tidb_index_lookup_pushdown_policy")
+            .unwrap_or_else(|| "hint-only".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "force" => sealdb_planner::ILP_POLICY_FORCE,
+            "affinity-force" => sealdb_planner::ILP_POLICY_AFFINITY_FORCE,
+            _ => sealdb_planner::ILP_POLICY_HINT_ONLY,
+        };
         // Cost model version changes the chosen access path; keep it in the
         // Domain-shared plan-cache key so sessions cannot cross-read plans.
         let cache_key = if cost_model_version == 2 {
@@ -2013,24 +2196,26 @@ impl Session {
         };
         let plan = sealdb_planner::with_inl_join_inner_multi_pattern(
             inl_join_inner_multi_pattern,
-            || sealdb_planner::with_planner_blacklist(blacklist, || {
-            sealdb_expression::with_current_db(current_db.as_str(), || {
-                sealdb_planner::with_cost_model_version(cost_model_version, || {
-                    sealdb_planner::with_agg_push_down(opt_agg_push_down, || {
-                        sealdb_planner::with_insubq_to_join_and_agg(
-                            opt_insubq_to_join_and_agg,
-                            || {
-                                sealdb_planner::with_hashagg_concurrency(
-                                    hashagg_partial_concurrency,
-                                    hashagg_final_concurrency,
-                                    || {
-                                        sealdb_planner::with_foreign_key_checks(
-                                            foreign_key_checks,
-                                            || {
-                                                sealdb_planner::with_explicit_txn(
-                                                    explicit_txn,
-                                                    || {
-                                                        sealdb_planner::with_dirty_tables(
+            || {
+                sealdb_planner::with_planner_blacklist(blacklist, || {
+                    sealdb_expression::with_current_db(current_db.as_str(), || {
+                        sealdb_planner::with_cost_model_version(cost_model_version, || {
+                            sealdb_planner::with_index_lookup_pushdown_policy(ilp_policy, || {
+                                sealdb_planner::with_agg_push_down(opt_agg_push_down, || {
+                                    sealdb_planner::with_insubq_to_join_and_agg(
+                                        opt_insubq_to_join_and_agg,
+                                        || {
+                                            sealdb_planner::with_hashagg_concurrency(
+                                                hashagg_partial_concurrency,
+                                                hashagg_final_concurrency,
+                                                || {
+                                                    sealdb_planner::with_foreign_key_checks(
+                                                        foreign_key_checks,
+                                                        || {
+                                                            sealdb_planner::with_explicit_txn(
+                                                                explicit_txn,
+                                                                || {
+                                                                    sealdb_planner::with_dirty_tables(
                                                             dirty_tables,
                                                             || {
                                                                 sealdb_planner::with_stable_result_mode(
@@ -2068,6 +2253,11 @@ impl Session {
                                                         }
                                                         Ok(plan)
                                                     } else {
+                                                        if ignore_plan_cache {
+                                                            *self.last_plan_from_cache.lock().expect(
+                                                                "session last plan from cache lock",
+                                                            ) = false;
+                                                        }
                                                         self.planner.build_with_schema(
                                                             stmt,
                                                             Some(&is),
@@ -2080,18 +2270,21 @@ impl Session {
                                             )
                                                             },
                                                         )
-                                                    },
-                                                )
-                                            },
-                                        )
-                                    },
-                                )
-                            },
-                        )
+                                                                },
+                                                            )
+                                                        },
+                                                    )
+                                                },
+                                            )
+                                        },
+                                    )
+                                })
+                            })
+                        })
                     })
                 })
-            })
-        }))?;
+            },
+        )?;
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
         // MySQL statement atomicity: a failed statement inside an explicit
         // transaction only rolls back its own writes.
@@ -2165,28 +2358,34 @@ impl Session {
             .strict_not_null_check
             .lock()
             .expect("session strict not null lock");
+        let enable_check = *self
+            .enable_check_constraint
+            .lock()
+            .expect("session check constraint lock");
         let mut result = with_clustered_index_mode(clustered_index, || {
-            sealdb_expression::with_strict_dml(strict_dml, || {
-                sealdb_expression::with_div_by_zero_mode(div_mode, || {
-                    sealdb_expression::with_allow_auto_random_explicit_insert(
-                        allow_auto_random,
-                        || {
-                            sealdb_expression::with_allow_auto_increment_in_generated(
-                                allow_auto_inc_in_generated,
-                                || {
-                                    sealdb_expression::with_sql_mode(sql_mode, || {
-                                        sealdb_expression::with_time_zone(time_zone, || {
-                                            sealdb_expression::with_current_db(
-                                                current_db.as_str(),
-                                                || {
-                                                    sealdb_expression::with_collation(
-                                                        collate_mode,
-                                                        || {
-                                                            sealdb_expression::clear_warnings();
-                                                            // TiDB allocates a fresh memory tracker per query.
-                                                            sealdb_expression::reset_query_mem_usage();
-                                                            self.probe_plan_cache(stmt);
-                                                            sealdb_expression::with_strict_not_null_check(
+            with_enable_check_constraint(enable_check, || {
+                sealdb_expression::with_strict_dml(strict_dml, || {
+                    sealdb_expression::with_div_by_zero_mode(div_mode, || {
+                        sealdb_expression::with_allow_auto_random_explicit_insert(
+                            allow_auto_random,
+                            || {
+                                sealdb_expression::with_allow_auto_increment_in_generated(
+                                    allow_auto_inc_in_generated,
+                                    || {
+                                        sealdb_expression::with_sql_mode(sql_mode, || {
+                                            sealdb_expression::with_time_zone(time_zone, || {
+                                                sealdb_expression::with_current_db(
+                                                    current_db.as_str(),
+                                                    || {
+                                                        sealdb_expression::with_collation(
+                                                            collate_mode,
+                                                            || {
+                                                                sealdb_expression::clear_warnings();
+                                                                sealdb_expression::clear_binary_columns();
+                                                                // TiDB allocates a fresh memory tracker per query.
+                                                                sealdb_expression::reset_query_mem_usage();
+                                                                self.probe_plan_cache(stmt);
+                                                                sealdb_expression::with_strict_not_null_check(
                                                                 strict_not_null,
                                                                 || {
                                                                     sealdb_expression::with_allow_write_row_id(
@@ -2195,16 +2394,17 @@ impl Session {
                                                                     )
                                                                 },
                                                             )
-                                                        },
-                                                    )
-                                                },
-                                            )
+                                                            },
+                                                        )
+                                                    },
+                                                )
+                                            })
                                         })
-                                    })
-                                },
-                            )
-                        },
-                    )
+                                    },
+                                )
+                            },
+                        )
+                    })
                 })
             })
         });
@@ -2247,6 +2447,34 @@ impl Session {
                 warnings.extend(qr.warnings.iter().cloned());
                 qr.warnings = warnings;
             }
+            // INL_JOIN / INL_HASH_JOIN / TIDB_INLJ that cannot form an IndexJoin
+            // (no equijoin key, outer-side force, or no usable index) → 1815.
+            let inl_warns = match stmt {
+                Statement::Select(select) => {
+                    sealdb_planner::inl_join_inapplicable_warnings(select, Some(&is), &current_db)
+                }
+                Statement::Explain(explain) => match explain.stmt.as_ref() {
+                    Statement::Select(select) => sealdb_planner::inl_join_inapplicable_warnings(
+                        select,
+                        Some(&is),
+                        &current_db,
+                    ),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            if !inl_warns.is_empty() {
+                // Parse-time hint warnings already sit at the front; append
+                // these optimizer inapplicable notices after them.
+                qr.warnings.extend(inl_warns);
+            }
+            if !ilp_warnings.is_empty() {
+                qr.warnings.extend(ilp_warnings.iter().cloned());
+            }
+            let keep_order_ilp = sealdb_planner::take_index_lookup_pushdown_warnings();
+            if !keep_order_ilp.is_empty() {
+                qr.warnings.extend(keep_order_ilp);
+            }
             let binding_note = self
                 .binding_note
                 .lock()
@@ -2270,6 +2498,15 @@ impl Session {
                 .last_warnings
                 .lock()
                 .expect("session last_warnings lock") = qr.warnings.clone();
+            // TiDB `ExchangeChunkStatus`: overlong (blob/text) columns skip the
+            // chunk allocator under the default memory limit → report 0; other
+            // statements report 1. Bare `SELECT @@…` returns earlier and does
+            // not update this flag.
+            let use_alloc = !stmt_touches_overlong_type(stmt, &is, &current_db);
+            *self
+                .last_sql_use_alloc
+                .lock()
+                .expect("session last sql use alloc lock") = use_alloc;
         }
         result
     }
@@ -4544,16 +4781,19 @@ fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
         return Ok(sealdb_types::Datum::Bytes(inner.as_bytes().to_vec()));
     }
     // TiDB accepts clock functions here: `AS OF TIMESTAMP NOW()` reads the
-    // latest committed data as of this statement.
-    if let Some(fsp) = as_of_now_fsp(text) {
+    // latest committed data as of this statement. Also `NOW(6) - INTERVAL …`.
+    if let Some((fsp, offset_micros)) = as_of_now_interval(text) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| (d.as_secs() as i64, d.subsec_micros()))
+            .map(|d| (d.as_secs() as i64, d.subsec_micros() as i64))
             .unwrap_or((0, 0));
-        let mut time = sealdb_types::Time::from_unix_secs(now.0, sealdb_types::TimeType::Timestamp);
+        let total_micros = now.0.saturating_mul(1_000_000) + now.1 + offset_micros;
+        let secs = total_micros.div_euclid(1_000_000);
+        let micro = total_micros.rem_euclid(1_000_000) as u32;
+        let mut time = sealdb_types::Time::from_unix_secs(secs, sealdb_types::TimeType::Timestamp);
         time.fsp = fsp;
         if fsp > 0 {
-            time.micro = now.1;
+            time.micro = micro;
         }
         return Ok(sealdb_types::Datum::Time(
             sealdb_expression::utc_to_session_local(time)?,
@@ -4562,6 +4802,43 @@ fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
     Err(Error::unsupported(format!(
         "AS OF TIMESTAMP with expression {text}"
     )))
+}
+
+/// `NOW([fsp]) [+/- INTERVAL <n> <unit>]` → (fsp, microsecond offset).
+fn as_of_now_interval(raw: &str) -> Option<(i8, i64)> {
+    let lowered = raw.to_ascii_lowercase();
+    let trimmed = lowered.trim();
+    // Split on the first `+` / `-` that introduces INTERVAL (not a leading sign).
+    let (now_part, offset) = if let Some(rest) = trimmed.split_once(" - interval ") {
+        (rest.0.trim(), -parse_interval_micros(rest.1)?)
+    } else if let Some(rest) = trimmed.split_once(" + interval ") {
+        (rest.0.trim(), parse_interval_micros(rest.1)?)
+    } else if let Some(rest) = trimmed.split_once("- interval ") {
+        (rest.0.trim(), -parse_interval_micros(rest.1)?)
+    } else if let Some(rest) = trimmed.split_once("+ interval ") {
+        (rest.0.trim(), parse_interval_micros(rest.1)?)
+    } else {
+        (trimmed, 0)
+    };
+    let fsp = as_of_now_fsp(now_part)?;
+    Some((fsp, offset))
+}
+
+/// Parse `0.05 second` / `1 day` into microseconds.
+fn parse_interval_micros(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (num, unit) = text.split_once(char::is_whitespace)?;
+    let value: f64 = num.trim().parse().ok()?;
+    let unit = unit.trim().trim_end_matches('s'); // second(s), day(s), …
+    let micros_per = match unit {
+        "microsecond" => 1.0,
+        "second" => 1_000_000.0,
+        "minute" => 60.0 * 1_000_000.0,
+        "hour" => 3600.0 * 1_000_000.0,
+        "day" => 86400.0 * 1_000_000.0,
+        _ => return None,
+    };
+    Some((value * micros_per) as i64)
 }
 
 /// Fractional-second precision when `raw` is a clock function TiDB accepts as
@@ -5381,8 +5658,8 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     "Variable 'tidb_current_ts' is a read only variable",
                 ));
             }
-            // Plan-cache probes report the previous execution's outcome.
-            "last_plan_from_binding" | "last_plan_from_cache" => {
+            // Plan-cache / chunk-alloc probes report the previous execution.
+            "last_plan_from_binding" | "last_plan_from_cache" | "last_sql_use_alloc" => {
                 return Err(sealdb_errno::Error::new(
                     sealdb_errno::ERR_VAR_CANT_BE_READ,
                     format!("Variable '{name}' is a read only variable"),
@@ -5535,11 +5812,32 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .lock()
                     .expect("session clustered index lock") = mode;
             }
+            "tidb_enable_check_constraint" => {
+                let on = parse_sysvar_flag("tidb_enable_check_constraint", &value)?;
+                *session
+                    .enable_check_constraint
+                    .lock()
+                    .expect("session check constraint lock") = on;
+            }
             "tidb_enable_resource_control" => {
                 // The global flag gates `RESOURCE_GROUP()` hints; the session
                 // value mirrors it (`@@tidb_enable_resource_control`).
                 let on = parse_resource_control_flag(&value);
                 session.domain.set_enable_resource_control(on);
+            }
+            // Deprecated: TiDB keeps this always ON. Turning it off only
+            // reports the deprecation warning, the value stays 1.
+            "tidb_enable_exchange_partition" => {
+                if !value.eq_ignore_ascii_case("DEFAULT") {
+                    let on = parse_sysvar_flag("tidb_enable_exchange_partition", &value)?;
+                    if !on {
+                        warnings.push((
+                            1105,
+                            "tidb_enable_exchange_partition is always turned on. This variable has been deprecated and will be removed in the future releases"
+                                .to_string(),
+                        ));
+                    }
+                }
             }
             "tidb_shard_allocate_step" => {
                 let step = parse_shard_allocate_step(&value)?;
@@ -5790,6 +6088,31 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .lock()
                     .expect("session agg push down lock") = on;
             }
+            // TiDB IndexLookUp push-down policy (`hint-only` / `force` /
+            // `affinity-force`).
+            "tidb_index_lookup_pushdown_policy" => {
+                let mut overrides = session
+                    .sysvar_overrides
+                    .lock()
+                    .expect("session sysvar overrides lock");
+                if value.eq_ignore_ascii_case("DEFAULT") {
+                    overrides.remove("tidb_index_lookup_pushdown_policy");
+                } else {
+                    let normalized = value.trim().to_ascii_lowercase();
+                    if !matches!(
+                        normalized.as_str(),
+                        "hint-only" | "force" | "affinity-force"
+                    ) {
+                        return Err(sealdb_errno::Error::new(
+                            sealdb_errno::ERR_WRONG_ARGUMENTS,
+                            format!(
+                                "Variable 'tidb_index_lookup_pushdown_policy' can't be set to the value of '{value}'"
+                            ),
+                        ));
+                    }
+                    overrides.insert("tidb_index_lookup_pushdown_policy".to_string(), normalized);
+                }
+            }
             // `ResultReorder` gate (TiDB default OFF).
             "tidb_enable_ordered_result_mode" => {
                 let on = if value.eq_ignore_ascii_case("DEFAULT") {
@@ -5981,6 +6304,7 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
         if name != "tidb_enable_table_partition"
             && name != "tidb_enable_list_partition"
             && name != "tidb_session_alias"
+            && name != "tidb_index_lookup_pushdown_policy"
         {
             record_sysvar_override(session, &name, &record_value);
         }
@@ -6218,6 +6542,13 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
             let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
             session.domain.set_global_enable_auto_analyze(on);
         }
+        "tidb_enable_check_constraint" => {
+            let on = parse_sysvar_flag("tidb_enable_check_constraint", value)?;
+            *session
+                .enable_check_constraint
+                .lock()
+                .expect("session check constraint lock") = on;
+        }
         "tidb_auto_analyze_concurrency" => {
             if !value.eq_ignore_ascii_case("DEFAULT") {
                 let concurrency: u64 = value.parse().map_err(|_| {
@@ -6347,6 +6678,98 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
             .set_global_override(name, Some(normalize_show_variable_value(kind, value)));
     }
     Ok(warnings)
+}
+
+/// TiDB treats blob/text columns as "overlong" types that skip chunk reuse
+/// under the default memory limit, so `@@last_sql_use_alloc` reports 0.
+fn is_overlong_field_tp(tp: u8) -> bool {
+    matches!(
+        tp,
+        sealdb_types::TYPE_BLOB
+            | sealdb_types::TYPE_TINY_BLOB
+            | sealdb_types::TYPE_MEDIUM_BLOB
+            | sealdb_types::TYPE_LONG_BLOB
+    )
+}
+
+fn is_overlong_type_name(type_name: &str) -> bool {
+    let lower = type_name.to_ascii_lowercase();
+    lower.contains("blob") || lower.contains("text")
+}
+
+fn table_has_overlong_column(info: &sealdb_meta::TableInfo) -> bool {
+    info.columns
+        .iter()
+        .any(|c| is_overlong_field_tp(c.field_type.tp))
+}
+
+fn stmt_touches_overlong_type(
+    stmt: &Statement,
+    is: &sealdb_infoschema::InfoSchema,
+    current_db: &str,
+) -> bool {
+    match stmt {
+        Statement::CreateTable(create) => {
+            if create
+                .cols
+                .iter()
+                .any(|c| is_overlong_type_name(&c.type_name))
+            {
+                return true;
+            }
+            let (schema, table) = create.table.qualified(current_db);
+            is.table_by_name(&schema, &table)
+                .is_some_and(table_has_overlong_column)
+        }
+        Statement::Insert(insert) => {
+            let (schema, table) = insert.table.qualified(current_db);
+            is.table_by_name(&schema, &table)
+                .is_some_and(table_has_overlong_column)
+                || insert
+                    .select
+                    .as_ref()
+                    .is_some_and(|s| select_touches_overlong(s, is, current_db))
+        }
+        Statement::Update(update) => {
+            let (schema, table) = update.table.qualified(current_db);
+            is.table_by_name(&schema, &table)
+                .is_some_and(table_has_overlong_column)
+        }
+        Statement::Delete(delete) => {
+            let (schema, table) = delete.table.qualified(current_db);
+            is.table_by_name(&schema, &table)
+                .is_some_and(table_has_overlong_column)
+        }
+        Statement::Select(select) => select_touches_overlong(select, is, current_db),
+        Statement::Explain(explain) => stmt_touches_overlong_type(&explain.stmt, is, current_db),
+        Statement::AnalyzeTable(analyze) => {
+            let mut tables = vec![&analyze.table];
+            tables.extend(analyze.tables.iter());
+            tables.into_iter().any(|t| {
+                let (schema, table) = t.qualified(current_db);
+                is.table_by_name(&schema, &table)
+                    .is_some_and(table_has_overlong_column)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn select_touches_overlong(
+    select: &SelectStmt,
+    is: &sealdb_infoschema::InfoSchema,
+    current_db: &str,
+) -> bool {
+    for table in select.join_tables() {
+        let (schema, name) = table.qualified(current_db);
+        if is
+            .table_by_name(&schema, &name)
+            .is_some_and(table_has_overlong_column)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult> {
@@ -6630,6 +7053,8 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
             .expect("session clustered index lock")
             .as_str()
             .to_string(),
+        // Deprecated in TiDB 6.x but pinned to ON; `SET` to OFF only warns.
+        "tidb_enable_exchange_partition" => "1".to_string(),
         "tidb_enable_auto_analyze" => {
             if *session
                 .enable_auto_analyze
@@ -6821,6 +7246,17 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
                 "0".into()
             }
         }
+        "last_sql_use_alloc" => {
+            if *session
+                .last_sql_use_alloc
+                .lock()
+                .expect("session last sql use alloc lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         // Common TiDB session vars referenced by integrationtest; defaults.
         "tidb_allow_function_for_expression_index" => {
             "json_array, json_array_append, json_array_insert, json_contains, \
@@ -6916,6 +7352,7 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("interactive_timeout", "28800", VarKind::Text),
     ("last_plan_from_binding", "OFF", VarKind::Flag),
     ("last_plan_from_cache", "OFF", VarKind::Flag),
+    ("last_sql_use_alloc", "OFF", VarKind::Flag),
     ("license", "Apache License 2.0", VarKind::Text),
     ("lower_case_table_names", "2", VarKind::Text),
     ("max_allowed_packet", "67108864", VarKind::Text),
@@ -6972,6 +7409,12 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("tidb_memory_usage_alarm_ratio", "0.8", VarKind::Text),
     ("tidb_opt_agg_push_down", "OFF", VarKind::Flag),
     ("tidb_opt_insubq_to_join_and_agg", "ON", VarKind::Flag),
+    ("tidb_enable_exchange_partition", "1", VarKind::Text),
+    (
+        "tidb_index_lookup_pushdown_policy",
+        "hint-only",
+        VarKind::Text,
+    ),
     ("tidb_partition_prune_mode", "dynamic", VarKind::Text),
     ("tidb_session_alias", "", VarKind::Text),
     ("tidb_snapshot", "", VarKind::Text),
@@ -7592,6 +8035,180 @@ fn restore_sql(stmt: &Statement) -> String {
     ctx.into_string()
 }
 
+/// TiDB `/*+ IGNORE_PLAN_CACHE() */` on the prepared template / statement text.
+fn stmt_has_ignore_plan_cache_hint(stmt: &Statement) -> bool {
+    restore_sql(stmt)
+        .to_ascii_uppercase()
+        .contains("IGNORE_PLAN_CACHE")
+}
+
+/// TiDB PREPARE plan-cache probe: recursive CTE names are resolved as base
+/// tables and miss, producing `skip prepared plan-cache: find table …`.
+fn prepared_plan_cache_skip_warnings_sql(sql: &str, db: &str) -> Vec<(i32, String)> {
+    let Some(name) = recursive_cte_probe_name(sql) else {
+        return Vec::new();
+    };
+    let table = format!("{db}.{name}");
+    vec![(
+        1105,
+        format!(
+            "skip prepared plan-cache: find table {table} failed: [schema:1146]Table '{table}' doesn't exist"
+        ),
+    )]
+}
+
+/// Name TiDB's prepare probe reports for a `WITH RECURSIVE` template: the CTE
+/// that references itself (else the last CTE in the WITH list).
+fn recursive_cte_probe_name(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    let mut search = 0usize;
+    let mut best: Option<String> = None;
+    while let Some(rel) = lower[search..].find("with recursive") {
+        let start = search + rel + "with recursive".len();
+        let names = cte_names_after(sql, start);
+        if names.is_empty() {
+            search = start;
+            continue;
+        }
+        let mut picked = names.last().cloned();
+        for name in &names {
+            // Self-reference: bare table token appears again after the def.
+            if ident_occurrences(&lower[start..], name) >= 2 {
+                picked = Some(name.clone());
+                // Prefer the last self-referencing CTE (TiDB hits `cte` after `c`).
+            }
+        }
+        best = picked.or(best);
+        search = start;
+    }
+    best
+}
+
+fn ident_occurrences(haystack_lower: &str, name: &str) -> usize {
+    let needle = name.to_ascii_lowercase();
+    let bytes = haystack_lower.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return 0;
+    }
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + n.len() <= bytes.len() {
+        if &bytes[i..i + n.len()] == n {
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after = i + n.len();
+            let after_ok = after >= bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+            if before_ok && after_ok {
+                count += 1;
+                i = after;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Scan `sql[start..]` for `name AS` / `name(` CTE declarations until the
+/// outer SELECT of the WITH clause.
+fn cte_names_after(sql: &str, start: usize) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut i = start;
+    let mut names = Vec::new();
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let rest = sql[i..].to_ascii_lowercase();
+        if rest.starts_with("select")
+            || rest.starts_with("with")
+            || rest.starts_with('(') && names.is_empty()
+        {
+            // Hit the WITH body select (or nested junk) — stop.
+            if rest.starts_with("select") {
+                break;
+            }
+        }
+        // Identifier (possibly quoted).
+        let (name, next) = match bytes[i] {
+            b'`' | b'"' => {
+                let quote = bytes[i];
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != quote {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    break;
+                }
+                (sql[i + 1..j].to_string(), j + 1)
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                (sql[i..j].to_string(), j)
+            }
+            _ => break,
+        };
+        i = next;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // Optional column list `(a, b)`.
+        if i < bytes.len() && bytes[i] == b'(' {
+            let mut depth = 1usize;
+            i += 1;
+            while i < bytes.len() && depth > 0 {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+        if i + 2 <= bytes.len() && sql[i..].to_ascii_lowercase().starts_with("as") {
+            names.push(name);
+            i += 2;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            // Skip the CTE body `(…)`.
+            if i < bytes.len() && bytes[i] == b'(' {
+                let mut depth = 1usize;
+                i += 1;
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b',' {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+    names
+}
+
 /// Restore a statement with table names qualified by `db` (TiDB binding
 /// `bind_sql` form, `SELECT * FROM `db`.`t` …`).
 fn restore_qualified(stmt: &Statement, db: &str) -> String {
@@ -8074,6 +8691,191 @@ impl ViewPrivCtx<'_> {
     }
 }
 
+/// TiDB 1054 for a table-qualified column whose qualifier is not a visible
+/// FROM alias. An alias completely hides the physical table name. Correlated
+/// subqueries inherit the outer block's visible names.
+fn validate_statement_column_refs(stmt: &Statement) -> Result<()> {
+    match stmt {
+        Statement::Select(select) => validate_select_column_refs(select, &[]),
+        Statement::Explain(explain) => validate_statement_column_refs(&explain.stmt),
+        Statement::SetOpr(set) => {
+            validate_select_column_refs(&set.first, &[])?;
+            for (_, arm) in &set.rest {
+                validate_select_column_refs(arm, &[])?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn select_visible_table_names(select: &SelectStmt) -> Vec<String> {
+    let mut visible: Vec<String> = Vec::new();
+    for table in select.join_tables() {
+        // An explicit alias (`FROM t tmp`) hides the physical name.
+        if table.physical.is_some() {
+            visible.push(table.name.to_ascii_lowercase());
+        } else {
+            visible.push(table.resolve_name().to_ascii_lowercase());
+            visible.push(table.name.to_ascii_lowercase());
+        }
+    }
+    visible.sort();
+    visible.dedup();
+    visible
+}
+
+fn validate_select_column_refs(select: &SelectStmt, outer: &[String]) -> Result<()> {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            validate_select_column_refs(&cte.query, outer)?;
+            for (_, arm) in &cte.set_rest {
+                validate_select_column_refs(arm, outer)?;
+            }
+            for (_, rec) in &cte.recursive_rest {
+                validate_select_column_refs(rec, outer)?;
+            }
+        }
+    }
+    let mut visible = outer.to_vec();
+    visible.extend(select_visible_table_names(select));
+    visible.sort();
+    visible.dedup();
+    let check = |expr: &ExprNode, clause: &str| -> Result<()> {
+        validate_expr_column_refs(expr, &visible, clause)
+    };
+    for field in &select.fields {
+        check(&field.expr, "field list")?;
+    }
+    if let Some(sel) = &select.selection {
+        check(sel, "where clause")?;
+    }
+    for expr in &select.group_by {
+        check(expr, "group statement")?;
+    }
+    if let Some(having) = &select.having {
+        check(having, "having clause")?;
+    }
+    for item in &select.order_by {
+        check(&item.expr, "order clause")?;
+    }
+    for join in &select.joins {
+        check(&join.on, "on clause")?;
+    }
+    Ok(())
+}
+
+fn validate_expr_column_refs(expr: &ExprNode, visible: &[String], clause: &str) -> Result<()> {
+    match expr {
+        ExprNode::Column(col) => {
+            // User / system variables (`@v`, `@@session.x`, `@@global.y`) are
+            // not table-qualified columns.
+            if col.name.starts_with('@')
+                || col.table.as_deref().is_some_and(|t| {
+                    t.starts_with('@')
+                        || t.eq_ignore_ascii_case("global")
+                        || t.eq_ignore_ascii_case("session")
+                        || t.eq_ignore_ascii_case("local")
+                })
+            {
+                return Ok(());
+            }
+            let Some(table) = col.table.as_deref() else {
+                return Ok(());
+            };
+            if visible.iter().any(|v| v.eq_ignore_ascii_case(table)) {
+                return Ok(());
+            }
+            Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_BAD_FIELD,
+                format!("Unknown column '{table}.{}' in '{clause}'", col.name),
+            ))
+        }
+        // Nested SELECTs inherit this block's names as their outer scope.
+        ExprNode::Exists(e) => {
+            for sel in e.query.selects() {
+                validate_select_column_refs(sel, visible)?;
+            }
+            Ok(())
+        }
+        ExprNode::ScalarSubquery(s) => {
+            for sel in s.query.selects() {
+                validate_select_column_refs(sel, visible)?;
+            }
+            Ok(())
+        }
+        ExprNode::InSubquery(s) => {
+            validate_expr_column_refs(&s.expr, visible, clause)?;
+            for sel in s.query.selects() {
+                validate_select_column_refs(sel, visible)?;
+            }
+            Ok(())
+        }
+        ExprNode::QuantifiedCmp(c) => {
+            validate_expr_column_refs(&c.expr, visible, clause)?;
+            for sel in c.query.selects() {
+                validate_select_column_refs(sel, visible)?;
+            }
+            Ok(())
+        }
+        ExprNode::Binary(b) => {
+            validate_expr_column_refs(&b.left, visible, clause)?;
+            validate_expr_column_refs(&b.right, visible, clause)
+        }
+        ExprNode::Unary(u) => validate_expr_column_refs(&u.expr, visible, clause),
+        ExprNode::Func(f) => {
+            for arg in &f.args {
+                validate_expr_column_refs(arg, visible, clause)?;
+            }
+            Ok(())
+        }
+        ExprNode::Cast(c) => validate_expr_column_refs(&c.expr, visible, clause),
+        ExprNode::InList(i) => {
+            validate_expr_column_refs(&i.expr, visible, clause)?;
+            for item in &i.list {
+                validate_expr_column_refs(item, visible, clause)?;
+            }
+            Ok(())
+        }
+        ExprNode::Between(b) => {
+            validate_expr_column_refs(&b.expr, visible, clause)?;
+            validate_expr_column_refs(&b.low, visible, clause)?;
+            validate_expr_column_refs(&b.high, visible, clause)
+        }
+        ExprNode::Like(l) => {
+            validate_expr_column_refs(&l.expr, visible, clause)?;
+            validate_expr_column_refs(&l.pattern, visible, clause)
+        }
+        ExprNode::IsNull(i) => validate_expr_column_refs(&i.expr, visible, clause),
+        ExprNode::Case(c) => {
+            if let Some(op) = &c.operand {
+                validate_expr_column_refs(op, visible, clause)?;
+            }
+            for (when, then) in &c.when_then {
+                validate_expr_column_refs(when, visible, clause)?;
+                validate_expr_column_refs(then, visible, clause)?;
+            }
+            if let Some(e) = &c.else_expr {
+                validate_expr_column_refs(e, visible, clause)?;
+            }
+            Ok(())
+        }
+        ExprNode::Row(r) => {
+            for item in &r.exprs {
+                validate_expr_column_refs(item, visible, clause)?;
+            }
+            Ok(())
+        }
+        ExprNode::Window(w) => {
+            for arg in &w.args {
+                validate_expr_column_refs(arg, visible, clause)?;
+            }
+            Ok(())
+        }
+        ExprNode::Value(_) => Ok(()),
+    }
+}
+
 /// Expand VIEW references into CTEs so planner/executor reuse derived-table paths.
 fn expand_views(
     stmt: &mut Statement,
@@ -8297,8 +9099,9 @@ fn inject_view_cte(
     } else {
         CteMaterialize::Default
     };
-    // TiDB names unnamed select-list exprs `name_exp_N` for view/derived output.
-    // Leave empty for `SELECT *` / plain columns so CTE inherits expanded seed names.
+    // TiDB names unnamed select-list exprs from `field.Text()` (capped at 64),
+    // falling back to `name_exp_N`. Leave empty for `SELECT *` / plain columns
+    // so CTE inherits expanded seed names.
     let is_star_field = |f: &sealdb_parser::ast::SelectField| {
         matches!(
             &f.expr,
@@ -8333,7 +9136,26 @@ fn inject_view_cte(
                 }
                 match &f.expr {
                     sealdb_parser::ast::expressions::ExprNode::Column(c) => c.name.clone(),
-                    _ => format!("name_exp_{}", i + 1),
+                    sealdb_parser::ast::expressions::ExprNode::Value(_) => {
+                        let raw = f.expr.name();
+                        if raw.is_empty() || raw.len() > 64 {
+                            format!("name_exp_{}", i + 1)
+                        } else {
+                            raw
+                        }
+                    }
+                    _ => {
+                        let raw = f
+                            .orig_text
+                            .clone()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| f.expr.name());
+                        if raw.is_empty() || raw.len() > 64 {
+                            format!("name_exp_{}", i + 1)
+                        } else {
+                            raw
+                        }
+                    }
                 }
             })
             .collect()
@@ -8408,9 +9230,18 @@ fn validate_view_shape<'a>(
 ) -> Result<()> {
     let expected = info.columns.len();
     for arm in arms {
-        let width_bad =
-            select_output_width(arm, is, current_db).is_some_and(|width| width < expected);
-        if width_bad || view_arm_invalid(arm, is, current_db) {
+        let width = select_output_width(arm, is, current_db);
+        let width_bad = width.is_some_and(|w| w < expected);
+        let cols_bad = view_arm_invalid(arm, is, current_db);
+        let drifted = view_star_schema_drifted(info, arm, is, current_db);
+        if width_bad || cols_bad || drifted {
+            // Nested derived FROM (`SELECT * FROM (SELECT …) alias`) cannot be
+            // shape-checked against infoschema the way a base-table `SELECT *`
+            // can; TiDB still accepts these views. Skip the hard fail when the
+            // arm's FROM is covered by a derived CTE.
+            if select_has_derived_cte(arm) || from_is_unresolved_derived(arm, is, current_db) {
+                continue;
+            }
             return Err(sealdb_errno::Error::new(
                 sealdb_errno::ERR_VIEW_INVALID_TABLE,
                 format!(
@@ -8423,6 +9254,62 @@ fn validate_view_shape<'a>(
     Ok(())
 }
 
+/// True when `FROM` names a table that is not in infoschema (typically a
+/// derived-table alias that has not been rewritten into a CTE yet).
+fn from_is_unresolved_derived(select: &SelectStmt, is: &InfoSchema, current_db: &str) -> bool {
+    let Some(from) = select.from.as_ref() else {
+        return false;
+    };
+    let (schema, name) = from.qualified(current_db);
+    is.table_by_name(&schema, &name).is_none()
+        && select.with.as_ref().is_none_or(|with| {
+            !with
+                .ctes
+                .iter()
+                .any(|cte| cte.name.eq_ignore_ascii_case(&from.name))
+        })
+}
+
+/// `CREATE VIEW v AS SELECT * FROM t` records the base column names at create
+/// time. If `t` is later recreated with the same width but different names,
+/// TiDB reports 1356 even though `*` still expands to that many columns.
+fn view_star_schema_drifted(
+    info: &sealdb_meta::TableInfo,
+    select: &SelectStmt,
+    is: &InfoSchema,
+    current_db: &str,
+) -> bool {
+    let only_star = select.fields.len() == 1 && is_star_select_expr(&select.fields[0].expr);
+    if !only_star || !select.joins.is_empty() {
+        return false;
+    }
+    let Some(from) = select.from.as_ref() else {
+        return false;
+    };
+    // Nested derived tables lower to synthetic CTEs (`derived: true`); they are
+    // not base tables, so a missing infoschema lookup is not schema drift
+    // (`CREATE VIEW v AS SELECT * FROM (SELECT * FROM t) tb`).
+    if select.with.as_ref().is_some_and(|with| {
+        with.ctes
+            .iter()
+            .any(|cte| cte.derived && cte.name.eq_ignore_ascii_case(&from.name))
+    }) {
+        return false;
+    }
+    let (schema, name) = from.qualified(current_db);
+    let Some(base) = is.table_by_name(&schema, &name) else {
+        return true;
+    };
+    if base.columns.len() != info.columns.len() {
+        return true;
+    }
+    !info
+        .columns
+        .iter()
+        .zip(base.columns.iter())
+        .all(|(want, have)| want.name.o().eq_ignore_ascii_case(have.name.o()))
+}
+
 /// One `FROM` source while validating a view body's column references.
 #[derive(Clone)]
 struct ViewCheckSource {
@@ -8433,6 +9320,18 @@ struct ViewCheckSource {
 /// True when the view body references a table or column that no longer exists.
 fn view_arm_invalid(select: &SelectStmt, is: &InfoSchema, current_db: &str) -> bool {
     view_arm_invalid_scoped(select, is, current_db, &[])
+}
+
+fn select_has_derived_cte(select: &SelectStmt) -> bool {
+    select
+        .with
+        .as_ref()
+        .is_some_and(|with| with.ctes.iter().any(|cte| cte.derived))
+        || select.with.as_ref().is_some_and(|with| {
+            with.ctes
+                .iter()
+                .any(|cte| select_has_derived_cte(&cte.query))
+        })
 }
 
 /// Columns a CTE exposes (`AS alias` or the expression's name).
@@ -8513,6 +9412,13 @@ fn view_arm_invalid_scoped(
         }
         let (schema, name) = table.qualified(current_db);
         let Some(info) = is.table_by_name(&schema, &name) else {
+            // Nested derived tables may appear as FROM names before their
+            // synthetic CTE is visible in `sources` (double-nested
+            // `SELECT * FROM (SELECT * FROM (SELECT * FROM t) tb1) tb`).
+            // Defer to planning instead of rejecting the view as invalid.
+            if select_has_derived_cte(select) {
+                continue;
+            }
             return true;
         };
         let mut names = vec![table.name.clone(), name];
@@ -8528,21 +9434,24 @@ fn view_arm_invalid_scoped(
                 .collect(),
         });
     }
-    let exprs: Vec<&ExprNode> = select
-        .fields
-        .iter()
-        .map(|field| &field.expr)
-        .chain(select.selection.iter())
-        .chain(select.group_by.iter())
-        .chain(select.having.iter())
-        .chain(select.order_by.iter().map(|item| &item.expr))
-        .chain(select.joins.iter().map(|join| &join.on))
-        .collect();
-    for expr in exprs {
-        if !expr_columns_exist(expr, &sources, is, current_db) && !is_output_alias_ref(expr, select)
-        {
+    // SELECT-list exprs must resolve against FROM sources: a bare `a` in
+    // `SELECT a` is not an "output alias" of itself (that escape is only for
+    // ORDER BY / HAVING / GROUP BY referring to `AS` names).
+    for field in &select.fields {
+        if !expr_columns_exist(&field.expr, &sources, is, current_db) {
             return true;
         }
+    }
+    let alias_ok = |expr: &ExprNode| {
+        expr_columns_exist(expr, &sources, is, current_db) || is_output_alias_ref(expr, select)
+    };
+    if select.selection.iter().any(|e| !alias_ok(e))
+        || select.group_by.iter().any(|e| !alias_ok(e))
+        || select.having.iter().any(|e| !alias_ok(e))
+        || select.order_by.iter().any(|item| !alias_ok(&item.expr))
+        || select.joins.iter().any(|join| !alias_ok(&join.on))
+    {
+        return true;
     }
     false
 }
@@ -9151,13 +10060,282 @@ fn apply_optimizer_index_hints(stmt: &mut Statement) {
     });
 }
 
+/// Apply `INDEX_LOOKUP_PUSHDOWN` / `NO_INDEX_LOOKUP_PUSHDOWN` like TiDB:
+/// force the named index (or table scan when inapplicable), mark push-down,
+/// and collect 1815 warnings.
+fn apply_index_lookup_pushdown_hints(
+    session: &Session,
+    stmt: &mut Statement,
+    is: &sealdb_infoschema::InfoSchema,
+    current_db: &str,
+) -> Vec<(i32, String)> {
+    let text = statement_hint_text(stmt);
+    let push_hints = named_index_optimizer_hints(text, "index_lookup_pushdown");
+    let no_hints = named_index_optimizer_hints(text, "no_index_lookup_pushdown");
+    if push_hints.is_empty() && no_hints.is_empty() {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    let mut no_tables: HashSet<String> = HashSet::new();
+    for (table, indexes) in &no_hints {
+        if !indexes.is_empty() {
+            warnings.push((
+                1815,
+                "hint NO_INDEX_LOOKUP_PUSH_DOWN is inapplicable, only table name without indexes is supported"
+                    .to_string(),
+            ));
+            continue;
+        }
+        no_tables.insert(table.to_ascii_lowercase());
+    }
+    // Mark NO_INDEX_LOOKUP_PUSHDOWN on matching table refs.
+    if !no_tables.is_empty() {
+        map_statement_tables(stmt, &mut |table| {
+            let name = table.resolve_name();
+            if no_tables
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(name) || t.eq_ignore_ascii_case(&table.name))
+            {
+                table.no_index_lookup_pushdown = true;
+            }
+        });
+    }
+    for (table, indexes) in &push_hints {
+        let table_l = table.to_ascii_lowercase();
+        if indexes.is_empty() {
+            warnings.push((
+                1815,
+                "hint INDEX_LOOKUP_PUSH_DOWN is inapplicable, the index names should be specified"
+                    .to_string(),
+            ));
+            force_table_scan_hint(stmt, table);
+            continue;
+        }
+        if no_tables.contains(&table_l) {
+            warnings.push((
+                1815,
+                "hint INDEX_LOOKUP_PUSHDOWN cannot be inapplicable, NO_INDEX_LOOKUP_PUSHDOWN is specified"
+                    .to_string(),
+            ));
+            force_table_scan_hint(stmt, table);
+            continue;
+        }
+        // Snapshot any `USE INDEX` already on the table factor so a rejected
+        // pushdown can restore it (TiDB keeps `USE INDEX` even when the
+        // pushdown hint is inapplicable).
+        let mut prior_use: Vec<(bool, Vec<String>)> = Vec::new();
+        map_statement_tables(stmt, &mut |tbl| {
+            let name = tbl.resolve_name();
+            if table.eq_ignore_ascii_case(name) || table.eq_ignore_ascii_case(&tbl.name) {
+                prior_use.push((tbl.use_index_hint, tbl.use_indexes.clone()));
+            }
+        });
+        if let Some(reason) =
+            index_lookup_pushdown_unsupported(session, is, current_db, stmt, table, indexes)
+        {
+            warnings.push((
+                1815,
+                format!("hint INDEX_LOOKUP_PUSHDOWN is inapplicable, {reason}"),
+            ));
+            // Non-leader replica read with an explicit `USE INDEX` keeps a
+            // normal IndexLookUp. Every other blocker falls back to a table
+            // scan unless `USE INDEX` was already present on the factor.
+            let keep_hint_index = reason.contains("only leader read is supported")
+                && prior_use.iter().any(|(had, _)| *had);
+            let mut prior = prior_use.into_iter();
+            map_statement_tables(stmt, &mut |tbl| {
+                let name = tbl.resolve_name();
+                if !(table.eq_ignore_ascii_case(name) || table.eq_ignore_ascii_case(&tbl.name)) {
+                    return;
+                }
+                tbl.index_lookup_pushdown = false;
+                if keep_hint_index {
+                    tbl.use_index_hint = true;
+                    tbl.use_indexes = indexes.clone();
+                    return;
+                }
+                if let Some((had, idxs)) = prior.next() {
+                    if had {
+                        tbl.use_index_hint = true;
+                        tbl.use_indexes = idxs;
+                    } else {
+                        tbl.use_index_hint = true;
+                        tbl.use_indexes.clear();
+                    }
+                } else {
+                    tbl.use_index_hint = true;
+                    tbl.use_indexes.clear();
+                }
+            });
+            continue;
+        }
+        map_statement_tables(stmt, &mut |tbl| {
+            let name = tbl.resolve_name();
+            if table.eq_ignore_ascii_case(name) || table.eq_ignore_ascii_case(&tbl.name) {
+                tbl.use_index_hint = true;
+                tbl.use_indexes = indexes.clone();
+                tbl.index_lookup_pushdown = true;
+            }
+        });
+    }
+    warnings
+}
+
+/// TiDB: an INDEX_LOOKUP_PUSHDOWN with no index names still counts as a
+/// USE/FORCE scan hint with no surviving path, so the planner falls back to
+/// table scan.
+fn force_table_scan_hint(stmt: &mut Statement, table: &str) {
+    map_statement_tables(stmt, &mut |tbl| {
+        let name = tbl.resolve_name();
+        if table.eq_ignore_ascii_case(name) || table.eq_ignore_ascii_case(&tbl.name) {
+            tbl.use_index_hint = true;
+            tbl.use_indexes.clear();
+            tbl.index_lookup_pushdown = false;
+        }
+    });
+}
+
+/// Reasons TiDB rejects INDEX_LOOKUP_PUSHDOWN (see `checkIndexLookUpPushDownSupported`).
+fn index_lookup_pushdown_unsupported(
+    session: &Session,
+    is: &sealdb_infoschema::InfoSchema,
+    current_db: &str,
+    stmt: &Statement,
+    table: &str,
+    indexes: &[String],
+) -> Option<&'static str> {
+    let (schema, _) = {
+        // Resolve against the statement's table ref when possible.
+        let mut found = (current_db.to_string(), table.to_string());
+        map_statement_tables(&mut stmt.clone(), &mut |tbl| {
+            let name = tbl.resolve_name();
+            if table.eq_ignore_ascii_case(name) || table.eq_ignore_ascii_case(&tbl.name) {
+                let (db, name) = tbl.qualified(current_db);
+                found = (db, name);
+            }
+        });
+        found
+    };
+    let info = is.table_by_name(&schema, table).or_else(|| {
+        // Alias / physical name.
+        is.table_by_name(&schema, &{
+            let mut physical = table.to_string();
+            map_statement_tables(&mut stmt.clone(), &mut |tbl| {
+                if table.eq_ignore_ascii_case(&tbl.name) {
+                    physical = tbl.resolve_name().to_string();
+                }
+            });
+            physical
+        })
+    })?;
+    if info.temporary || schema.eq_ignore_ascii_case(TEMP_TABLE_SCHEMA) {
+        return Some("temporary table is not supported");
+    }
+    if info.cached_table {
+        return Some("cached table is not supported");
+    }
+    if indexes.iter().any(|hint| {
+        info.indices.iter().any(|idx| {
+            idx.name.o().eq_ignore_ascii_case(hint)
+                && idx.columns.iter().any(|col| {
+                    info.columns
+                        .get(col.offset as usize)
+                        .and_then(|c| c.generated_expr.as_deref())
+                        .is_some_and(|expr| expr.to_ascii_uppercase().contains("ARRAY"))
+                })
+        })
+    }) {
+        return Some("multi-valued index is not supported");
+    }
+    // TiDB `checkIndexLookUpPushDownSupported`: GLOBAL indexes on a partition
+    // table cannot be pushed (`the global index in partition table is not
+    // supported`). An empty hint list still falls through; the planner picks
+    // the access path separately.
+    if indexes.iter().any(|hint| {
+        info.indices
+            .iter()
+            .any(|idx| idx.global && idx.name.o().eq_ignore_ascii_case(hint))
+    }) {
+        return Some("the global index in partition table is not supported");
+    }
+    let isolation = *session.isolation.lock().expect("session isolation lock");
+    if isolation != IsolationLevel::RepeatableRead {
+        return Some("transaction isolation level is not REPEATABLE-READ");
+    }
+    let replica =
+        read_session_sysvar(session, "tidb_replica_read").unwrap_or_else(|| "leader".to_string());
+    if !replica.eq_ignore_ascii_case("leader") {
+        return Some("only leader read is supported");
+    }
+    // Stale / historical read.
+    if read_session_sysvar(session, "tidb_snapshot").is_some_and(|v| !v.is_empty()) {
+        return Some("historical read is not supported");
+    }
+    if stmt_has_as_of(stmt) || begin_was_stale(session) {
+        return Some("stale read is not supported");
+    }
+    None
+}
+
+fn stmt_has_as_of(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Select(select) => select_has_as_of(select),
+        Statement::Explain(explain) => stmt_has_as_of(&explain.stmt),
+        _ => false,
+    }
+}
+
+fn select_has_as_of(select: &SelectStmt) -> bool {
+    if select.from.as_ref().is_some_and(|t| t.as_of_ts.is_some()) {
+        return true;
+    }
+    for t in select.join_tables() {
+        if t.as_of_ts.is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort: an explicit READ ONLY txn started with AS OF is stale.
+/// Tracked lightly via sysvar / pending flag when available.
+fn begin_was_stale(session: &Session) -> bool {
+    session
+        .sysvar_overrides
+        .lock()
+        .expect("session sysvar overrides lock")
+        .get("__sealdb_stale_txn")
+        .is_some_and(|v| v == "1")
+}
+
 /// `use_index(tbl, idx…)` hint arguments from statement text.
 fn use_index_optimizer_hints(text: &str) -> Vec<(String, Vec<String>)> {
+    named_index_optimizer_hints(text, "use_index")
+        .into_iter()
+        .filter(|(_, indexes)| !indexes.is_empty())
+        .collect()
+}
+
+/// `hint_name(tbl[, idx…])` arguments from statement text (case-insensitive).
+///
+/// Requires a non-identifier character before the name so
+/// `no_index_lookup_pushdown` is not matched as `index_lookup_pushdown`.
+fn named_index_optimizer_hints(text: &str, hint_name: &str) -> Vec<(String, Vec<String>)> {
     let lower = text.to_ascii_lowercase();
+    let needle = format!("{hint_name}(");
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(offset) = lower[from..].find("use_index(") {
-        let start = from + offset + "use_index(".len();
+    while let Some(offset) = lower[from..].find(&needle) {
+        let abs = from + offset;
+        // Reject a match that continues a longer identifier (`no_<hint>`).
+        if abs > 0 {
+            let prev = lower.as_bytes()[abs - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                from = abs + 1;
+                continue;
+            }
+        }
+        let start = abs + needle.len();
         let Some(end) = matching_text_paren(text, start - 1) else {
             break;
         };
@@ -9171,9 +10349,7 @@ fn use_index_optimizer_hints(text: &str) -> Vec<(String, Vec<String>)> {
         if args.first().is_some_and(|arg| arg.starts_with('@')) {
             args.remove(0);
         }
-        if let Some((table, indexes)) = args.split_first()
-            && !indexes.is_empty()
-        {
+        if let Some((table, indexes)) = args.split_first() {
             out.push((table.clone(), indexes.to_vec()));
         }
         from = end + 1;
@@ -9990,6 +11166,10 @@ impl Session {
         stmt: &Statement,
         raw_sql: Option<&str>,
     ) -> Result<Option<Statement>> {
+        *self
+            .binding_ignore_plan_cache
+            .lock()
+            .expect("session binding ignore plan cache lock") = false;
         match stmt {
             Statement::Select(_)
             | Statement::SetOpr(_)
@@ -10006,6 +11186,13 @@ impl Session {
                     // finishes (TiDB `Note 1105 Using the bindSQL: …`).
                     *self.binding_note.lock().expect("session binding note lock") =
                         Some(binding.display_bind_sql.clone());
+                    *self
+                        .binding_ignore_plan_cache
+                        .lock()
+                        .expect("session binding ignore plan cache lock") = binding
+                        .bind_sql
+                        .to_ascii_uppercase()
+                        .contains("IGNORE_PLAN_CACHE");
                     // A binding may carry its own `SET_VAR` hint (`… using select
                     // /*+ SET_VAR(group_concat_max_len = 4) */ …`); TiDB applies it
                     // as part of the replaced statement.
@@ -15875,6 +17062,61 @@ mod cte_limit_tests {
                 "tidb_batch_pending_tiflash_count".to_string(),
                 "6".to_string()
             )]
+        );
+    }
+}
+
+#[cfg(test)]
+mod prepared_cte_warn_tests {
+    use super::*;
+
+    #[test]
+    fn exists_recursive_cte_warns() {
+        let sql = "SELECT * FROM t1 dt WHERE EXISTS(WITH RECURSIVE qn AS (SELECT a*? AS b UNION ALL SELECT b+? FROM qn WHERE b=?) SELECT * FROM qn WHERE b=a)";
+        let warnings = prepared_plan_cache_skip_warnings_sql(sql, "executor__explainfor");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].1.contains(".qn"), "{}", warnings[0].1);
+    }
+
+    #[test]
+    fn top_level_recursive_cte_warns() {
+        let sql = "with recursive c(p) as (select ?), cte(a, b) as (select 1, 1 union select a+?, 1 from cte, c where a < ?)  select * from cte order by 1, 2";
+        let warnings = prepared_plan_cache_skip_warnings_sql(sql, "executor__explainfor");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].1.contains(".cte"), "{}", warnings[0].1);
+    }
+}
+
+#[cfg(test)]
+mod view4_nested_derived_tests {
+    use super::*;
+
+    #[test]
+    fn nested_derived_view_selects() {
+        let session = Session::new();
+        session.execute_stmt("drop database if exists v4t").ok();
+        session.execute_stmt("create database v4t").unwrap();
+        session.execute_stmt("use v4t").unwrap();
+        session
+            .execute_stmt("create table view_t (a int,b int)")
+            .unwrap();
+        session
+            .execute_stmt("insert into view_t values(1,2)")
+            .unwrap();
+        session
+            .execute_stmt(
+                "create view view4 as select * from (select * from (select * from view_t) tb1) tb",
+            )
+            .unwrap();
+        let result = session
+            .execute_stmt("select * from view4")
+            .expect("select view4");
+        assert_eq!(result.rows.len(), 1, "rows={:?}", result.rows);
+        let show = session.execute_stmt("show create view view4").unwrap();
+        let create = &show.display_rows()[0][1];
+        assert!(
+            create.contains("view_t") && create.contains("tb1"),
+            "nested derived lost: {create}"
         );
     }
 }

@@ -54,6 +54,10 @@ pub struct IndexLookUpExecutor {
     merge_order: bool,
     /// Project TiDB's `_tidb_rowid` (the heap table handle) as an extra column.
     with_rowid: bool,
+    /// Cap how many index keys the Build side collects before the table probe
+    /// (`LIMIT` absorbed into IndexLookUp push-down: fetch `offset+count`).
+    /// The root `Limit` still applies the original offset/count on the result.
+    index_fetch_limit: Option<u64>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -91,10 +95,17 @@ impl IndexLookUpExecutor {
             keep_order,
             merge_order: false,
             with_rowid,
+            index_fetch_limit: None,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
         }
+    }
+
+    /// Cap the index-side scan to `fetch` keys (TiDB LocalIndexLookUp Limit).
+    pub fn with_index_fetch_limit(mut self, fetch: Option<u64>) -> Self {
+        self.index_fetch_limit = fetch;
+        self
     }
 
     /// True when the current transaction has buffered writes under any of the
@@ -126,6 +137,7 @@ impl Executor for IndexLookUpExecutor {
                 format!("Table '{schema}.{name}' doesn't exist"),
             )
         })?;
+        sealdb_expression::note_binary_columns_from_table(&info);
         let index = info
             .indices
             .iter()
@@ -169,6 +181,9 @@ impl Executor for IndexLookUpExecutor {
         // side scanned an expression index. Index-only reads keep the
         // expression order (`SELECT a+1` over `KEY ((a+1))` yields 0,1,2…)
         // because they never probe the table.
+        // Absorbed Limit still batches the Probe (TiDB TableRowIDScan →
+        // handle order). Residual Selection is applied while collecting
+        // handles so the fetch cap counts only matching rows.
         let probe_batched = !index_only && !self.keep_order && !self.txn_has_writes(&physical);
         // A GLOBAL expression index read spans the partitions, so its keys are
         // stored in one subtree per partition: the scan yields them partition
@@ -211,7 +226,16 @@ impl Executor for IndexLookUpExecutor {
                 let mut rows = Vec::new();
                 let mut keyed: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
                 let mut pending: Vec<(i64, i64)> = Vec::new();
-                for physical_id in physical {
+                let mut fetched = 0u64;
+                let fetch_cap = self.index_fetch_limit;
+                // Unordered multi-partition LocalIndexLookUp: TiDB runs a
+                // per-region cop task (handle order within each partition),
+                // then concatenates partitions in id order before the root
+                // Limit. Cap per partition so early index-order stop across
+                // partitions cannot reshuffle the first N handles.
+                let per_partition_cap = probe_batched && physical.len() > 1;
+                'scan: for physical_id in physical {
+                    let mut part_fetched = 0u64;
                     for access in &self.access {
                         let (start, end) = scan_bounds(physical_id, index.id, access);
                         if start.as_bytes() >= end.as_slice() {
@@ -222,6 +246,13 @@ impl Executor for IndexLookUpExecutor {
                             let pairs =
                                 txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
                             for (key, value) in pairs {
+                                if per_partition_cap {
+                                    if fetch_cap.is_some_and(|cap| part_fetched >= cap) {
+                                        continue 'scan;
+                                    }
+                                } else if fetch_cap.is_some_and(|cap| fetched >= cap) {
+                                    break 'scan;
+                                }
                                 let handle = index_handle(&index, &key, &value)?;
                                 if self.covering {
                                     let mut row = covering_row(&info, &index, &key, handle)?;
@@ -252,10 +283,50 @@ impl Executor for IndexLookUpExecutor {
                                     } else {
                                         rows.push(row);
                                     }
+                                    fetched = fetched.saturating_add(1);
+                                    part_fetched = part_fetched.saturating_add(1);
+                                    continue;
+                                }
+                                // Absorbed Limit + residual Selection: probe to
+                                // test the filter before counting toward the cap.
+                                if fetch_cap.is_some()
+                                    && let Some(filter) = self.pushed.as_ref()
+                                {
+                                    let row_key = encode_row_key_with_handle(physical_id, handle);
+                                    let Some(raw) =
+                                        txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?
+                                    else {
+                                        continue;
+                                    };
+                                    let row = decode_lookup_row(&info, &raw, expose_rowid, handle);
+                                    let schema: Vec<String> = info
+                                        .columns
+                                        .iter()
+                                        .map(|c| c.name.o().to_string())
+                                        .collect();
+                                    let filtered =
+                                        filter_rows(vec![row], &schema, Some(filter), Some(&info))?;
+                                    if filtered.is_empty() {
+                                        continue;
+                                    }
+                                    if probe_batched {
+                                        pending.push((physical_id, handle));
+                                    } else if merge_order {
+                                        keyed.push((
+                                            index_sort_key(&key),
+                                            filtered.into_iter().next().unwrap(),
+                                        ));
+                                    } else {
+                                        rows.push(filtered.into_iter().next().unwrap());
+                                    }
+                                    fetched = fetched.saturating_add(1);
+                                    part_fetched = part_fetched.saturating_add(1);
                                     continue;
                                 }
                                 if probe_batched {
                                     pending.push((physical_id, handle));
+                                    fetched = fetched.saturating_add(1);
+                                    part_fetched = part_fetched.saturating_add(1);
                                     continue;
                                 }
                                 let row_key = encode_row_key_with_handle(physical_id, handle);
@@ -268,6 +339,8 @@ impl Executor for IndexLookUpExecutor {
                                     } else {
                                         rows.push(row);
                                     }
+                                    fetched = fetched.saturating_add(1);
+                                    part_fetched = part_fetched.saturating_add(1);
                                 }
                             }
                         }
@@ -282,6 +355,11 @@ impl Executor for IndexLookUpExecutor {
                 if probe_batched {
                     // Key order is the storage order: table id, then the row handle.
                     pending.sort_unstable();
+                    if per_partition_cap {
+                        if let Some(cap) = fetch_cap {
+                            pending.truncate(cap as usize);
+                        }
+                    }
                     for (physical_id, handle) in pending {
                         let row_key = encode_row_key_with_handle(physical_id, handle);
                         let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;

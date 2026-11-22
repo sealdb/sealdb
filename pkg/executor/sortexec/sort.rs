@@ -6,9 +6,42 @@ use sealdb_expression::eval_expr_with_row;
 use sealdb_parser::ast::ByItem;
 use sealdb_types::Datum;
 use sealdb_util::chunk::{Chunk, DataInDiskByRows, mem_row_limit};
+use sealdb_util::collate::CollateMode;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Per-`ORDER BY` key collations (column FieldType), scoped around a sort.
+    static ORDER_COLLATIONS: RefCell<Vec<CollateMode>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with per-key ORDER BY collations visible to `compare_rows`.
+pub fn with_order_collations<T>(modes: Vec<CollateMode>, f: impl FnOnce() -> T) -> T {
+    ORDER_COLLATIONS.with(|cell| {
+        let prev = cell.replace(modes);
+        let out = f();
+        *cell.borrow_mut() = prev;
+        out
+    })
+}
+
+/// Snapshot of the current per-key ORDER BY collations (for worker threads).
+pub fn order_collations_snapshot() -> Vec<CollateMode> {
+    ORDER_COLLATIONS.with(|cell| cell.borrow().clone())
+}
+
+fn order_key_collation(idx: usize) -> CollateMode {
+    ORDER_COLLATIONS.with(|cell| {
+        cell.borrow()
+            .get(idx)
+            .copied()
+            .unwrap_or_else(sealdb_expression::collation_mode)
+    })
+}
 
 pub struct SortExec {
     by: Vec<ByItem>,
+    /// Collation of each `ORDER BY` key (column collation when applicable).
+    collations: Vec<CollateMode>,
     child: Box<dyn Executor>,
     mem_limit: usize,
     spilled: bool,
@@ -17,12 +50,26 @@ pub struct SortExec {
 
 impl SortExec {
     pub fn new(by: Vec<ByItem>, child: Box<dyn Executor>) -> Self {
-        Self::with_mem_limit(by, child, mem_row_limit())
+        Self::with_collations(by, Vec::new(), child)
     }
 
-    pub fn with_mem_limit(by: Vec<ByItem>, child: Box<dyn Executor>, mem_limit: usize) -> Self {
+    pub fn with_collations(
+        by: Vec<ByItem>,
+        collations: Vec<CollateMode>,
+        child: Box<dyn Executor>,
+    ) -> Self {
+        Self::with_mem_limit(by, collations, child, mem_row_limit())
+    }
+
+    pub fn with_mem_limit(
+        by: Vec<ByItem>,
+        collations: Vec<CollateMode>,
+        child: Box<dyn Executor>,
+        mem_limit: usize,
+    ) -> Self {
         Self {
             by,
+            collations,
             child,
             mem_limit,
             spilled: false,
@@ -48,31 +95,34 @@ impl Executor for SortExec {
         }
         self.emitted = true;
         let schema = self.child.schema().to_vec();
-        let mut buf = Vec::new();
-        let mut runs: Vec<DataInDiskByRows> = Vec::new();
-        while let Some(chunk) = self.child.next()? {
-            for i in 0..chunk.num_rows() {
-                buf.push(chunk.get_row(i));
-                if buf.len() >= self.mem_limit {
-                    runs.push(spill_sorted_run(&mut buf, &self.by, &schema)?);
-                    self.spilled = true;
+        let collations = self.collations.clone();
+        with_order_collations(collations, || {
+            let mut buf = Vec::new();
+            let mut runs: Vec<DataInDiskByRows> = Vec::new();
+            while let Some(chunk) = self.child.next()? {
+                for i in 0..chunk.num_rows() {
+                    buf.push(chunk.get_row(i));
+                    if buf.len() >= self.mem_limit {
+                        runs.push(spill_sorted_run(&mut buf, &self.by, &schema)?);
+                        self.spilled = true;
+                    }
                 }
             }
-        }
-        let rows = if runs.is_empty() {
-            parallel_sort_rows(&mut buf, &self.by, &schema)?;
-            buf
-        } else {
-            if !buf.is_empty() {
-                runs.push(spill_sorted_run(&mut buf, &self.by, &schema)?);
+            let rows = if runs.is_empty() {
+                parallel_sort_rows(&mut buf, &self.by, &schema)?;
+                buf
+            } else {
+                if !buf.is_empty() {
+                    runs.push(spill_sorted_run(&mut buf, &self.by, &schema)?);
+                }
+                merge_runs(&mut runs, &self.by, &schema)?
+            };
+            let mut out = Chunk::new(schema.len(), rows.len());
+            for row in rows {
+                out.append_row(row);
             }
-            merge_runs(&mut runs, &self.by, &schema)?
-        };
-        let mut out = Chunk::new(schema.len(), rows.len());
-        for row in rows {
-            out.append_row(row);
-        }
-        Ok(Some(out))
+            Ok(Some(out))
+        })
     }
 
     fn close(&mut self) -> Result<()> {
@@ -125,12 +175,12 @@ pub(crate) fn compare_rows(
     by: &[ByItem],
     schema: &[String],
 ) -> std::cmp::Ordering {
-    for item in by {
+    for (idx, item) in by.iter().enumerate() {
         let lv = eval_order_key(&item.expr, schema, left);
         let rv = eval_order_key(&item.expr, schema, right);
         let ord = if matches!((&lv, &rv), (Datum::Bytes(_), Datum::Bytes(_))) {
             sealdb_util::collate::compare_bytes(
-                sealdb_expression::collation_mode(),
+                order_key_collation(idx),
                 &lv.as_bytes(),
                 &rv.as_bytes(),
             )
@@ -185,13 +235,14 @@ mod tests {
         let schema = vec!["id".to_string(), "name".to_string()];
         let mut mem = SortExec::with_mem_limit(
             by_id(),
+            Vec::new(),
             Box::new(VecExec::new(schema.clone(), rows.clone())),
             usize::MAX,
         );
         mem.open().unwrap();
         let mem_rows = mem.next().unwrap().unwrap();
         let mut spilled =
-            SortExec::with_mem_limit(by_id(), Box::new(VecExec::new(schema, rows)), 1);
+            SortExec::with_mem_limit(by_id(), Vec::new(), Box::new(VecExec::new(schema, rows)), 1);
         spilled.open().unwrap();
         let spilled_rows = spilled.next().unwrap().unwrap();
         assert!(spilled.spilled());

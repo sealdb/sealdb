@@ -57,6 +57,12 @@ fn is_volatile_func(name: &str) -> bool {
             // own assignment, so folding would double the side effect.
             | "__sealdb_assign"
             | "__sealdb_getvar"
+            // `expr COLLATE name`: the wrapper is collation metadata that
+            // pruning, statistics and the coprocessor filter read; folding it
+            // into a plain literal would silently fall back to the column's
+            // collation.
+            | "__collate"
+            | "__convert_using"
     )
 }
 
@@ -181,14 +187,21 @@ fn fold_control(func: &sealdb_parser::ast::expressions::FuncCallExpr) -> Option<
 /// Bottom-up constant folding. Returns `None` when nothing changed so callers
 /// can skip cloning the containing plan node.
 pub fn fold_constants(expr: &ExprNode) -> Option<ExprNode> {
+    fold_constants_opts(expr, true)
+}
+
+/// Like [`fold_constants`], but when `collapse_conflicts` is false keeps
+/// contradictory equalities (`a = 1 AND a = 2`) intact so memtable extractors
+/// can turn them into `skip_request` / `skip_inspection`.
+fn fold_constants_opts(expr: &ExprNode, collapse_conflicts: bool) -> Option<ExprNode> {
     let mut changed = false;
-    let rebuilt = fold_children(expr, &mut changed);
+    let rebuilt = fold_children(expr, &mut changed, collapse_conflicts);
     // `ifnull(NULL, x)` / `if(<const>, x, y)` / `coalesce`: TiDB replaces the
     // function with the decided branch even when that branch is not constant.
     if let ExprNode::Func(f) = &rebuilt
         && let Some(branch) = fold_control(f)
     {
-        return Some(fold_constants(&branch).unwrap_or(branch));
+        return Some(fold_constants_opts(&branch, collapse_conflicts).unwrap_or(branch));
     }
     if !changed && !is_constant(&rebuilt) {
         return None;
@@ -199,9 +212,9 @@ pub fn fold_constants(expr: &ExprNode) -> Option<ExprNode> {
     changed.then_some(rebuilt)
 }
 
-fn fold_children(expr: &ExprNode, changed: &mut bool) -> ExprNode {
-    fn fold(e: &ExprNode, changed: &mut bool) -> ExprNode {
-        match fold_constants(e) {
+fn fold_children(expr: &ExprNode, changed: &mut bool, collapse_conflicts: bool) -> ExprNode {
+    fn fold(e: &ExprNode, changed: &mut bool, collapse_conflicts: bool) -> ExprNode {
+        match fold_constants_opts(e, collapse_conflicts) {
             Some(folded) => {
                 *changed = true;
                 folded
@@ -211,55 +224,139 @@ fn fold_children(expr: &ExprNode, changed: &mut bool) -> ExprNode {
     }
     use sealdb_parser::ast::expressions as ast;
     match expr {
-        ExprNode::Binary(b) => ExprNode::Binary(ast::BinaryOpExpr {
-            left: Box::new(fold(&b.left, changed)),
-            op: b.op,
-            right: Box::new(fold(&b.right, changed)),
-            single_cnf_item: b.single_cnf_item,
-        }),
+        ExprNode::Binary(b) => {
+            let left = fold(&b.left, changed, collapse_conflicts);
+            let right = fold(&b.right, changed, collapse_conflicts);
+            // Short-circuit boolean folds TiDB applies even with a non-constant
+            // sibling: `x AND false` → `0`, `x AND NULL` → `NULL`, `x OR true` → `1`.
+            if b.op == sealdb_parser::opcode::Op::LogicAnd {
+                for side in [&left, &right] {
+                    if let ExprNode::Value(v) = side {
+                        if v.datum.is_null() {
+                            *changed = true;
+                            return ExprNode::Value(ValueExpr { datum: Datum::Null });
+                        }
+                        if truthy(&v.datum) == Some(false) {
+                            *changed = true;
+                            return ExprNode::Value(ValueExpr {
+                                datum: Datum::I64(0),
+                            });
+                        }
+                    }
+                }
+            }
+            if b.op == sealdb_parser::opcode::Op::LogicOr {
+                for side in [&left, &right] {
+                    if let ExprNode::Value(v) = side {
+                        if !v.datum.is_null() && truthy(&v.datum) == Some(true) {
+                            *changed = true;
+                            return ExprNode::Value(ValueExpr {
+                                datum: Datum::I64(1),
+                            });
+                        }
+                    }
+                }
+            }
+            // `col = NULL` / `col <=> NULL` with a non-null-safe `=`: SQL
+            // UNKNOWN, which TiDB folds to a zero-row plan under WHERE.
+            if matches!(
+                b.op,
+                sealdb_parser::opcode::Op::Eq
+                    | sealdb_parser::opcode::Op::Ne
+                    | sealdb_parser::opcode::Op::Lt
+                    | sealdb_parser::opcode::Op::Le
+                    | sealdb_parser::opcode::Op::Gt
+                    | sealdb_parser::opcode::Op::Ge
+            ) {
+                let null_side = matches!(&left, ExprNode::Value(v) if v.datum.is_null())
+                    || matches!(&right, ExprNode::Value(v) if v.datum.is_null());
+                if null_side {
+                    *changed = true;
+                    return ExprNode::Value(ValueExpr { datum: Datum::Null });
+                }
+            }
+            let rebuilt = ExprNode::Binary(ast::BinaryOpExpr {
+                left: Box::new(left),
+                op: b.op,
+                right: Box::new(right),
+                single_cnf_item: b.single_cnf_item,
+            });
+            // Nested `a = 2 AND a = 3` (e.g. inside an OR arm) is unsatisfiable:
+            // fold it to `0` so TiDB shapes like `or(eq(a, 1), 0)` appear.
+            // Memtable extractors need the conflict intact → skip when asked.
+            if collapse_conflicts
+                && b.op == sealdb_parser::opcode::Op::LogicAnd
+                && has_conflicting_equalities(&rebuilt)
+            {
+                *changed = true;
+                return ExprNode::Value(ValueExpr {
+                    datum: Datum::I64(0),
+                });
+            }
+            rebuilt
+        }
         ExprNode::Unary(u) => ExprNode::Unary(ast::UnaryOpExpr {
             op: u.op,
-            expr: Box::new(fold(&u.expr, changed)),
+            expr: Box::new(fold(&u.expr, changed, collapse_conflicts)),
         }),
         ExprNode::Func(f) => ExprNode::Func(ast::FuncCallExpr {
             name: f.name.clone(),
-            args: f.args.iter().map(|a| fold(a, changed)).collect(),
+            args: f
+                .args
+                .iter()
+                .map(|a| fold(a, changed, collapse_conflicts))
+                .collect(),
             distinct: f.distinct,
         }),
         ExprNode::Cast(c) => ExprNode::Cast(ast::FuncCastExpr {
-            expr: Box::new(fold(&c.expr, changed)),
+            expr: Box::new(fold(&c.expr, changed, collapse_conflicts)),
             target: c.target.clone(),
             json: c.json,
         }),
         ExprNode::InList(i) => ExprNode::InList(ast::InListExpr {
-            expr: Box::new(fold(&i.expr, changed)),
+            expr: Box::new(fold(&i.expr, changed, collapse_conflicts)),
             not: i.not,
-            list: i.list.iter().map(|a| fold(a, changed)).collect(),
+            list: i
+                .list
+                .iter()
+                .map(|a| fold(a, changed, collapse_conflicts))
+                .collect(),
         }),
         ExprNode::Between(b) => ExprNode::Between(ast::BetweenExpr {
-            expr: Box::new(fold(&b.expr, changed)),
+            expr: Box::new(fold(&b.expr, changed, collapse_conflicts)),
             not: b.not,
-            low: Box::new(fold(&b.low, changed)),
-            high: Box::new(fold(&b.high, changed)),
+            low: Box::new(fold(&b.low, changed, collapse_conflicts)),
+            high: Box::new(fold(&b.high, changed, collapse_conflicts)),
         }),
         ExprNode::Like(l) => ExprNode::Like(ast::PatternLikeExpr {
-            expr: Box::new(fold(&l.expr, changed)),
+            expr: Box::new(fold(&l.expr, changed, collapse_conflicts)),
             not: l.not,
-            pattern: Box::new(fold(&l.pattern, changed)),
+            pattern: Box::new(fold(&l.pattern, changed, collapse_conflicts)),
             ci: l.ci,
         }),
         ExprNode::IsNull(i) => ExprNode::IsNull(ast::IsNullExpr {
-            expr: Box::new(fold(&i.expr, changed)),
+            expr: Box::new(fold(&i.expr, changed, collapse_conflicts)),
             not: i.not,
         }),
         ExprNode::Case(c) => ExprNode::Case(ast::CaseExpr {
-            operand: c.operand.as_ref().map(|e| Box::new(fold(e, changed))),
+            operand: c
+                .operand
+                .as_ref()
+                .map(|e| Box::new(fold(e, changed, collapse_conflicts))),
             when_then: c
                 .when_then
                 .iter()
-                .map(|(w, t)| (fold(w, changed), fold(t, changed)))
+                .map(|(w, t)| {
+                    (
+                        fold(w, changed, collapse_conflicts),
+                        fold(t, changed, collapse_conflicts),
+                    )
+                })
                 .collect(),
-            else_expr: c.else_expr.as_ref().map(|e| Box::new(fold(e, changed))),
+            else_expr: c
+                .else_expr
+                .as_ref()
+                .map(|e| Box::new(fold(e, changed, collapse_conflicts))),
         }),
         other => other.clone(),
     }
@@ -376,6 +473,26 @@ fn qualified_column_const(expr: &ExprNode) -> Option<(Option<String>, String, Da
 pub fn fold_constant_select(select: &SelectStmt) -> Option<SelectStmt> {
     let mut changed = false;
 
+    // Inspection / cluster memtable extractors absorb contradictory equalities
+    // into `skip_inspection` / `skip_request` on MemTableScan — do not collapse
+    // those conflicts to `0` during constant fold.
+    let keep_conflict_for_extractor = select.from.as_ref().is_some_and(|from| {
+        let name = from.resolve_name().to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            "inspection_result"
+                | "inspection_rules"
+                | "inspection_summary"
+                | "statistics"
+                | "tables"
+                | "key_column_usage"
+                | "referential_constraints"
+                | "columns"
+                | "schemata"
+        )
+    });
+    let collapse_conflicts = !keep_conflict_for_extractor;
+
     let fields = select
         .fields
         .iter()
@@ -391,36 +508,79 @@ pub fn fold_constant_select(select: &SelectStmt) -> Option<SelectStmt> {
         .collect::<Vec<_>>();
 
     let fold_filter = |filter: &Option<ExprNode>, changed: &mut bool| match filter {
-        Some(expr) => match fold_constants(expr) {
-            Some(folded) => {
-                *changed = true;
-                // `WHERE <true>` is not a filter at all; a false/`NULL`
-                // predicate stays so the planner can prune to `TableDual`.
-                match &folded {
-                    ExprNode::Value(v) if !v.datum.is_null() && truthy(&v.datum) == Some(true) => {
-                        None
+        Some(expr) => {
+            let (folded, did_fold) = match fold_constants_opts(expr, collapse_conflicts) {
+                Some(folded) => (folded, true),
+                None => (expr.clone(), false),
+            };
+            // `WHERE <true>` is not a filter at all (including a constant `1`
+            // already produced by an earlier rewrite); a false/`NULL`
+            // predicate stays so the planner can prune to `TableDual`.
+            match &folded {
+                ExprNode::Value(v) if !v.datum.is_null() && truthy(&v.datum) == Some(true) => {
+                    *changed = true;
+                    None
+                }
+                _ => {
+                    if did_fold {
+                        *changed = true;
                     }
-                    _ => Some(folded),
+                    Some(folded)
                 }
             }
-            None => Some(expr.clone()),
-        },
+        }
         None => None,
     };
     let selection = fold_filter(&select.selection, &mut changed);
     // TiDB `PredicateSimplification`: conflicting constant equalities on one
     // column (`a = 1 AND a = 2`) are unsatisfiable, so the WHERE folds to
-    // `0` and the plan is a zero-row `TableDual`.
+    // `0` and the plan is a zero-row `TableDual` (unless a memtable extractor
+    // needs the conflict for `skip_request` / `skip_inspection`).
     let selection = match selection {
-        Some(expr) if has_conflicting_equalities(&expr) => {
+        Some(expr) if collapse_conflicts && has_conflicting_equalities(&expr) => {
             changed = true;
             Some(ExprNode::Value(ValueExpr {
                 datum: Datum::I64(0),
             }))
         }
+        Some(expr) => {
+            // Deduplicate identical CNF conjuncts (`a = 1 AND a = 1` → `a = 1`).
+            let mut seen = Vec::new();
+            let mut uniq = Vec::new();
+            for conjunct in expr.split_cnf_all() {
+                let key = format!("{conjunct:?}");
+                if seen.iter().any(|s: &String| s == &key) {
+                    changed = true;
+                    continue;
+                }
+                seen.push(key);
+                uniq.push(conjunct);
+            }
+            if uniq.len() != expr.split_cnf_all().len() {
+                ExprNode::compose_cnf(uniq)
+            } else {
+                Some(expr)
+            }
+        }
         other => other,
     };
     let having = fold_filter(&select.having, &mut changed);
+
+    // Fold join ON predicates too (`ON t1.a = 1 OR (t1.a = 2 AND t1.a = 3)`
+    // → `or(eq(t1.a, 1), 0)`), matching TiDB's FoldConstant over the join.
+    let joins: Vec<_> = select
+        .joins
+        .iter()
+        .map(|join| match fold_constants(&join.on) {
+            Some(on) => {
+                changed = true;
+                let mut out = join.clone();
+                out.on = on;
+                out
+            }
+            None => join.clone(),
+        })
+        .collect();
 
     if !changed {
         return None;
@@ -429,6 +589,7 @@ pub fn fold_constant_select(select: &SelectStmt) -> Option<SelectStmt> {
     out.fields = fields;
     out.selection = selection;
     out.having = having;
+    out.joins = joins;
     Some(out)
 }
 

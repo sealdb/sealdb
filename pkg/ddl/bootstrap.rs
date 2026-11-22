@@ -143,6 +143,12 @@ const SYSTEM_TABLES: &[&str] = &[
         PRIMARY KEY (Host, DB, User, Table_name, Column_name),\n\
         KEY i_user (User)\n\
     )",
+    // TiDB `mysql.tidb`: cluster-level key/value settings (GC safe point, …).
+    "CREATE TABLE tidb (\n\
+        VARIABLE_NAME VARCHAR(64) NOT NULL PRIMARY KEY,\n\
+        VARIABLE_VALUE VARCHAR(1024) NOT NULL,\n\
+        COMMENT VARCHAR(1024)\n\
+    )",
     // TiDB `mysql.expr_pushdown_blacklist`: expressions kept out of coprocessors.
     "CREATE TABLE expr_pushdown_blacklist (\n\
         name CHAR(100) NOT NULL,\n\

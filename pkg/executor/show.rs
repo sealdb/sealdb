@@ -748,6 +748,11 @@ fn render_create_table(info: &TableInfo) -> String {
             line
         })
         .collect();
+    // TiDB emits the PRIMARY KEY at its storage position: a clustered primary
+    // key is index 0 and comes first, a NONCLUSTERED one is a secondary index
+    // created after the declared keys and therefore prints last.
+    let mut key_lines: Vec<String> = Vec::new();
+    let mut primary_line: Option<String> = None;
     for idx in &info.indices {
         let key = if idx.primary {
             "PRIMARY KEY"
@@ -793,7 +798,7 @@ fn render_create_table(info: &TableInfo) -> String {
             })
             .collect::<Vec<_>>()
             .join(",");
-        cols.push(if idx.primary {
+        if idx.primary {
             // TiDB prints the PRIMARY KEY without an index name and annotates
             // how the key is stored (`/*T![clustered_index] … */`).
             let stored = if info.pk_is_clustered() {
@@ -801,15 +806,28 @@ fn render_create_table(info: &TableInfo) -> String {
             } else {
                 "NONCLUSTERED"
             };
-            format!("  PRIMARY KEY ({parts}) /*T![clustered_index] {stored} */")
-        } else {
-            let predicate = idx
-                .where_clause
-                .as_ref()
-                .map(|text| format!(" WHERE {text}"))
-                .unwrap_or_default();
-            format!("  {key} `{}` ({parts}){predicate}", idx.name.o())
-        });
+            primary_line = Some(format!(
+                "  PRIMARY KEY ({parts}) /*T![clustered_index] {stored} */"
+            ));
+            continue;
+        }
+        let predicate = idx
+            .where_clause
+            .as_ref()
+            .map(|text| format!(" WHERE {text}"))
+            .unwrap_or_default();
+        key_lines.push(format!("  {key} `{}` ({parts}){predicate}", idx.name.o()));
+    }
+    if info.pk_is_clustered() {
+        if let Some(line) = primary_line.take() {
+            cols.push(line);
+        }
+        cols.extend(key_lines);
+    } else {
+        cols.extend(key_lines);
+        if let Some(line) = primary_line.take() {
+            cols.push(line);
+        }
     }
     // FOREIGN KEY constraints follow the keys (`CONSTRAINT `fk` FOREIGN KEY …`).
     for fk in &info.foreign_keys {
@@ -880,26 +898,64 @@ fn render_create_table(info: &TableInfo) -> String {
             ttl.expr, ttl.job_interval
         ));
     }
+    if let Some(policy) = &info.placement_policy {
+        out.push_str(&format!(" /*T![placement] PLACEMENT POLICY=`{policy}` */"));
+    }
     if let Some(part) = &info.partition {
         out.push('\n');
         out.push_str(&render_partition_clause(part));
     }
+    // `ANSI_QUOTES`: TiDB quotes every identifier with `"` instead of a
+    // backtick in `SHOW CREATE TABLE`.
+    if sealdb_parser::ansi_quotes() {
+        out = out.replace('`', "\"");
+    }
+    // TiDB keeps backticks around partition-expression function arguments even
+    // under `ANSI_QUOTES` (`UNIX_TIMESTAMP(`c`)`); those were marked with a
+    // sentinel so they survive the blanket identifier replacement.
+    out = out.replace('\u{1}', "`");
     out
 }
 
-/// HASH/KEY partition key text: a plain column is printed backticked
-/// (`HASH (`a`)`), an expression is printed as stored.
+/// HASH/KEY/RANGE/LIST partition key text: a plain column is printed
+/// backticked (`HASH (`a`)`), a function call renders its name upper-case with
+/// backticked column arguments (`RANGE (YEAR(`hired`))`).
 fn partition_key_expr(expr: &str) -> String {
     let trimmed = expr.trim();
-    if !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
-    {
-        format!("`{trimmed}`")
-    } else {
-        trimmed.to_string()
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+    };
+    if plain(trimmed) {
+        return format!("`{trimmed}`");
     }
+    // `KEY (c1, c2, …)`: a comma list of plain columns.
+    let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    if parts.len() > 1 && parts.iter().all(|p| plain(p)) {
+        return parts
+            .iter()
+            .map(|p| format!("`{p}`"))
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    if let Some((name, args)) = trimmed.split_once('(')
+        && trimmed.ends_with(')')
+        && plain(name)
+    {
+        let inner = &args[..args.len() - 1];
+        let rendered = if inner.split(',').all(|a| plain(a.trim())) {
+            inner
+                .split(',')
+                .map(|a| format!("\u{1}{}\u{1}", a.trim()))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            inner.to_string()
+        };
+        return format!("{}({rendered})", name.to_uppercase());
+    }
+    trimmed.to_string()
 }
 
 fn render_partition_clause(part: &sealdb_meta::PartitionInfo) -> String {
@@ -919,9 +975,9 @@ fn render_partition_clause(part: &sealdb_meta::PartitionInfo) -> String {
         format!("{keyword}({cols})")
     } else {
         match part.tp {
-            PartitionType::Range => format!("RANGE (`{}`)", part.expr),
+            PartitionType::Range => format!("RANGE ({})", partition_key_expr(&part.expr)),
             PartitionType::Hash => format!("HASH ({})", partition_key_expr(&part.expr)),
-            PartitionType::List => format!("LIST (`{}`)", part.expr),
+            PartitionType::List => format!("LIST ({})", partition_key_expr(&part.expr)),
             PartitionType::Key => format!("KEY ({})", partition_key_expr(&part.expr)),
         }
     };
@@ -933,24 +989,65 @@ fn render_partition_clause(part: &sealdb_meta::PartitionInfo) -> String {
     }
     let mut defs = Vec::new();
     for def in &part.definitions {
-        let bound = if !def.in_values.is_empty() {
-            let vals = def
-                .in_values
+        let mut piece = format!("PARTITION `{}`", def.name.o());
+        if matches!(part.tp, PartitionType::Hash | PartitionType::Key)
+            && def.less_than.is_empty()
+            && def.in_values.is_empty()
+            && !def.list_default
+        {
+            // HASH/KEY named partitions have no VALUES clause.
+        } else if def.list_default
+            && def.in_values.len() == 1
+            && matches!(def.in_values[0], sealdb_meta::ListInEntry::Default)
+        {
+            piece.push_str(" DEFAULT");
+        } else if !def.in_values.is_empty() {
+            piece.push_str(&format!(
+                " VALUES IN ({})",
+                format_list_in_values(&def.in_values, part.range_columns)
+            ));
+        } else {
+            let lt = def.less_than.to_vec().join(",");
+            piece.push_str(&format!(" VALUES LESS THAN ({lt})"));
+        }
+        if !def.comment.is_empty() {
+            piece.push_str(&format!(" COMMENT '{}'", def.comment.replace('\'', "''")));
+        }
+        if let Some(policy) = &def.placement_policy {
+            piece.push_str(&format!(" /*T![placement] PLACEMENT POLICY=`{policy}` */"));
+        }
+        defs.push(piece);
+    }
+    format!("PARTITION BY {key}\n({})", defs.join(",\n "))
+}
+
+fn format_list_in_values(entries: &[sealdb_meta::ListInEntry], list_columns: bool) -> String {
+    entries
+        .iter()
+        .map(|e| format_list_in_entry(e, list_columns))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_list_in_entry(entry: &sealdb_meta::ListInEntry, list_columns: bool) -> String {
+    match entry {
+        sealdb_meta::ListInEntry::Default => "DEFAULT".to_string(),
+        sealdb_meta::ListInEntry::Row(row) => {
+            let multi = list_columns && row.len() > 1;
+            let inner = row
                 .iter()
-                .map(|v| match v {
-                    Some(v) => v.to_string(),
-                    None => "NULL".to_string(),
+                .map(|lit| match lit {
+                    sealdb_meta::ListLiteral::Null => "NULL".to_string(),
+                    sealdb_meta::ListLiteral::Number(n) => n.clone(),
+                    sealdb_meta::ListLiteral::String(s) => {
+                        format!("'{}'", sealdb_meta::escape_mysql_string(s))
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            format!("VALUES IN ({vals})")
-        } else {
-            let lt = def.less_than.to_vec().join(",");
-            format!("VALUES LESS THAN ({lt})")
-        };
-        defs.push(format!("PARTITION `{}` {bound}", def.name.o()));
+            if multi { format!("({inner})") } else { inner }
+        }
     }
-    format!("PARTITION BY {key}\n({})", defs.join(",\n "))
 }
 
 fn render_create_view(info: &TableInfo, view: &sealdb_meta::ViewInfo) -> String {

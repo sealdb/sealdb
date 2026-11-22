@@ -89,6 +89,7 @@ fn column_from_json(col: &Value) -> Result<ColumnStats> {
         // only the row-count and histogram matter to the planner.
         tot_col_size: 0,
         part_tot_col_size: Vec::new(),
+        ci: false,
     })
 }
 

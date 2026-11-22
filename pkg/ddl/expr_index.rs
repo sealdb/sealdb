@@ -42,11 +42,15 @@ pub(crate) fn resolve_index_parts(
     let mut seen: Vec<String> = Vec::with_capacity(parts.len());
     // TiDB `buildIndexInfo`: an expression index cannot be auto-analyzed (the
     // column stats do not cover the expression), so the DDL asks for a manual
-    // ANALYZE.
-    if parts
+    // ANALYZE. Multi-valued (`CAST(… AS … ARRAY)`) indexes skip this warning.
+    let has_expr = parts
         .iter()
-        .any(|part| matches!(part, IndexPart::Expression(_)))
-    {
+        .any(|part| matches!(part, IndexPart::Expression(_)));
+    let multi_valued = parts.iter().any(|part| match part {
+        IndexPart::Expression(expr) => expr.to_ascii_uppercase().contains("ARRAY"),
+        _ => false,
+    });
+    if has_expr && !multi_valued {
         sealdb_expression::note_warning(
             8265,
             format!(

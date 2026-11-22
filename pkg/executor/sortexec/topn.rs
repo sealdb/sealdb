@@ -1,18 +1,20 @@
 // TopN heap + spill (TiDB pkg/executor/sortexec/topn.go).
 // Completeness wave / not this feature: parallel TopN workers.
 use crate::internal::exec::Executor;
-use crate::sortexec::sort::compare_rows;
+use crate::sortexec::sort::{compare_rows, with_order_collations};
 use crate::sortexec::sort_spill::{merge_runs_n, spill_sorted_run};
 use sealdb_errno::Result;
 use sealdb_parser::ast::ByItem;
 use sealdb_types::Datum;
 use sealdb_util::chunk::{Chunk, DataInDiskByRows, mem_row_limit};
+use sealdb_util::collate::CollateMode;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 pub struct TopNExec {
     by: Vec<ByItem>,
+    collations: Vec<CollateMode>,
     limit: u64,
     offset: u64,
     child: Box<dyn Executor>,
@@ -23,11 +25,22 @@ pub struct TopNExec {
 
 impl TopNExec {
     pub fn new(by: Vec<ByItem>, limit: u64, offset: u64, child: Box<dyn Executor>) -> Self {
-        Self::with_mem_limit(by, limit, offset, child, mem_row_limit())
+        Self::with_collations(by, Vec::new(), limit, offset, child)
+    }
+
+    pub fn with_collations(
+        by: Vec<ByItem>,
+        collations: Vec<CollateMode>,
+        limit: u64,
+        offset: u64,
+        child: Box<dyn Executor>,
+    ) -> Self {
+        Self::with_mem_limit(by, collations, limit, offset, child, mem_row_limit())
     }
 
     pub fn with_mem_limit(
         by: Vec<ByItem>,
+        collations: Vec<CollateMode>,
         limit: u64,
         offset: u64,
         child: Box<dyn Executor>,
@@ -35,6 +48,7 @@ impl TopNExec {
     ) -> Self {
         Self {
             by,
+            collations,
             limit,
             offset,
             child,
@@ -70,22 +84,25 @@ impl Executor for TopNExec {
         }
         let schema = self.child.schema().to_vec();
         let keep = self.keep();
-        let rows = if keep <= self.mem_limit {
-            heap_topn(&mut *self.child, &self.by, &schema, keep)?
-        } else {
-            self.spilled = true;
-            spill_topn(&mut *self.child, &self.by, &schema, keep, self.mem_limit)?
-        };
-        let taken: Vec<Vec<Datum>> = rows
-            .into_iter()
-            .skip(self.offset as usize)
-            .take(self.limit as usize)
-            .collect();
-        let mut out = Chunk::new(schema.len(), taken.len());
-        for row in taken {
-            out.append_row(row);
-        }
-        Ok(Some(out))
+        let collations = self.collations.clone();
+        with_order_collations(collations, || {
+            let rows = if keep <= self.mem_limit {
+                heap_topn(&mut *self.child, &self.by, &schema, keep)?
+            } else {
+                self.spilled = true;
+                spill_topn(&mut *self.child, &self.by, &schema, keep, self.mem_limit)?
+            };
+            let taken: Vec<Vec<Datum>> = rows
+                .into_iter()
+                .skip(self.offset as usize)
+                .take(self.limit as usize)
+                .collect();
+            let mut out = Chunk::new(schema.len(), taken.len());
+            for row in taken {
+                out.append_row(row);
+            }
+            Ok(Some(out))
+        })
     }
 
     fn close(&mut self) -> Result<()> {
@@ -215,6 +232,7 @@ mod tests {
         let schema = vec!["id".to_string(), "name".to_string()];
         let mut heap = TopNExec::with_mem_limit(
             by_id(),
+            Vec::new(),
             3,
             0,
             Box::new(VecExec::new(schema.clone(), rows())),
@@ -223,8 +241,14 @@ mod tests {
         heap.open().unwrap();
         let heap_rows = heap.next().unwrap().unwrap();
         assert!(!heap.spilled());
-        let mut spilled =
-            TopNExec::with_mem_limit(by_id(), 3, 0, Box::new(VecExec::new(schema, rows())), 1);
+        let mut spilled = TopNExec::with_mem_limit(
+            by_id(),
+            Vec::new(),
+            3,
+            0,
+            Box::new(VecExec::new(schema, rows())),
+            1,
+        );
         spilled.open().unwrap();
         let spilled_rows = spilled.next().unwrap().unwrap();
         assert!(spilled.spilled());

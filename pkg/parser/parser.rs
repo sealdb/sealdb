@@ -16,6 +16,20 @@ pub fn set_high_not_precedence(on: bool) {
     HIGH_NOT_PRECEDENCE.with(|flag| flag.set(on));
 }
 
+// TiDB `ANSI_QUOTES` sql_mode: identifiers are quoted with `"` in
+// `SHOW CREATE TABLE`.
+thread_local! {
+    static ANSI_QUOTES: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_ansi_quotes(on: bool) {
+    ANSI_QUOTES.with(|flag| flag.set(on));
+}
+
+pub fn ansi_quotes() -> bool {
+    ANSI_QUOTES.with(Cell::get)
+}
+
 pub fn high_not_precedence() -> bool {
     HIGH_NOT_PRECEDENCE.with(Cell::get)
 }
@@ -1845,8 +1859,18 @@ mod tests {
             crate::ast::Statement::CreateTable(create) => {
                 let part = create.partition.expect("list partition");
                 assert_eq!(part.tp, crate::ast::PartitionType::List);
-                assert_eq!(part.defs[0].in_values, vec![Some(1), Some(2)]);
-                assert_eq!(part.defs[1].in_values, vec![Some(10)]);
+                use crate::ast::{ListInEntry, ListLiteral};
+                assert_eq!(
+                    part.defs[0].in_values,
+                    vec![
+                        ListInEntry::Row(vec![ListLiteral::Number("1".into())]),
+                        ListInEntry::Row(vec![ListLiteral::Number("2".into())]),
+                    ]
+                );
+                assert_eq!(
+                    part.defs[1].in_values,
+                    vec![ListInEntry::Row(vec![ListLiteral::Number("10".into())])]
+                );
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
@@ -1941,7 +1965,7 @@ mod tests {
             crate::ast::Statement::AlterTable(alter) => match &alter.specs[..] {
                 [
                     crate::ast::AlterTableSpec::Algorithm(_),
-                    crate::ast::AlterTableSpec::AddPartition { defs },
+                    crate::ast::AlterTableSpec::AddPartition { defs, count: _ },
                 ] => {
                     assert_eq!(defs[0].name, "p2");
                     assert_eq!(defs[0].less_than.as_deref(), Some("30"));
@@ -2309,4 +2333,3 @@ mod orig_text_timestamp {
         );
     }
 }
-

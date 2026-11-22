@@ -281,6 +281,9 @@ pub enum PhysicalPlan {
         index: String,
         index_columns: Vec<String>,
         partitions: Vec<i64>,
+        /// Partition names read by this lookup (`partition:p0` in EXPLAIN).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        partition_names: Vec<String>,
         /// TiDB `partition:all` / `partition:p0` label for a GLOBAL index read.
         #[serde(default)]
         partition_access: String,
@@ -297,6 +300,14 @@ pub enum PhysicalPlan {
         /// scan). Drives the `IndexRangeScan range:…` Build side in EXPLAIN.
         #[serde(default)]
         range_scan: Option<IndexScanRange>,
+        /// Index lookup push-down: Build collects `offset+count` matching index
+        /// keys before the table probe (TiDB `tryPushDownLookUp`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        push_down: bool,
+        /// Offsets into `index_columns` that hold the handle (or common handle)
+        /// columns, used by the pushed-down coprocessor plan.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        handle_offsets: Vec<u32>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
@@ -306,6 +317,9 @@ pub enum PhysicalPlan {
         /// Index column names for EXPLAIN `index:idx(b, c)`.
         index_columns: Vec<String>,
         partitions: Vec<i64>,
+        /// Partition names read by this index reader (`partition:p0` in EXPLAIN).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        partition_names: Vec<String>,
         /// TiDB `partition:all` / `partition:p0` label for a GLOBAL index read.
         #[serde(default)]
         partition_access: String,

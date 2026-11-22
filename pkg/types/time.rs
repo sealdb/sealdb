@@ -952,10 +952,7 @@ fn parse_datetime_string(s: &str) -> Result<Time> {
     // day (`2024-0-1`, `2024-1-0`) parses too: TiDB leaves the
     // `NO_ZERO_DATE` / `NO_ZERO_IN_DATE` policy to storage.
     let zero_part = (month == 0 || day == 0) && month <= 12 && day <= 31;
-    if (!valid_ymd(year, month, day) && !zero_date && !zero_part)
-        || hour > 23
-        || minute > 59
-    {
+    if (!valid_ymd(year, month, day) && !zero_date && !zero_part) || hour > 23 || minute > 59 {
         return Err(incorrect("datetime", s));
     }
     // When frac absorbed into second, display still uses original fsp.
@@ -1252,7 +1249,11 @@ mod parse_tests {
 
     #[test]
     fn time_literal_rejects_datetime_and_long_digits() {
-        for bad in ["2017-01-01 00:00:00", "071231235959.999999", "20171231235959.999999"] {
+        for bad in [
+            "2017-01-01 00:00:00",
+            "071231235959.999999",
+            "20171231235959.999999",
+        ] {
             let err = parse_time_literal(bad).unwrap_err();
             assert_eq!(err.code, ERR_TRUNCATED_WRONG_VALUE);
             assert!(err.message.contains("Incorrect time value"), "{bad}");

@@ -3,8 +3,8 @@ use crate::ast::ddl::{
     AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
     ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
     CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt,
-    ForeignKeyDef, GeneratedColumn, IndexDef, IndexPart, PartitionDef, PartitionOption,
-    PartitionType, SequenceOptionSet, TableName, TruncateTableStmt, TtlInfo,
+    ForeignKeyDef, GeneratedColumn, IndexDef, IndexPart, ListInEntry, ListLiteral, PartitionDef,
+    PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt, TtlInfo,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -60,6 +60,22 @@ thread_local! {
     /// records which one the statement named.
     static PENDING_ADMIN_RELOAD: std::cell::Cell<Option<AdminReloadKind>> =
         const { std::cell::Cell::new(None) };
+    /// `CHECK (expr) [NOT] ENFORCED` stripped from CREATE TABLE, one slot per
+    /// CREATE so DDL can attach them to `TableInfo.checks`.
+    static PENDING_CREATE_CHECKS: std::cell::RefCell<Vec<Vec<(String, bool)>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take CHECK constraints captured for the next CREATE TABLE.
+pub fn take_pending_create_checks() -> Vec<(String, bool)> {
+    PENDING_CREATE_CHECKS.with(|cell| {
+        let mut v = cell.borrow_mut();
+        if v.is_empty() {
+            Vec::new()
+        } else {
+            v.remove(0)
+        }
+    })
 }
 
 /// Target of an `ADMIN RELOAD` statement.
@@ -151,6 +167,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // TiDB `int1`…`int4` type aliases: sqlparser only knows the canonical names,
     // and a Custom type cannot take `UNSIGNED`.
     let rewritten = rewrite_integer_type_aliases(&rewritten);
+    // MySQL `ZEROFILL` is not in sqlparser; rewrite to UNSIGNED + marker comment
+    // so DDL can set the zerofill flag (EXCHANGE 1736).
+    let rewritten = rewrite_zerofill(&rewritten);
     // TiDB `REAL(M,D)` is `DOUBLE(M,D)`; sqlparser's `REAL` takes no precision.
     let rewritten = rewrite_real_type_precision(&rewritten);
     // MySQL column `CHARSET gbk`: sqlparser's column option is `CHARACTER SET`.
@@ -219,6 +238,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, materialize_hints) = rewrite_cte_materialized(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
     let (rewritten, ttls, create_affinities) = extract_create_table_ttl(&rewritten)?;
+    let (rewritten, create_checks) = extract_create_table_checks(&rewritten)?;
+    let (rewritten, create_placement) = extract_create_table_placement(&rewritten)?;
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let (rewritten, alter_parts) = extract_alter_partitions(&rewritten)?;
     // sqlparser rejects MySQL `GRANT/REVOKE role TO/FROM user` (no ON).
@@ -244,8 +265,13 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // TiDB `START TRANSACTION … AS OF TIMESTAMP <expr>` stale-read txn (the
     // clause has no sqlparser grammar); the operand is resolved by `BEGIN`.
     let (rewritten, begin_as_of) = extract_begin_as_of(&rewritten);
+    // `SET TRANSACTION … AS OF TIMESTAMP …` — strip before sqlparser; the
+    // session still detects stale-read intent from the original SQL text.
+    let rewritten = strip_set_txn_as_of(&rewritten);
     // TiDB `FROM t AS OF TIMESTAMP <expr>` stale read (no sqlparser grammar).
     let rewritten = rewrite_as_of_timestamp(&rewritten);
+    // MySQL 8 / TiDB `x MEMBER OF (json_array)` — no sqlparser grammar.
+    let rewritten = rewrite_member_of(&rewritten);
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -255,6 +281,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut flags = pessimistic_flags.into_iter();
     let mut ttls = ttls.into_iter();
     let mut create_affinities = create_affinities.into_iter();
+    let mut create_checks = create_checks.into_iter();
+    let mut create_placement = create_placement.into_iter();
     let mut partitions = partitions.into_iter();
     let mut alter_parts = alter_parts.into_iter();
     let mut prepares = prepares.into_iter();
@@ -305,13 +333,48 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             create.ttl = ttls.next().flatten();
             create.affinity = create_affinities.next().flatten();
             create.partition = partitions.next().flatten();
+            create.checks = create_checks.next().unwrap_or_default();
+            create.placement_policy = create_placement.next().flatten();
         }
         if let Statement::AlterTable(alter) = &mut lowered
             && let Some(op) = alter_parts.next().flatten()
         {
             match op {
-                AlterPartOp::Add(defs) => {
-                    alter.specs.push(AlterTableSpec::AddPartition { defs });
+                AlterPartOp::Add { defs, count } => {
+                    alter
+                        .specs
+                        .push(AlterTableSpec::AddPartition { defs, count });
+                }
+                AlterPartOp::PlacementPolicy(policy) => {
+                    alter.specs.push(AlterTableSpec::TableOption {
+                        name: "PLACEMENT_POLICY".to_string(),
+                        value: policy,
+                    });
+                }
+                AlterPartOp::Unsupported(msg) => {
+                    alter
+                        .specs
+                        .push(AlterTableSpec::UnsupportedPartitionOp(msg));
+                }
+                AlterPartOp::FirstPartition(bound) => {
+                    alter.specs.push(AlterTableSpec::FirstPartition { bound });
+                }
+                AlterPartOp::LastPartition(bound) => {
+                    alter.specs.push(AlterTableSpec::LastPartition { bound });
+                }
+                AlterPartOp::MergeFirstPartition(bound) => {
+                    alter
+                        .specs
+                        .push(AlterTableSpec::UnsupportedPartitionOp(format!(
+                            "MERGE FIRST PARTITION"
+                        )));
+                    let _ = bound;
+                }
+                AlterPartOp::SplitMaxvaluePartition(bound) => {
+                    alter.specs.push(AlterTableSpec::UnsupportedPartitionOp(
+                        "SPLIT LAST PARTITION".to_string(),
+                    ));
+                    let _ = bound;
                 }
                 AlterPartOp::Repartition(option) => {
                     alter.specs.push(AlterTableSpec::Repartition(option));
@@ -342,8 +405,10 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                 AlterPartOp::RemovePartitioning => {
                     alter.specs.push(AlterTableSpec::RemovePartitioning);
                 }
-                AlterPartOp::ReorganizePartition => {
-                    alter.specs.push(AlterTableSpec::ReorganizePartition);
+                AlterPartOp::ReorganizePartition { names, defs } => {
+                    alter
+                        .specs
+                        .push(AlterTableSpec::ReorganizePartition { names, defs });
                 }
                 AlterPartOp::CoalescePartition(num) => {
                     alter.specs.push(AlterTableSpec::CoalescePartition(num));
@@ -418,6 +483,12 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         apply_cte_materialize(&mut lowered, &mut materialize_hints);
         if let Statement::Select(sel) = &mut lowered {
             attach_projection_texts(sel, projection_texts.as_ref());
+        }
+        if let Statement::CreateView(view) = &mut lowered {
+            // CREATE VIEW AS SELECT … — capture the view body's select-list
+            // texts so unnamed window/expression columns keep TiDB names.
+            let body_texts = capture_select_projections_after_as(sql);
+            attach_projection_texts(&mut view.select, body_texts.as_ref());
         }
         out.push(lowered);
     }
@@ -727,6 +798,41 @@ fn attach_projection_texts(sel: &mut SelectStmt, texts: Option<&Vec<String>>) {
             field.orig_text = Some(text.clone());
         }
     }
+}
+
+/// `CREATE VIEW … AS SELECT …` — locate the view body and reuse SELECT capture.
+fn capture_select_projections_after_as(sql: &str) -> Option<Vec<String>> {
+    let bytes = sql.as_bytes();
+    let mut i = skip_ws_and_comments(bytes, 0);
+    if !keyword_at(bytes, i, "CREATE") {
+        return None;
+    }
+    // Scan for the view body's `AS SELECT` (skip DEFINER / ALGORITHM tokens).
+    while i < bytes.len() {
+        i = skip_ws_and_comments(bytes, i);
+        if i >= bytes.len() {
+            break;
+        }
+        if keyword_at(bytes, i, "AS") {
+            let after = skip_ws_and_comments(bytes, i + "AS".len());
+            if keyword_at(bytes, after, "SELECT") || keyword_at(bytes, after, "WITH") {
+                return capture_select_projections(&sql[after..]);
+            }
+        }
+        // Advance one token / quoted span; always make progress.
+        let start = i;
+        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+            i = skip_quoted(bytes, i);
+        } else if bytes[i] == b'(' {
+            i = skip_balanced(bytes, i);
+        } else {
+            i = skip_ident_or_quoted(bytes, i);
+        }
+        if i <= start {
+            i = start + 1;
+        }
+    }
+    None
 }
 
 /// Extract top-level SELECT projection snippets from original SQL (TiDB `field.Text()`).
@@ -1627,6 +1733,61 @@ fn rewrite_integer_type_aliases(sql: &str) -> String {
         {
             out.push_str(canonical);
             i += alias.len();
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Marker comment carrying ZEROFILL through sqlparser (stripped in DDL).
+pub const ZEROFILL_COMMENT_MARKER: &str = "__sealdb_zerofill__";
+
+/// `INT ZEROFILL` → `INT UNSIGNED COMMENT '__sealdb_zerofill__'` (ZEROFILL
+/// implies UNSIGNED in MySQL). When UNSIGNED is already present, only the
+/// marker comment is injected.
+fn rewrite_zerofill(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            if b == b'\\' && q != b'`' {
+                if let Some(ch) = sql[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(b, b'\'' | b'"' | b'`') {
+            quote = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if keyword_at(bytes, i, "ZEROFILL") {
+            // Scan the preceding column fragment (back to `,` / `(`) for UNSIGNED.
+            let frag_start = out.rfind([',', '(']).map(|p| p + 1).unwrap_or(0);
+            let has_unsigned = out[frag_start..]
+                .to_ascii_uppercase()
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|w| w == "UNSIGNED");
+            if has_unsigned {
+                out.push_str(&format!("COMMENT '{ZEROFILL_COMMENT_MARKER}'"));
+            } else {
+                out.push_str(&format!("UNSIGNED COMMENT '{ZEROFILL_COMMENT_MARKER}'"));
+            }
+            i += "ZEROFILL".len();
             continue;
         }
         let ch = sql[i..].chars().next().unwrap();
@@ -5176,6 +5337,133 @@ fn scan_comment_end(sql: &str, start: usize) -> usize {
         .unwrap_or(bytes.len())
 }
 
+/// Rewrite `expr MEMBER OF (json_expr)` to `json_memberof(cast(expr AS json), json_expr)`
+/// so sqlparser can lower it; EXPLAIN prints TiDB's `json_memberof(…)` shape.
+fn rewrite_member_of(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+            let end = scan_quoted_end(bytes, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "MEMBER") {
+            let of = skip_ws(bytes, i + "MEMBER".len());
+            if keyword_at(bytes, of, "OF") {
+                let open = skip_ws(bytes, of + "OF".len());
+                if bytes.get(open) == Some(&b'(')
+                    && let Some(close) = matching_paren(bytes, open)
+                {
+                    // Walk back over the left operand (skip trailing ws on `out`).
+                    let left = {
+                        let trimmed = out.trim_end();
+                        let cut = trimmed.len();
+                        // Drop a wrapping `(` that opened just before MEMBER.
+                        let left_expr = if trimmed.ends_with('(') {
+                            // Keep the paren on out; left is empty sentinel —
+                            // fall through to non-rewrite.
+                            String::new()
+                        } else {
+                            // Find start of left primary: number, ident, or `)`.
+                            let b = trimmed.as_bytes();
+                            let mut s = b.len();
+                            if s > 0 && b[s - 1] == b')' {
+                                // Balanced call / paren expr.
+                                let mut depth = 0i32;
+                                while s > 0 {
+                                    s -= 1;
+                                    match b[s] {
+                                        b')' => depth += 1,
+                                        b'(' => {
+                                            depth -= 1;
+                                            if depth == 0 {
+                                                break;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                trimmed[s..].to_string()
+                            } else {
+                                while s > 0 && (is_ident_byte(b[s - 1]) || b[s - 1] == b'.') {
+                                    s -= 1;
+                                }
+                                trimmed[s..].to_string()
+                            }
+                        };
+                        (cut, left_expr)
+                    };
+                    if !left.1.is_empty() {
+                        let keep_len = left.0 - left.1.len();
+                        out.truncate(keep_len);
+                        let rhs = sql[open + 1..close].trim();
+                        out.push_str("json_memberof(cast(");
+                        out.push_str(&left.1);
+                        out.push_str(" as json), ");
+                        out.push_str(rhs);
+                        out.push(')');
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
+/// Strip `AS OF TIMESTAMP <expr>` from `SET TRANSACTION …` so sqlparser can
+/// parse the remaining READ ONLY / isolation clauses. The session detects the
+/// stale-read intent from the original statement text (`contains("as of")`).
+fn strip_set_txn_as_of(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let trim_start = sql.len() - sql.trim_start().len();
+    let is_set_txn = keyword_at(bytes, trim_start, "SET") && {
+        let after = skip_ws(bytes, trim_start + "SET".len());
+        let scope_end = if keyword_at(bytes, after, "SESSION") {
+            skip_ws(bytes, after + "SESSION".len())
+        } else if keyword_at(bytes, after, "GLOBAL") {
+            skip_ws(bytes, after + "GLOBAL".len())
+        } else {
+            after
+        };
+        keyword_at(bytes, scope_end, "TRANSACTION")
+    };
+    if !is_set_txn {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+            let end = scan_quoted_end(bytes, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "AS") {
+            let of = skip_ws(bytes, i + 2);
+            if keyword_at(bytes, of, "OF") {
+                let ts = skip_ws(bytes, of + 2);
+                if keyword_at(bytes, ts, "TIMESTAMP") {
+                    let expr_start = skip_ws(bytes, ts + "TIMESTAMP".len());
+                    let expr_end = scan_as_of_expr_end(bytes, expr_start);
+                    if expr_end > expr_start {
+                        i = expr_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out.trim_end().to_string()
+}
+
 /// TiDB `START TRANSACTION [READ ONLY] AS OF TIMESTAMP <expr>` (stale-read
 /// transaction). sqlparser's MySQL dialect has no `AS OF TIMESTAMP` clause, so
 /// strip it here and hand the raw operand text back for the session's `BEGIN`
@@ -5229,8 +5517,47 @@ fn extract_begin_as_of(sql: &str) -> (String, Vec<Option<String>>) {
 
 /// End (exclusive) of the `AS OF TIMESTAMP` operand. Accepts the shapes TiDB
 /// allows in practice: user/system variables, quoted literals, function
-/// calls, bracketed expressions and plain identifiers/numbers.
+/// calls, bracketed expressions, plain identifiers/numbers, and arithmetic
+/// with `INTERVAL` (`NOW(6) - INTERVAL 0.05 SECOND`).
 fn scan_as_of_expr_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = scan_as_of_primary(bytes, start);
+    loop {
+        let after = skip_ws(bytes, i);
+        let op = match bytes.get(after).copied() {
+            Some(b'+') | Some(b'-') => after,
+            _ => break,
+        };
+        // Do not treat `--` comment as arithmetic.
+        if bytes[op] == b'-' && bytes.get(op + 1) == Some(&b'-') {
+            break;
+        }
+        let rhs = skip_ws(bytes, op + 1);
+        if rhs >= bytes.len() {
+            break;
+        }
+        // `INTERVAL <n> <unit>` or another primary (`@a`, `now()`, …).
+        if keyword_at(bytes, rhs, "INTERVAL") {
+            let mut j = skip_ws(bytes, rhs + "INTERVAL".len());
+            j = scan_as_of_primary(bytes, j);
+            j = skip_ws(bytes, j);
+            // unit identifier (`SECOND`, `DAY`, …)
+            while j < bytes.len() && is_ident_byte(bytes[j]) {
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        let next = scan_as_of_primary(bytes, rhs);
+        if next <= rhs {
+            break;
+        }
+        i = next;
+    }
+    i
+}
+
+/// One primary operand of an `AS OF TIMESTAMP` expression.
+fn scan_as_of_primary(bytes: &[u8], start: usize) -> usize {
     let mut i = skip_ws(bytes, start);
     if i >= bytes.len() {
         return i;
@@ -5246,7 +5573,7 @@ fn scan_as_of_expr_end(bytes: &[u8], start: usize) -> usize {
     }
     while i < bytes.len() {
         let b = bytes[i];
-        if is_ident_byte(b) || b == b'@' || b == b'.' || b == b'$' || b == b':' || b == b'-' {
+        if is_ident_byte(b) || b == b'@' || b == b'.' || b == b'$' || b == b':' {
             i += 1;
         } else {
             break;
@@ -5988,7 +6315,8 @@ fn qualify_derived_columns(expr: &mut Expr, alias: &str, base: &str) -> bool {
         }
         Expr::Value(_) => true,
         Expr::BinaryOp { left, right, .. } => {
-            qualify_derived_columns(left, alias, base) && qualify_derived_columns(right, alias, base)
+            qualify_derived_columns(left, alias, base)
+                && qualify_derived_columns(right, alias, base)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
@@ -8294,6 +8622,22 @@ fn take_explain_format(bytes: &[u8], i: usize) -> (String, usize) {
         let mut raw = Vec::new();
         let mut j = i + 1;
         while j < bytes.len() {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                // MySQL backslash escapes in string literals (`"\n"`, `\'`,
+                // `\\`, …); a prepared SQL body relies on them for newlines.
+                let escaped = match bytes[j + 1] {
+                    b'n' => b'\n',
+                    b't' => b'\t',
+                    b'r' => b'\r',
+                    b'0' => 0,
+                    b'b' => 0x08,
+                    b'Z' => 0x1a,
+                    other => other,
+                };
+                raw.push(escaped);
+                j += 2;
+                continue;
+            }
             if bytes[j] == quote {
                 if j + 1 < bytes.len() && bytes[j + 1] == quote {
                     raw.push(quote);
@@ -8362,7 +8706,10 @@ fn lower_explain_format(
 
 #[derive(Clone, Debug)]
 enum AlterPartOp {
-    Add(Vec<PartitionDef>),
+    Add {
+        defs: Vec<PartitionDef>,
+        count: Option<u64>,
+    },
     Repartition(PartitionOption),
     Drop {
         if_exists: bool,
@@ -8382,10 +8729,25 @@ enum AlterPartOp {
     },
     /// `AFFINITY [=] '<table|partition|none|>'`.
     Affinity(String),
+    /// `PLACEMENT POLICY [=] name|DEFAULT`.
+    PlacementPolicy(String),
+    /// CHECK/OPTIMIZE/REPAIR/REBUILD/IMPORT/DISCARD PARTITION → DDL 8200.
+    Unsupported(String),
+    /// `FIRST PARTITION LESS THAN (bound)`.
+    FirstPartition(String),
+    /// `LAST PARTITION LESS THAN (bound)`.
+    LastPartition(String),
+    /// `MERGE FIRST PARTITION LESS THAN (bound)`.
+    MergeFirstPartition(String),
+    /// `SPLIT MAXVALUE PARTITION LESS THAN (bound)`.
+    SplitMaxvaluePartition(String),
     /// `REMOVE PARTITIONING`.
     RemovePartitioning,
     /// `REORGANIZE PARTITION … INTO (…)`.
-    ReorganizePartition,
+    ReorganizePartition {
+        names: Vec<String>,
+        defs: Vec<PartitionDef>,
+    },
     /// `COALESCE PARTITION n`.
     CoalescePartition(u64),
     /// `TRUNCATE PARTITION p0, p1`.
@@ -8516,16 +8878,88 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                     if keyword_at(bytes, after_add, "PARTITION") {
                         let after_part = skip_ws(bytes, after_add + "PARTITION".len());
                         if after_part < bytes.len() && bytes[after_part] == b'(' {
-                            let close = matching_paren(bytes, after_part)
-                                .ok_or_else(|| Error::unsupported("ADD PARTITION list"))?;
+                            let close = match matching_paren(bytes, after_part) {
+                                Some(close) => close,
+                                None => {
+                                    // Unbalanced `ADD PARTITION (`: TiDB still
+                                    // fails inside the definition list first
+                                    // (e.g. an illegal `DEFAULT`), so parse to
+                                    // the statement end before rejecting.
+                                    let end = stmt_end(bytes, after_part);
+                                    let body = std::str::from_utf8(&bytes[after_part + 1..end])
+                                        .map_err(|_| {
+                                            Error::new(ERR_PARSE_ERROR, "invalid ADD PARTITION")
+                                        })?;
+                                    parse_add_partition_defs(body, bytes, after_part + 1)?;
+                                    return Err(Error::new(
+                                        ERR_PARSE_ERROR,
+                                        "You have an error in your SQL syntax; check the manual that corresponds to your TiDB version for the right syntax to use near \"ADD PARTITION\"",
+                                    ));
+                                }
+                            };
                             let body = std::str::from_utf8(&bytes[after_part + 1..close]).map_err(
                                 |_| Error::new(ERR_PARSE_ERROR, "invalid ADD PARTITION"),
                             )?;
-                            let defs = parse_add_partition_defs(body)?;
+                            let defs = parse_add_partition_defs(body, bytes, after_part + 1)?;
                             out.push_str(&sql[i..after_name]);
                             out.push_str("ALGORITHM=INPLACE");
-                            ops.push(Some(AlterPartOp::Add(defs)));
+                            ops.push(Some(AlterPartOp::Add { defs, count: None }));
                             i = skip_ws(bytes, close + 1);
+                            continue;
+                        }
+                        // `ADD PARTITION PARTITIONS n` (HASH/KEY).
+                        if keyword_at(bytes, after_part, "PARTITIONS") {
+                            let mut j = skip_ws(bytes, after_part + "PARTITIONS".len());
+                            let num_start = j;
+                            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                                j += 1;
+                            }
+                            let num = std::str::from_utf8(&bytes[num_start..j])
+                                .unwrap_or_default()
+                                .parse::<u64>()
+                                .map_err(|_| Error::unsupported("ADD PARTITION PARTITIONS"))?;
+                            let end = stmt_end(bytes, j);
+                            out.push_str(&sql[i..after_name]);
+                            out.push_str("ALGORITHM=INPLACE");
+                            ops.push(Some(AlterPartOp::Add {
+                                defs: Vec::new(),
+                                count: Some(num),
+                            }));
+                            i = skip_ws(bytes, end);
+                            continue;
+                        }
+                        // `ADD PARTITION;` with no definition list (TiDB 1492).
+                        let end = stmt_end(bytes, after_part);
+                        out.push_str(&sql[i..after_name]);
+                        out.push_str("ALGORITHM=INPLACE");
+                        ops.push(Some(AlterPartOp::Add {
+                            defs: Vec::new(),
+                            count: None,
+                        }));
+                        i = skip_ws(bytes, end);
+                        continue;
+                    }
+                }
+                // `ALTER TABLE t PLACEMENT POLICY [=] name|DEFAULT`.
+                if keyword_at(bytes, after_name, "PLACEMENT") {
+                    let after_pl = skip_ws(bytes, after_name + "PLACEMENT".len());
+                    if keyword_at(bytes, after_pl, "POLICY") {
+                        let mut j = skip_ws(bytes, after_pl + "POLICY".len());
+                        if j < bytes.len() && bytes[j] == b'=' {
+                            j = skip_ws(bytes, j + 1);
+                        }
+                        let (name, next) = if j < bytes.len() && matches!(bytes[j], b'\'' | b'"') {
+                            let (v, n) = read_sql_string(bytes, j)?;
+                            (v, n)
+                        } else {
+                            read_ident(bytes, j)
+                        };
+                        if !name.is_empty() {
+                            let end = stmt_end(bytes, next);
+                            out.push_str(&sql[i..after_name]);
+                            out.push_str("ALGORITHM=INPLACE");
+                            ops.push(Some(AlterPartOp::PlacementPolicy(name)));
+                            i = skip_ws(bytes, end);
                             continue;
                         }
                     }
@@ -8597,10 +9031,24 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                             table = TableName::new(Some(table.name), second);
                             j = next;
                         }
+                        j = skip_ws(bytes, j);
+                        // Optional `WITH VALIDATION` / `WITHOUT VALIDATION`.
+                        if keyword_at(bytes, j, "WITH") || keyword_at(bytes, j, "WITHOUT") {
+                            let kw_len = if keyword_at(bytes, j, "WITHOUT") {
+                                "WITHOUT".len()
+                            } else {
+                                "WITH".len()
+                            };
+                            let after_kw = skip_ws(bytes, j + kw_len);
+                            if keyword_at(bytes, after_kw, "VALIDATION") {
+                                j = skip_ws(bytes, after_kw + "VALIDATION".len());
+                            }
+                        }
+                        let end = stmt_end(bytes, j);
                         out.push_str(&sql[i..after_name]);
                         out.push_str("ALGORITHM=INPLACE");
                         ops.push(Some(AlterPartOp::Exchange { partition, table }));
-                        i = skip_ws(bytes, j);
+                        i = skip_ws(bytes, end);
                         continue;
                     }
                 }
@@ -8634,10 +9082,42 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                         "PARTITION",
                     )
                 {
-                    let end = stmt_end(bytes, after_name);
+                    let mut j = skip_ws(bytes, after_name + "REORGANIZE".len());
+                    j = skip_ws(bytes, j + "PARTITION".len());
+                    let mut names = Vec::new();
+                    loop {
+                        let (name, next) = read_ident(bytes, j);
+                        if name.is_empty() {
+                            break;
+                        }
+                        names.push(name);
+                        j = skip_ws(bytes, next);
+                        if j < bytes.len() && bytes[j] == b',' {
+                            j = skip_ws(bytes, j + 1);
+                            continue;
+                        }
+                        break;
+                    }
+                    if !keyword_at(bytes, j, "INTO") {
+                        return Err(Error::unsupported("REORGANIZE PARTITION without INTO"));
+                    }
+                    j = skip_ws(bytes, j + "INTO".len());
+                    if j >= bytes.len() || bytes[j] != b'(' {
+                        return Err(Error::unsupported("REORGANIZE PARTITION INTO list"));
+                    }
+                    let close = matching_paren(bytes, j)
+                        .ok_or_else(|| Error::unsupported("REORGANIZE PARTITION INTO list"))?;
+                    let body = &sql[j + 1..close];
+                    // INTO may hold LIST or RANGE defs; try LIST first (VALUES IN /
+                    // DEFAULT), then RANGE (VALUES LESS THAN).
+                    let defs = match parse_add_partition_defs(body, bytes, j + 1) {
+                        Ok(defs) => defs,
+                        Err(_) => parse_range_defs(body, bytes, j + 1)?,
+                    };
+                    let end = stmt_end(bytes, close + 1);
                     out.push_str(&sql[i..after_name]);
                     out.push_str("ALGORITHM=INPLACE");
-                    ops.push(Some(AlterPartOp::ReorganizePartition));
+                    ops.push(Some(AlterPartOp::ReorganizePartition { names, defs }));
                     i = skip_ws(bytes, end);
                     continue;
                 }
@@ -8708,6 +9188,38 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                     out.push_str(&sql[i..after_name]);
                     out.push_str("ALGORITHM=INPLACE");
                     ops.push(Some(AlterPartOp::CoalescePartition(num)));
+                    i = skip_ws(bytes, end);
+                    continue;
+                }
+                // Unsupported partition maintenance → DDL 8200.
+                for (kw, msg) in [
+                    ("CHECK", "check partition"),
+                    ("OPTIMIZE", "optimize partition"),
+                    ("REPAIR", "repair partition"),
+                    ("REBUILD", "rebuild partition"),
+                    ("IMPORT", "Unsupported/unknown ALTER TABLE specification"),
+                    ("DISCARD", "Unsupported/unknown ALTER TABLE specification"),
+                ] {
+                    if keyword_at(bytes, after_name, kw) {
+                        let after_kw = skip_ws(bytes, after_name + kw.len());
+                        if keyword_at(bytes, after_kw, "PARTITION") {
+                            let end = stmt_end(bytes, after_name);
+                            out.push_str(&sql[i..after_name]);
+                            out.push_str("ALGORITHM=INPLACE");
+                            ops.push(Some(AlterPartOp::Unsupported(msg.to_string())));
+                            i = skip_ws(bytes, end);
+                            break;
+                        }
+                    }
+                }
+                if matches!(ops.last(), Some(Some(AlterPartOp::Unsupported(_)))) {
+                    continue;
+                }
+                // INTERVAL ALTER: FIRST/LAST/MERGE FIRST/SPLIT MAXVALUE PARTITION.
+                if let Some((op, end)) = parse_interval_alter(bytes, after_name)? {
+                    out.push_str(&sql[i..after_name]);
+                    out.push_str("ALGORITHM=INPLACE");
+                    ops.push(Some(op));
                     i = skip_ws(bytes, end);
                     continue;
                 }
@@ -8857,13 +9369,15 @@ fn parse_alter_ttl_spec(
     )))
 }
 
-fn parse_add_partition_defs(body: &str) -> Result<Vec<PartitionDef>> {
+fn parse_add_partition_defs(body: &str, sql: &[u8], body_abs: usize) -> Result<Vec<PartitionDef>> {
     let mut defs = Vec::new();
-    for raw in split_defs(body) {
+    for (raw_start, raw_end) in split_top_level_ranges(body) {
+        let raw = &body[raw_start..raw_end];
         let item = raw.trim();
         if item.is_empty() {
             continue;
         }
+        let item_abs = body_abs + raw_start + (raw.len() - raw.trim_start().len());
         let bytes = item.as_bytes();
         let mut i = skip_ws(bytes, 0);
         if !keyword_at(bytes, i, "PARTITION") {
@@ -8873,57 +9387,234 @@ fn parse_add_partition_defs(body: &str) -> Result<Vec<PartitionDef>> {
         let name_end = skip_ident_or_quoted(bytes, i);
         let name = item[i..name_end].trim().trim_matches('`').to_string();
         i = skip_ws(bytes, name_end);
-        if !keyword_at(bytes, i, "VALUES") {
-            return Err(Error::unsupported("ADD PARTITION VALUES"));
-        }
-        i = skip_ws(bytes, i + "VALUES".len());
-        if keyword_at(bytes, i, "IN") {
-            i = skip_ws(bytes, i + "IN".len());
-            if i >= bytes.len() || bytes[i] != b'(' {
-                return Err(Error::unsupported("VALUES IN"));
-            }
-            let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("VALUES IN"))?;
-            let mut in_values = Vec::new();
-            for raw_v in item[i + 1..close].split(',') {
-                let v = raw_v.trim();
-                if v.is_empty() {
-                    continue;
+        let mut def = PartitionDef::named(name);
+        if keyword_at(bytes, i, "DEFAULT") {
+            def.in_values = vec![ListInEntry::Default];
+            def.list_default = true;
+            i = skip_ws(bytes, i + "DEFAULT".len());
+        } else if keyword_at(bytes, i, "HISTORY") {
+            // TiDB accepts bare HISTORY; error text says VALUES HISTORY.
+            def.values_history = true;
+            i = skip_ws(bytes, i + "HISTORY".len());
+        } else if keyword_at(bytes, i, "VALUES") {
+            i = skip_ws(bytes, i + "VALUES".len());
+            if keyword_at(bytes, i, "HISTORY") {
+                def.values_history = true;
+                i = skip_ws(bytes, i + "HISTORY".len());
+            } else if keyword_at(bytes, i, "IN") {
+                i = skip_ws(bytes, i + "IN".len());
+                if i >= bytes.len() || bytes[i] != b'(' {
+                    return Err(Error::unsupported("VALUES IN"));
                 }
-                in_values.push(parse_list_value(v)?);
-            }
-            defs.push(PartitionDef {
-                name,
-                less_than: None,
-                extra_bounds: Vec::new(),
-                in_values,
-            });
-        } else if keyword_at(bytes, i, "LESS") {
-            i = skip_ws(bytes, i + "LESS".len());
-            if !keyword_at(bytes, i, "THAN") {
-                return Err(Error::unsupported("VALUES LESS THAN"));
-            }
-            i = skip_ws(bytes, i + "THAN".len());
-            let bounds = parse_less_than_bounds(bytes, i, item)?;
-            let less_than = bounds.first().cloned().flatten();
-            let extra_bounds = if bounds.len() > 1 {
-                bounds[1..].to_vec()
+                let close =
+                    matching_paren(bytes, i).ok_or_else(|| Error::unsupported("VALUES IN"))?;
+                def.in_values = parse_list_in_values(&item[i + 1..close], sql, item_abs + i + 1)?;
+                i = skip_ws(bytes, close + 1);
+            } else if keyword_at(bytes, i, "LESS") {
+                i = skip_ws(bytes, i + "LESS".len());
+                if !keyword_at(bytes, i, "THAN") {
+                    return Err(Error::unsupported("VALUES LESS THAN"));
+                }
+                i = skip_ws(bytes, i + "THAN".len());
+                let bounds = parse_less_than_bounds(bytes, i, item, sql, item_abs)?;
+                def.less_than = bounds.first().cloned().flatten();
+                def.extra_bounds = if bounds.len() > 1 {
+                    bounds[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                i = after_less_than(bytes, i).unwrap_or(i);
             } else {
-                Vec::new()
-            };
-            defs.push(PartitionDef {
-                name,
-                less_than,
-                extra_bounds,
-                in_values: Vec::new(),
-            });
+                return Err(Error::unsupported("ADD PARTITION VALUES"));
+            }
+        } else if i >= bytes.len()
+            || keyword_at(bytes, i, "COMMENT")
+            || keyword_at(bytes, i, "PLACEMENT")
+        {
+            // HASH/KEY named partition: no VALUES, optional COMMENT / PLACEMENT.
+            def.missing_bound = true;
         } else {
             return Err(Error::unsupported("ADD PARTITION VALUES"));
         }
+        // Optional COMMENT / PLACEMENT POLICY after the bound clause.
+        loop {
+            i = skip_ws(bytes, i);
+            if keyword_at(bytes, i, "COMMENT") {
+                i = skip_ws(bytes, i + "COMMENT".len());
+                if i < bytes.len() && bytes[i] == b'=' {
+                    i = skip_ws(bytes, i + 1);
+                }
+                let (value, next) = read_sql_string(bytes, i)?;
+                def.comment = Some(value);
+                i = next;
+                continue;
+            }
+            if keyword_at(bytes, i, "PLACEMENT") {
+                i = skip_ws(bytes, i + "PLACEMENT".len());
+                if !keyword_at(bytes, i, "POLICY") {
+                    return Err(Error::unsupported("PLACEMENT POLICY"));
+                }
+                i = skip_ws(bytes, i + "POLICY".len());
+                if i < bytes.len() && bytes[i] == b'=' {
+                    i = skip_ws(bytes, i + 1);
+                }
+                let (policy, next) = if i < bytes.len() && matches!(bytes[i], b'\'' | b'"') {
+                    read_sql_string(bytes, i)?
+                } else {
+                    read_ident(bytes, i)
+                };
+                if policy.is_empty() {
+                    return Err(Error::unsupported("PLACEMENT POLICY"));
+                }
+                def.placement_policy = Some(policy);
+                i = next;
+                continue;
+            }
+            break;
+        }
+        defs.push(def);
     }
     if defs.is_empty() {
         return Err(Error::unsupported("ADD PARTITION without definitions"));
     }
     Ok(defs)
+}
+
+/// Strip `CHECK (expr) [NOT] ENFORCED` from CREATE TABLE column/table defs and
+/// record them for DDL (`TableInfo.checks`). sqlparser has no MySQL CHECK form.
+fn extract_create_table_checks(sql: &str) -> Result<(String, Vec<Vec<(String, bool)>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut all_checks = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "CREATE") {
+            let after_create = skip_ws(bytes, i + "CREATE".len());
+            let mut j = after_create;
+            if keyword_at(bytes, j, "GLOBAL") {
+                j = skip_ws(bytes, j + "GLOBAL".len());
+            }
+            if keyword_at(bytes, j, "TEMPORARY") {
+                j = skip_ws(bytes, j + "TEMPORARY".len());
+            }
+            if keyword_at(bytes, j, "TABLE") {
+                let end = stmt_end(bytes, i);
+                let stmt = &sql[i..end];
+                let (stripped, checks) = strip_checks_from_create(stmt);
+                all_checks.push(checks);
+                out.push_str(&stripped);
+                i = end;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok((out, all_checks))
+}
+
+/// Strip `PLACEMENT POLICY [=] 'name'` from CREATE TABLE.
+fn extract_create_table_placement(sql: &str) -> Result<(String, Vec<Option<String>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut policies = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "CREATE") {
+            let after_create = skip_ws(bytes, i + "CREATE".len());
+            let mut j = after_create;
+            if keyword_at(bytes, j, "GLOBAL") {
+                j = skip_ws(bytes, j + "GLOBAL".len());
+            }
+            if keyword_at(bytes, j, "TEMPORARY") {
+                j = skip_ws(bytes, j + "TEMPORARY".len());
+            }
+            if keyword_at(bytes, j, "TABLE") {
+                let end = stmt_end(bytes, i);
+                let stmt = &sql[i..end];
+                let (stripped, policy) = strip_placement_from_create(stmt);
+                policies.push(policy);
+                out.push_str(&stripped);
+                i = end;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok((out, policies))
+}
+
+fn strip_placement_from_create(stmt: &str) -> (String, Option<String>) {
+    let bytes = stmt.as_bytes();
+    let mut out = String::new();
+    let mut policy = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "PLACEMENT") {
+            let after = skip_ws(bytes, i + "PLACEMENT".len());
+            if keyword_at(bytes, after, "POLICY") {
+                let mut j = skip_ws(bytes, after + "POLICY".len());
+                if j < bytes.len() && bytes[j] == b'=' {
+                    j = skip_ws(bytes, j + 1);
+                }
+                if j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'"') {
+                    if let Ok((value, next)) = read_sql_string(bytes, j) {
+                        policy = Some(value);
+                        i = next;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = stmt[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, policy)
+}
+
+fn strip_checks_from_create(stmt: &str) -> (String, Vec<(String, bool)>) {
+    let bytes = stmt.as_bytes();
+    let mut out = String::new();
+    let mut checks = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "CHECK") {
+            let after = skip_ws(bytes, i + "CHECK".len());
+            if after < bytes.len() && bytes[after] == b'(' {
+                if let Some(close) = matching_paren(bytes, after) {
+                    let expr = stmt[after + 1..close].trim().to_string();
+                    let mut j = skip_ws(bytes, close + 1);
+                    let mut enforced = true;
+                    if keyword_at(bytes, j, "NOT") {
+                        let after_not = skip_ws(bytes, j + "NOT".len());
+                        if keyword_at(bytes, after_not, "ENFORCED") {
+                            enforced = false;
+                            j = skip_ws(bytes, after_not + "ENFORCED".len());
+                        }
+                    } else if keyword_at(bytes, j, "ENFORCED") {
+                        j = skip_ws(bytes, j + "ENFORCED".len());
+                    }
+                    checks.push((expr, enforced));
+                    // Drop a preceding comma if we left `, CHECK`.
+                    let trimmed = out.trim_end();
+                    if trimmed.ends_with(',') {
+                        out.truncate(trimmed.len() - 1);
+                        out.push(' ');
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        let ch = stmt[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, checks)
 }
 
 /// sqlparser-rs MySQL dialect does not accept TiDB/MySQL `PARTITION BY`.
@@ -9195,7 +9886,14 @@ fn extract_create_table_partitions(sql: &str) -> Result<(String, Vec<Option<Part
     let mut i = 0;
     while i < bytes.len() {
         if keyword_at(bytes, i, "CREATE") {
-            let after_create = skip_ws(bytes, i + "CREATE".len());
+            let mut after_create = skip_ws(bytes, i + "CREATE".len());
+            // `CREATE [GLOBAL] TEMPORARY TABLE` — strip PARTITION BY the same way.
+            if keyword_at(bytes, after_create, "GLOBAL") {
+                after_create = skip_ws(bytes, after_create + "GLOBAL".len());
+            }
+            if keyword_at(bytes, after_create, "TEMPORARY") {
+                after_create = skip_ws(bytes, after_create + "TEMPORARY".len());
+            }
             if keyword_at(bytes, after_create, "TABLE") {
                 let after_table = skip_ws(bytes, after_create + "TABLE".len());
                 let after_name = skip_create_table_name(bytes, after_table);
@@ -9319,10 +10017,29 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
     let mut i = open;
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' | b'"' | b'`' => {
+            b'\'' | b'"' => {
                 let q = bytes[i];
                 i += 1;
-                while i < bytes.len() && bytes[i] != q {
+                while i < bytes.len() {
+                    // MySQL string escapes: a backslash consumes the next
+                    // character, and a doubled quote stays inside the string.
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == q {
+                        if i + 1 < bytes.len() && bytes[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'`' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'`' {
                     i += 1;
                 }
             }
@@ -9537,15 +10254,175 @@ fn find_word(haystack: &str, word: &str, from: usize) -> Option<usize> {
     None
 }
 
+/// TiDB-shaped 1064 for a syntax error in the original statement bytes.
+///
+/// `near_start` is where the `near "…"` snippet begins (usually right after the
+/// offending token); `col_index` is the 0-based byte the error column points at
+/// (TiDB reports the token's last byte for keyword token failures).
+fn syntax_error_at(sql: &[u8], near_start: usize, col_index: usize) -> Error {
+    let len = sql.len();
+    let near_start = near_start.min(len);
+    let col_index = col_index.min(len);
+    let near = String::from_utf8_lossy(&sql[near_start..]);
+    let near = near.trim_end();
+    let line = sql[..col_index].iter().filter(|b| **b == b'\n').count() + 1;
+    // TiDB's lexer counts the newline byte itself as column 1 of the next
+    // line, so the recorded column is one past the usual 1-based offset.
+    let line_start = sql[..col_index]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .unwrap_or(0);
+    let col = col_index - line_start + 1;
+    Error::new(
+        ERR_PARSE_ERROR,
+        format!(
+            // TiDB's mysql err message keeps a trailing space after the quote.
+            "You have an error in your SQL syntax; check the manual that corresponds to your TiDB version for the right syntax to use line {line} column {col} near \"{near}\" "
+        ),
+    )
+}
+
 /// `p0`, `P1`, … partition names in `INSERT … PARTITION (...)`.
-/// One `VALUES IN (…)` list entry: an integer literal or SQL `NULL`.
-fn parse_list_value(v: &str) -> Result<Option<i64>> {
+/// One scalar LIST / LIST COLUMNS literal: `NULL`, number, or quoted string.
+fn parse_list_literal(v: &str, sql: &[u8], v_abs: usize) -> Result<ListLiteral> {
+    let v = v.trim();
     if v.eq_ignore_ascii_case("null") {
-        return Ok(None);
+        return Ok(ListLiteral::Null);
     }
-    v.parse::<i64>()
-        .map(Some)
-        .map_err(|_| Error::unsupported("non-integer LIST value"))
+    if v.eq_ignore_ascii_case("default") {
+        // Bare DEFAULT is only valid as a top-level VALUES IN entry, not inside
+        // a tuple — callers must reject that before reaching here.
+        let end = v_abs + v.len();
+        return Err(syntax_error_at(sql, end, end));
+    }
+    let bytes = v.as_bytes();
+    if let Some(canonical) = canonical_string_bound(v) {
+        // `canonical_string_bound` returns the escaped `'…'` text; store the
+        // raw value so comparisons and re-escaping work on real characters.
+        let inner = &canonical[1..canonical.len() - 1];
+        return Ok(ListLiteral::String(unescape_mysql_literal(inner, b'\'')));
+    }
+    // Numeric (optional leading sign). Keep text so unsigned bigint survives.
+    let num = if bytes.first().is_some_and(|b| *b == b'+' || *b == b'-') {
+        &v[1..]
+    } else {
+        v
+    };
+    if !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(ListLiteral::Number(v.to_string()));
+    }
+    // A bare keyword (`MAXVALUE`) is lexed as a token: TiDB's `near` snippet
+    // starts at the token while the column points at its last byte.
+    let end = v_abs + v.len();
+    Err(syntax_error_at(sql, v_abs, end.saturating_sub(1)))
+}
+
+/// Byte ranges of a `VALUES IN (…)` body split on top-level commas
+/// (respecting quotes/parens). Chunks are not trimmed.
+fn split_list_item_ranges(body: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_quote: Option<u8> = None;
+    let mut start = 0usize;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            // Backslash escape (`\'`, `\\`) keeps the next byte inside the
+            // literal; without this a `\'` would close the quote early and a
+            // comma-separated `VALUES IN` body would not split.
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                // SQL escaping: doubled quote stays inside the literal.
+                if i + 1 < bytes.len() && bytes[i + 1] == q {
+                    i += 2;
+                    continue;
+                }
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_quote = Some(b),
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                if !body[start..i].trim().is_empty() {
+                    out.push((start, i));
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !body[start..].trim().is_empty() {
+        out.push((start, body.len()));
+    }
+    out
+}
+
+/// Parse one `VALUES IN` entry: `DEFAULT`, a parenthesized tuple, or a scalar.
+fn parse_list_in_entry(item: &str, sql: &[u8], item_abs: usize) -> Result<ListInEntry> {
+    let item = item.trim();
+    if item.eq_ignore_ascii_case("default") {
+        return Ok(ListInEntry::Default);
+    }
+    let bytes = item.as_bytes();
+    if bytes.first() == Some(&b'(') {
+        let close =
+            matching_paren(bytes, 0).ok_or_else(|| Error::unsupported("unclosed LIST tuple"))?;
+        if close + 1 != bytes.len() {
+            let at = item_abs + close;
+            return Err(syntax_error_at(sql, at, at));
+        }
+        let inner = &item[1..close];
+        // `(default)` alone is invalid (DEFAULT cannot be wrapped).
+        if inner.trim().eq_ignore_ascii_case("default") {
+            let lead = inner.len() - inner.trim_start().len();
+            let end = item_abs + 1 + lead + inner.trim().len();
+            return Err(syntax_error_at(sql, end, end));
+        }
+        let mut row = Vec::new();
+        for (s, e) in split_list_item_ranges(inner) {
+            let part = inner[s..e].trim();
+            if part.eq_ignore_ascii_case("default") {
+                let lead = inner[s..e].len() - inner[s..e].trim_start().len();
+                let end = item_abs + 1 + s + lead + part.len();
+                return Err(syntax_error_at(sql, end, end));
+            }
+            let lead = inner[s..e].len() - inner[s..e].trim_start().len();
+            row.push(parse_list_literal(part, sql, item_abs + 1 + s + lead)?);
+        }
+        if row.is_empty() {
+            return Err(Error::unsupported("empty LIST tuple"));
+        }
+        return Ok(ListInEntry::Row(row));
+    }
+    Ok(ListInEntry::Row(vec![parse_list_literal(
+        item, sql, item_abs,
+    )?]))
+}
+
+fn parse_list_in_values(body: &str, sql: &[u8], body_abs: usize) -> Result<Vec<ListInEntry>> {
+    let mut entries = Vec::new();
+    for (s, e) in split_list_item_ranges(body) {
+        let raw = &body[s..e];
+        let item = raw.trim();
+        let lead = raw.len() - raw.trim_start().len();
+        entries.push(parse_list_in_entry(item, sql, body_abs + s + lead)?);
+    }
+    if entries.is_empty() {
+        // Empty `VALUES IN ()`: the error points at the closing paren.
+        let at = body_abs + body.len();
+        return Err(syntax_error_at(sql, at, at));
+    }
+    Ok(entries)
 }
 
 fn insert_partition_names(exprs: Option<&Vec<Expr>>) -> Result<Vec<String>> {
@@ -9591,18 +10468,22 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
     let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("PARTITION BY"))?;
     let inner = std::str::from_utf8(&bytes[i + 1..close])
         .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid partition column"))?;
-    let (column, columns, expr) = parse_partition_key(inner, range_columns)?;
+    let key_partition = matches!(tp, PartitionType::Key);
+    let (column, columns, expr) = parse_partition_key(inner, range_columns, key_partition)?;
     i = skip_ws(bytes, close + 1);
     match tp {
         PartitionType::Hash | PartitionType::Key => {
-            if !keyword_at(bytes, i, "PARTITIONS") {
-                return Err(Error::unsupported("HASH/KEY partition list"));
-            }
-            i = skip_ws(bytes, i + "PARTITIONS".len());
-            let (num, end) = parse_u64_at(bytes, i)?;
-            if num == 0 {
-                return Err(Error::unsupported("HASH/KEY PARTITIONS 0"));
-            }
+            // TiDB defaults to 1 partition when `PARTITIONS n` is omitted.
+            let (num, end) = if keyword_at(bytes, i, "PARTITIONS") {
+                i = skip_ws(bytes, i + "PARTITIONS".len());
+                let (num, end) = parse_u64_at(bytes, i)?;
+                if num == 0 {
+                    return Err(Error::unsupported("HASH/KEY PARTITIONS 0"));
+                }
+                (num, end)
+            } else {
+                (1u64, i)
+            };
             let (has_sub, end) = parse_optional_subpartition(bytes, skip_ws(bytes, end))?;
             if has_sub {
                 return Err(subpartition_mix_error());
@@ -9617,11 +10498,23 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     num,
                     subpartition_ignored: false,
                     range_columns,
+                    interval_expr: None,
+                    interval_first: None,
+                    interval_last: None,
+                    interval_null: false,
+                    interval_maxvalue: false,
+                    interval_error: None,
                 },
                 end,
             ))
         }
         PartitionType::Range => {
+            // TiDB RANGE INTERVAL (…) FIRST … LAST … [NULL] [MAXVALUE].
+            if keyword_at(bytes, i, "INTERVAL") {
+                let (opt, end) =
+                    parse_range_interval(bytes, i, tp, column, columns, expr, range_columns)?;
+                return Ok((opt, end));
+            }
             let (has_sub, next) = parse_optional_subpartition(bytes, i)?;
             i = next;
             if i >= bytes.len() || bytes[i] != b'(' {
@@ -9631,7 +10524,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                 .ok_or_else(|| Error::unsupported("RANGE partition list"))?;
             let body = std::str::from_utf8(&bytes[i + 1..end])
                 .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid RANGE partitions"))?;
-            let defs = parse_range_defs(body)?;
+            let defs = parse_range_defs(body, bytes, i + 1)?;
             Ok((
                 PartitionOption {
                     tp,
@@ -9642,6 +10535,12 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     defs,
                     subpartition_ignored: has_sub,
                     range_columns,
+                    interval_expr: None,
+                    interval_first: None,
+                    interval_last: None,
+                    interval_null: false,
+                    interval_maxvalue: false,
+                    interval_error: None,
                 },
                 end + 1,
             ))
@@ -9656,7 +10555,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                 .ok_or_else(|| Error::unsupported("LIST partition list"))?;
             let body = std::str::from_utf8(&bytes[i + 1..end])
                 .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid LIST partitions"))?;
-            let defs = parse_list_defs(body)?;
+            let defs = parse_list_defs(body, bytes, i + 1)?;
             Ok((
                 PartitionOption {
                     tp,
@@ -9667,11 +10566,507 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     defs,
                     subpartition_ignored: has_sub,
                     range_columns,
+                    interval_expr: None,
+                    interval_first: None,
+                    interval_last: None,
+                    interval_null: false,
+                    interval_maxvalue: false,
+                    interval_error: None,
                 },
                 end + 1,
             ))
         }
     }
+}
+
+/// `INTERVAL (expr) FIRST PARTITION LESS THAN (x) LAST PARTITION LESS THAN (y)
+/// [NULL PARTITION] [MAXVALUE PARTITION]`.
+fn parse_interval_alter(bytes: &[u8], start: usize) -> Result<Option<(AlterPartOp, usize)>> {
+    let mut i = skip_ws(bytes, start);
+    if keyword_at(bytes, i, "MERGE") {
+        i = skip_ws(bytes, i + "MERGE".len());
+        if !keyword_at(bytes, i, "FIRST") {
+            return Ok(None);
+        }
+        i = skip_ws(bytes, i + "FIRST".len());
+        if !keyword_at(bytes, i, "PARTITION") {
+            return Ok(None);
+        }
+        i = skip_ws(bytes, i + "PARTITION".len());
+        let (bound, next) = parse_alter_less_than(bytes, i)?;
+        return Ok(Some((AlterPartOp::MergeFirstPartition(bound), next)));
+    }
+    if keyword_at(bytes, i, "SPLIT") {
+        i = skip_ws(bytes, i + "SPLIT".len());
+        if !(keyword_at(bytes, i, "MAXVALUE") || keyword_at(bytes, i, "LAST")) {
+            return Ok(None);
+        }
+        let kw = if keyword_at(bytes, i, "MAXVALUE") {
+            "MAXVALUE"
+        } else {
+            "LAST"
+        };
+        i = skip_ws(bytes, i + kw.len());
+        if !keyword_at(bytes, i, "PARTITION") {
+            return Ok(None);
+        }
+        i = skip_ws(bytes, i + "PARTITION".len());
+        let (bound, next) = parse_alter_less_than(bytes, i)?;
+        return Ok(Some((AlterPartOp::SplitMaxvaluePartition(bound), next)));
+    }
+    if keyword_at(bytes, i, "FIRST") {
+        i = skip_ws(bytes, i + "FIRST".len());
+        if !keyword_at(bytes, i, "PARTITION") {
+            return Ok(None);
+        }
+        i = skip_ws(bytes, i + "PARTITION".len());
+        let (bound, next) = parse_alter_less_than(bytes, i)?;
+        return Ok(Some((AlterPartOp::FirstPartition(bound), next)));
+    }
+    if keyword_at(bytes, i, "LAST") {
+        i = skip_ws(bytes, i + "LAST".len());
+        if !keyword_at(bytes, i, "PARTITION") {
+            return Ok(None);
+        }
+        i = skip_ws(bytes, i + "PARTITION".len());
+        let (bound, next) = parse_alter_less_than(bytes, i)?;
+        return Ok(Some((AlterPartOp::LastPartition(bound), next)));
+    }
+    Ok(None)
+}
+
+fn parse_alter_less_than(bytes: &[u8], mut i: usize) -> Result<(String, usize)> {
+    i = skip_ws(bytes, i);
+    if !keyword_at(bytes, i, "LESS") {
+        return Err(Error::unsupported("PARTITION LESS THAN"));
+    }
+    i = skip_ws(bytes, i + "LESS".len());
+    if !keyword_at(bytes, i, "THAN") {
+        return Err(Error::unsupported("PARTITION LESS THAN"));
+    }
+    i = skip_ws(bytes, i + "THAN".len());
+    read_interval_bound(bytes, i)
+}
+
+fn parse_range_interval(
+    bytes: &[u8],
+    mut i: usize,
+    tp: PartitionType,
+    column: String,
+    columns: Vec<String>,
+    expr: Option<String>,
+    range_columns: bool,
+) -> Result<(PartitionOption, usize)> {
+    i = skip_ws(bytes, i + "INTERVAL".len());
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return Err(Error::unsupported("INTERVAL (expr)"));
+    }
+    let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("INTERVAL"))?;
+    let interval_expr = std::str::from_utf8(&bytes[i + 1..close])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    i = skip_ws(bytes, close + 1);
+    if !keyword_at(bytes, i, "FIRST") {
+        return Err(Error::unsupported("INTERVAL FIRST PARTITION"));
+    }
+    i = skip_ws(bytes, i + "FIRST".len());
+    if !keyword_at(bytes, i, "PARTITION") {
+        return Err(Error::unsupported("INTERVAL FIRST PARTITION"));
+    }
+    i = skip_ws(bytes, i + "PARTITION".len());
+    if !keyword_at(bytes, i, "LESS") {
+        return Err(Error::unsupported("INTERVAL FIRST LESS THAN"));
+    }
+    i = skip_ws(bytes, i + "LESS".len());
+    if !keyword_at(bytes, i, "THAN") {
+        return Err(Error::unsupported("INTERVAL FIRST LESS THAN"));
+    }
+    i = skip_ws(bytes, i + "THAN".len());
+    let (first, next) = read_interval_bound(bytes, i)?;
+    i = skip_ws(bytes, next);
+    if !keyword_at(bytes, i, "LAST") {
+        return Err(Error::unsupported("INTERVAL LAST PARTITION"));
+    }
+    i = skip_ws(bytes, i + "LAST".len());
+    if !keyword_at(bytes, i, "PARTITION") {
+        return Err(Error::unsupported("INTERVAL LAST PARTITION"));
+    }
+    i = skip_ws(bytes, i + "PARTITION".len());
+    if !keyword_at(bytes, i, "LESS") {
+        return Err(Error::unsupported("INTERVAL LAST LESS THAN"));
+    }
+    i = skip_ws(bytes, i + "LESS".len());
+    if !keyword_at(bytes, i, "THAN") {
+        return Err(Error::unsupported("INTERVAL LAST LESS THAN"));
+    }
+    i = skip_ws(bytes, i + "THAN".len());
+    let (last, next) = read_interval_bound(bytes, i)?;
+    i = skip_ws(bytes, next);
+    let mut interval_null = false;
+    let mut interval_maxvalue = false;
+    if keyword_at(bytes, i, "NULL") {
+        i = skip_ws(bytes, i + "NULL".len());
+        if keyword_at(bytes, i, "PARTITION") {
+            interval_null = true;
+            i = skip_ws(bytes, i + "PARTITION".len());
+        }
+    }
+    if keyword_at(bytes, i, "MAXVALUE") {
+        i = skip_ws(bytes, i + "MAXVALUE".len());
+        if keyword_at(bytes, i, "PARTITION") {
+            interval_maxvalue = true;
+            i = skip_ws(bytes, i + "PARTITION".len());
+        }
+    }
+    // Expand when possible; TIMESTAMP/illegal types are rejected later in DDL
+    // (1659) so parse must not fail first with a generic 8200.
+    let (defs, interval_error) = match expand_interval_defs(
+        &interval_expr,
+        &first,
+        &last,
+        interval_null,
+        interval_maxvalue,
+    ) {
+        Ok(defs) => (defs, None),
+        Err(err) if err.code == 8200 => {
+            // Keep INTERVAL metadata; DDL decides 1659 vs 8200 from column types
+            // and re-reports this exact 8200 message when the types are legal.
+            (Vec::new(), Some(err.message.clone()))
+        }
+        Err(err) => return Err(err),
+    };
+    Ok((
+        PartitionOption {
+            tp,
+            column,
+            columns,
+            expr,
+            num: defs.len() as u64,
+            defs,
+            subpartition_ignored: false,
+            range_columns,
+            interval_expr: Some(interval_expr),
+            interval_first: Some(first),
+            interval_last: Some(last),
+            interval_null,
+            interval_maxvalue,
+            interval_error,
+        },
+        i,
+    ))
+}
+
+fn read_interval_bound(bytes: &[u8], i: usize) -> Result<(String, usize)> {
+    if i < bytes.len() && bytes[i] == b'(' {
+        let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("LESS THAN"))?;
+        let inner = std::str::from_utf8(&bytes[i + 1..close])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        return Ok((inner, close + 1));
+    }
+    Err(Error::unsupported("LESS THAN (bound)"))
+}
+
+/// Expand TiDB RANGE INTERVAL into concrete PARTITION defs.
+pub fn expand_interval_defs(
+    interval: &str,
+    first: &str,
+    last: &str,
+    null_part: bool,
+    maxvalue: bool,
+) -> Result<Vec<PartitionDef>> {
+    let first = first.trim();
+    let last = last.trim();
+    // NULL / empty FIRST or LAST cannot generate a partition list.
+    if is_interval_null_bound(first) {
+        return Err(Error::new(
+            8200,
+            "Unsupported INTERVAL partitioning: Error when generating partition values",
+        ));
+    }
+    if is_interval_null_bound(last) {
+        // TiDB surfaces a FIRST+n*INTERVAL mismatch with an empty expr.
+        let step_txt = parse_interval_step(interval)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| interval.trim().to_string());
+        return Err(Error::new(
+            8200,
+            format!(
+                "Unsupported INTERVAL: expr () not matching FIRST + n INTERVALs ({first} + n * {step_txt})"
+            ),
+        ));
+    }
+    // Quoted / NULL / non-numeric INTERVAL values → "should be a positive number".
+    if interval_step_must_be_positive_number(interval) {
+        return Err(Error::new(
+            8200,
+            "Unsupported INTERVAL, should be a positive number",
+        ));
+    }
+    let mut defs = Vec::new();
+    if null_part {
+        // Placeholder; DDL rewrites to the column type minimum (unsigned → 0).
+        defs.push({
+            let mut d = PartitionDef::named("P_NULL");
+            d.less_than = Some(i64::MIN.to_string());
+            d
+        });
+    }
+    // Quoted FIRST/LAST bounds are date/datetime/string, never INT. Treating
+    // `'0'`/`'10000000'` as integers would invent partitions and surface 1654
+    // instead of TiDB's 8200 for VARCHAR RANGE COLUMNS + INTERVAL.
+    let quoted_bounds = first.starts_with('\'') || last.starts_with('\'');
+    if !quoted_bounds {
+        if let (Ok(step), Ok(mut cur), Ok(end)) = (
+            parse_interval_step(interval),
+            first.parse::<i64>(),
+            last.parse::<i64>(),
+        ) {
+            if step <= 0 {
+                return Err(Error::new(
+                    8200,
+                    "Unsupported INTERVAL, should be a positive number",
+                ));
+            }
+            // LAST must land on FIRST + n * INTERVAL (TiDB).
+            if end < cur || (end - cur) % step != 0 {
+                return Err(Error::new(
+                    8200,
+                    format!(
+                        "Unsupported INTERVAL: expr ({end}) not matching FIRST + n INTERVALs ({first} + n * {step})"
+                    ),
+                ));
+            }
+            while cur <= end {
+                let mut d = PartitionDef::named(format!("P_LT_{cur}"));
+                d.less_than = Some(cur.to_string());
+                defs.push(d);
+                cur = cur.saturating_add(step);
+            }
+        } else {
+            defs.extend(expand_temporal_interval(interval, first, last)?);
+        }
+    } else {
+        // Temporal interval: generate by repeatedly adding the unit.
+        defs.extend(expand_temporal_interval(interval, first, last)?);
+    }
+    if maxvalue {
+        let mut d = PartitionDef::named("P_MAXVALUE");
+        d.less_than = None;
+        d.missing_bound = false;
+        defs.push(d);
+    }
+    if defs.is_empty() {
+        return Err(Error::unsupported("INTERVAL produced no partitions"));
+    }
+    Ok(defs)
+}
+
+fn is_interval_null_bound(s: &str) -> bool {
+    s.is_empty() || s.eq_ignore_ascii_case("NULL")
+}
+
+fn interval_step_must_be_positive_number(interval: &str) -> bool {
+    let t = interval.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("NULL") {
+        return true;
+    }
+    if (t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')) {
+        return true;
+    }
+    false
+}
+
+fn parse_interval_step(interval: &str) -> Result<i64> {
+    let t = interval.trim();
+    // `N * M * …` (suite uses `1000 * 1000`).
+    if t.contains('*') {
+        let mut prod: i64 = 1;
+        for part in t.split('*') {
+            let n: i64 = part.trim().parse().map_err(|_| {
+                Error::new(8200, "Unsupported INTERVAL, should be a positive number")
+            })?;
+            prod = prod.saturating_mul(n);
+        }
+        return Ok(prod);
+    }
+    // Bare number, or `N UNIT` where UNIT is ignored for numeric columns.
+    let num: String = t
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+')
+        .collect();
+    // Reject `123abc` / trailing junk that is not a time unit word.
+    let rest = t[num.len()..].trim();
+    if !num.is_empty() && !rest.is_empty() {
+        let unit_ok = rest
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || c.is_ascii_whitespace());
+        if !unit_ok {
+            return Err(Error::new(
+                8200,
+                "Unsupported INTERVAL, should be a positive number",
+            ));
+        }
+    }
+    num.parse::<i64>()
+        .map_err(|_| Error::new(8200, "Unsupported INTERVAL, should be a positive number"))
+}
+
+fn expand_temporal_interval(interval: &str, first: &str, last: &str) -> Result<Vec<PartitionDef>> {
+    // Minimal WEEK/MONTH support for the suite: advance date strings.
+    let parts: Vec<&str> = interval.split_whitespace().collect();
+    let (n, unit) = match parts.as_slice() {
+        [n, u] => (
+            n.parse::<i64>().map_err(|_| {
+                Error::new(8200, "Unsupported INTERVAL, should be a positive number")
+            })?,
+            u.to_ascii_uppercase(),
+        ),
+        _ => {
+            return Err(Error::new(
+                8200,
+                "Unsupported INTERVAL partitioning, only supports Date, Datetime and INT types",
+            ));
+        }
+    };
+    if n <= 0 {
+        return Err(Error::new(
+            8200,
+            "Unsupported INTERVAL, should be a positive number",
+        ));
+    }
+    let strip = |s: &str| s.trim().trim_matches('\'').to_string();
+    let first = strip(first);
+    let last = strip(last);
+    let mut defs = Vec::new();
+    // TiDB adds `n` intervals to the ORIGINAL FIRST bound each time, so a
+    // month step from the 31st keeps clamping per month (`2022-01-31` + 2
+    // months is `2022-03-31`, not `2022-03-28`).
+    let advance = |base: &str, count: i64| -> Result<String> {
+        match unit.as_str() {
+            "WEEK" | "WEEKS" => add_days_ymd(base, 7 * count),
+            "DAY" | "DAYS" => add_days_ymd(base, count),
+            "MONTH" | "MONTHS" => add_months_ymd(base, count),
+            "YEAR" | "YEARS" => add_months_ymd(base, 12 * count),
+            "QUARTER" | "QUARTERS" => add_months_ymd(base, 3 * count),
+            "HOUR" | "HOURS" | "MINUTE" | "MINUTES" | "SECOND" | "SECONDS" => {
+                // Datetime-with-time intervals; advance at day granularity when
+                // the bound is date-only, otherwise reject for unsupported.
+                if base.len() <= 10 {
+                    add_days_ymd(base, count)
+                } else {
+                    Err(Error::new(
+                        8200,
+                        "Unsupported INTERVAL partitioning, only supports YEAR, QUARTER, MONTH, WEEK, DAY, HOUR, MINUTE and SECOND as time unit",
+                    ))
+                }
+            }
+            _ => Err(Error::new(
+                8200,
+                "Unsupported INTERVAL partitioning, only supports YEAR, QUARTER, MONTH, WEEK, DAY, HOUR, MINUTE and SECOND as time unit",
+            )),
+        }
+    };
+    let mut step_index = 0i64;
+    loop {
+        let cur = if step_index == 0 {
+            first.clone()
+        } else {
+            advance(&first, step_index * n)?
+        };
+        if cur > last {
+            return Err(Error::new(
+                8200,
+                format!(
+                    "Unsupported INTERVAL: expr ({last}) not matching FIRST + n INTERVALs ({first} + n * {})",
+                    interval.trim()
+                ),
+            ));
+        }
+        let mut d = PartitionDef::named(format!("P_LT_{cur}"));
+        d.less_than = Some(format!("'{cur}'"));
+        defs.push(d);
+        if cur == last {
+            break;
+        }
+        step_index += 1;
+        if step_index > 10_000 {
+            break;
+        }
+    }
+    Ok(defs)
+}
+
+fn add_days_ymd(date: &str, days: i64) -> Result<String> {
+    // Expect YYYY-MM-DD.
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() != 3 {
+        return Err(Error::unsupported("INTERVAL date"));
+    }
+    let y: i32 = parts[0].parse().unwrap_or(1970);
+    let m: u32 = parts[1].parse().unwrap_or(1);
+    let d: u32 = parts[2].parse().unwrap_or(1);
+    let days_from = ymd_to_days(y, m, d);
+    let (ny, nm, nd) = days_to_ymd(days_from + days);
+    Ok(format!("{ny:04}-{nm:02}-{nd:02}"))
+}
+
+fn add_months_ymd(date: &str, months: i64) -> Result<String> {
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() != 3 {
+        return Err(Error::unsupported("INTERVAL date"));
+    }
+    let y: i32 = parts[0].parse().unwrap_or(1970);
+    let m: i32 = parts[1].parse().unwrap_or(1);
+    let d: u32 = parts[2].parse().unwrap_or(1);
+    let total = y * 12 + (m - 1) + months as i32;
+    let ny = total.div_euclid(12);
+    let nm = total.rem_euclid(12) + 1;
+    let max_d = days_in_month(ny, nm as u32);
+    let nd = d.min(max_d);
+    Ok(format!("{ny:04}-{nm:02}-{nd:02}"))
+}
+
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+fn ymd_to_days(y: i32, m: u32, d: u32) -> i64 {
+    // Civil days from a fixed epoch (proleptic Gregorian).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u32;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era as i64) * 146097 + doe as i64 - 719468
+}
+
+fn days_to_ymd(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i32) + (era as i32) * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Consume `SUBPARTITION BY HASH|KEY (...) [SUBPARTITIONS n]`.
@@ -9721,6 +11116,7 @@ fn subpartition_mix_error() -> Error {
 fn parse_partition_key(
     inner: &str,
     range_columns: bool,
+    key_partition: bool,
 ) -> Result<(String, Vec<String>, Option<String>)> {
     let trimmed = inner.trim();
     if trimmed.is_empty() {
@@ -9742,12 +11138,22 @@ fn parse_partition_key(
             Some(trimmed.to_string()),
         ));
     }
-    let columns = parse_partition_columns(trimmed, false)?;
+    let columns = parse_partition_columns(trimmed, key_partition)?;
     let column = columns[0].clone();
     Ok((column, columns, None))
 }
 
 fn is_partition_expr(inner: &str) -> bool {
+    let trimmed = inner.trim();
+    // Bare numeric constant (`PARTITION BY RANGE (4)` / `HASH (4)`).
+    if !trimmed.is_empty()
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'+')
+        && trimmed.bytes().any(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
     let bytes = inner.as_bytes();
     if bytes.iter().any(|b| {
         matches!(
@@ -9866,13 +11272,15 @@ pub fn parse_expr(sql: &str) -> Result<ExprNode> {
         .ok_or_else(|| Error::unsupported("partition expression"))
 }
 
-fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
+fn parse_range_defs(body: &str, sql: &[u8], body_abs: usize) -> Result<Vec<PartitionDef>> {
     let mut defs = Vec::new();
-    for raw in split_defs(body) {
+    for (raw_start, raw_end) in split_top_level_ranges(body) {
+        let raw = &body[raw_start..raw_end];
         let item = raw.trim();
         if item.is_empty() {
             continue;
         }
+        let item_abs = body_abs + raw_start + (raw.len() - raw.trim_start().len());
         let bytes = item.as_bytes();
         let mut i = skip_ws(bytes, 0);
         if !keyword_at(bytes, i, "PARTITION") {
@@ -9882,6 +11290,16 @@ fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
         let name_end = skip_ident_or_quoted(bytes, i);
         let name = item[i..name_end].trim().trim_matches('`').to_string();
         i = skip_ws(bytes, name_end);
+        if keyword_at(bytes, i, "DEFAULT")
+            || (keyword_at(bytes, i, "VALUES")
+                && keyword_at(bytes, skip_ws(bytes, i + "VALUES".len()), "IN"))
+        {
+            // LIST-only forms on a RANGE table (TiDB 1480).
+            return Err(Error::new(
+                1480,
+                "Only LIST PARTITIONING can use VALUES IN in partition definition",
+            ));
+        }
         if !keyword_at(bytes, i, "VALUES") {
             return Err(Error::unsupported("VALUES LESS THAN"));
         }
@@ -9894,7 +11312,7 @@ fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
             return Err(Error::unsupported("VALUES LESS THAN"));
         }
         i = skip_ws(bytes, i + "THAN".len());
-        let bounds = parse_less_than_bounds(bytes, i, item)?;
+        let bounds = parse_less_than_bounds(bytes, i, item, sql, item_abs)?;
         let less_than = bounds.first().cloned().flatten();
         let extra_bounds = if bounds.len() > 1 {
             bounds[1..].to_vec()
@@ -9908,6 +11326,11 @@ fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
             less_than,
             extra_bounds,
             in_values: Vec::new(),
+            list_default: false,
+            missing_bound: false,
+            values_history: false,
+            comment: None,
+            placement_policy: None,
         });
     }
     if defs.is_empty() {
@@ -9936,7 +11359,110 @@ fn skip_named_subpartitions(bytes: &[u8], i: usize) -> usize {
     matching_paren(bytes, i).map(|end| end + 1).unwrap_or(i)
 }
 
-fn parse_less_than_bounds(bytes: &[u8], i: usize, item: &str) -> Result<Vec<Option<String>>> {
+/// Unescape MySQL string-literal escapes (backslash sequences and doubled
+/// quotes) as TiDB does when it stores a partition bound.
+fn unescape_mysql_literal(inner: &str, quote: u8) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == quote as char && chars.peek() == Some(&(quote as char)) {
+            chars.next();
+            out.push(c);
+            continue;
+        }
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('0') => out.push('\0'),
+            Some('b') => out.push('\x08'),
+            Some('Z') => out.push('\x1a'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('%') => out.push_str("\\%"),
+            Some('_') => out.push_str("\\_"),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Escape a stored partition string value the way `SHOW CREATE TABLE` prints it.
+fn escape_mysql_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("''"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            '\x1a' => out.push_str("\\Z"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn decode_partition_hex(body: &str) -> Option<Vec<u8>> {
+    let body = body.trim();
+    if body.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len() / 2);
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// Canonical `'escaped'` form of a quoted or hex partition bound, or `None`
+/// when the text is not a string literal.
+fn canonical_string_bound(v: &str) -> Option<String> {
+    let bytes = v.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'))
+    {
+        let inner = unescape_mysql_literal(&v[1..v.len() - 1], bytes[0]);
+        return Some(format!("'{}'", escape_mysql_literal(&inner)));
+    }
+    let hex = if let Some(body) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        decode_partition_hex(body)
+    } else if bytes.len() >= 3
+        && (bytes[0] == b'x' || bytes[0] == b'X')
+        && bytes[1] == b'\''
+        && bytes[bytes.len() - 1] == b'\''
+    {
+        decode_partition_hex(&v[2..v.len() - 1])
+    } else {
+        None
+    }?;
+    Some(format!(
+        "'{}'",
+        escape_mysql_literal(&String::from_utf8_lossy(&hex))
+    ))
+}
+
+fn parse_less_than_bounds(
+    bytes: &[u8],
+    i: usize,
+    item: &str,
+    sql: &[u8],
+    item_abs: usize,
+) -> Result<Vec<Option<String>>> {
     if keyword_at(bytes, i, "MAXVALUE") {
         return Ok(vec![None]);
     }
@@ -9945,17 +11471,29 @@ fn parse_less_than_bounds(bytes: &[u8], i: usize, item: &str) -> Result<Vec<Opti
     }
     let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("LESS THAN"))?;
     let mut bounds = Vec::new();
+    let mut cursor = i + 1;
     for raw in item[i + 1..close].split(',') {
+        let lead = raw.len() - raw.trim_start().len();
+        let bound_start = item_abs + cursor + lead;
+        cursor += raw.len() + 1;
         let bound = raw.trim();
         if bound.is_empty() {
             continue;
         }
         if bound.eq_ignore_ascii_case("MAXVALUE") {
             bounds.push(None);
+        } else if bound.eq_ignore_ascii_case("DEFAULT") {
+            // Bare DEFAULT is only valid for LIST; RANGE rejects it as syntax.
+            let end = bound_start + bound.len();
+            return Err(syntax_error_at(sql, end, end));
         } else {
-            // RANGE COLUMNS allows literal bounds (`LESS THAN ("2020-01-01")`);
-            // keep the text (unquoted) so `locate` and pruning compare typed.
-            bounds.push(Some(unquote_partition_bound(bound)));
+            // Canonicalize quoted / hex bounds so DDL and `SHOW CREATE TABLE`
+            // round-trip `\'`, `0x…` and `x'…'` forms the way TiDB does.
+            if let Some(canonical) = canonical_string_bound(bound) {
+                bounds.push(Some(canonical));
+            } else {
+                bounds.push(Some(unquote_partition_bound(bound)));
+            }
         }
     }
     if bounds.is_empty() {
@@ -9975,13 +11513,15 @@ fn unquote_partition_bound(bound: &str) -> String {
     bound.to_string()
 }
 
-fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
+fn parse_list_defs(body: &str, sql: &[u8], body_abs: usize) -> Result<Vec<PartitionDef>> {
     let mut defs = Vec::new();
-    for raw in split_defs(body) {
+    for (raw_start, raw_end) in split_top_level_ranges(body) {
+        let raw = &body[raw_start..raw_end];
         let item = raw.trim();
         if item.is_empty() {
             continue;
         }
+        let item_abs = body_abs + raw_start + (raw.len() - raw.trim_start().len());
         let bytes = item.as_bytes();
         let mut i = skip_ws(bytes, 0);
         if !keyword_at(bytes, i, "PARTITION") {
@@ -9991,10 +11531,66 @@ fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
         let name_end = skip_ident_or_quoted(bytes, i);
         let name = item[i..name_end].trim().trim_matches('`').to_string();
         i = skip_ws(bytes, name_end);
+        if keyword_at(bytes, i, "DEFAULT") {
+            let _ = skip_named_subpartitions(bytes, i + "DEFAULT".len());
+            defs.push(PartitionDef {
+                name,
+                less_than: None,
+                extra_bounds: Vec::new(),
+                in_values: vec![ListInEntry::Default],
+                list_default: true,
+                missing_bound: false,
+                values_history: false,
+                comment: None,
+                placement_policy: None,
+            });
+            continue;
+        }
+        // Bare `PARTITION p` / `VALUES LESS THAN` — keep the def so DDL can
+        // report TiDB 1479 / 1480 instead of a parse-time 1235.
         if !keyword_at(bytes, i, "VALUES") {
-            return Err(Error::unsupported("VALUES IN"));
+            let _ = skip_named_subpartitions(bytes, i);
+            defs.push(PartitionDef {
+                name,
+                less_than: None,
+                extra_bounds: Vec::new(),
+                in_values: Vec::new(),
+                list_default: false,
+                missing_bound: true,
+                values_history: false,
+                comment: None,
+                placement_policy: None,
+            });
+            continue;
         }
         i = skip_ws(bytes, i + "VALUES".len());
+        if keyword_at(bytes, i, "LESS") {
+            i = skip_ws(bytes, i + "LESS".len());
+            if !keyword_at(bytes, i, "THAN") {
+                return Err(Error::unsupported("VALUES LESS THAN"));
+            }
+            i = skip_ws(bytes, i + "THAN".len());
+            let bounds = parse_less_than_bounds(bytes, i, item, sql, item_abs)?;
+            let less_than = bounds.first().cloned().flatten();
+            let extra_bounds = if bounds.len() > 1 {
+                bounds[1..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let _ = skip_named_subpartitions(bytes, after_less_than(bytes, i)?);
+            defs.push(PartitionDef {
+                name,
+                less_than,
+                extra_bounds,
+                in_values: Vec::new(),
+                list_default: false,
+                missing_bound: false,
+                values_history: false,
+                comment: None,
+                placement_policy: None,
+            });
+            continue;
+        }
         if !keyword_at(bytes, i, "IN") {
             return Err(Error::unsupported("VALUES IN"));
         }
@@ -10003,23 +11599,18 @@ fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
             return Err(Error::unsupported("VALUES IN"));
         }
         let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("VALUES IN"))?;
-        let mut in_values = Vec::new();
-        for raw_v in item[i + 1..close].split(',') {
-            let v = raw_v.trim();
-            if v.is_empty() {
-                continue;
-            }
-            in_values.push(parse_list_value(v)?);
-        }
+        let in_values = parse_list_in_values(&item[i + 1..close], sql, item_abs + i + 1)?;
         let _ = skip_named_subpartitions(bytes, close + 1);
-        if in_values.is_empty() {
-            return Err(Error::unsupported("LIST VALUES IN empty"));
-        }
         defs.push(PartitionDef {
             name,
             less_than: None,
             extra_bounds: Vec::new(),
             in_values,
+            list_default: false,
+            missing_bound: false,
+            values_history: false,
+            comment: None,
+            placement_policy: None,
         });
     }
     if defs.is_empty() {
@@ -10029,27 +11620,31 @@ fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
 }
 
 fn split_defs(body: &str) -> Vec<String> {
+    split_top_level_ranges(body)
+        .into_iter()
+        .map(|(s, e)| body[s..e].to_string())
+        .collect()
+}
+
+/// Byte ranges of `body` split on depth-0 commas (quotes are not special:
+/// partition definitions have none at this level).
+fn split_top_level_ranges(body: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut depth = 0;
-    for ch in body.chars() {
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, ch) in body.char_indices() {
         match ch {
-            '(' => {
-                depth += 1;
-                cur.push(ch);
-            }
-            ')' => {
-                depth -= 1;
-                cur.push(ch);
-            }
+            '(' => depth += 1,
+            ')' => depth -= 1,
             ',' if depth == 0 => {
-                out.push(std::mem::take(&mut cur));
+                out.push((start, i));
+                start = i + ch.len_utf8();
             }
-            _ => cur.push(ch),
+            _ => {}
         }
     }
-    if !cur.trim().is_empty() {
-        out.push(cur);
+    if !body[start..].trim().is_empty() {
+        out.push((start, body.len()));
     }
     out
 }
@@ -10105,8 +11700,11 @@ fn lower_query_stmt(query: &Query) -> Result<Statement> {
             if with.is_some() && inner.with.is_some() {
                 return Err(Error::unsupported("nested WITH"));
             }
+            // `(set_op) ORDER BY … LIMIT n`: parentheses are a Query wrapper;
+            // ORDER BY / LIMIT live on the outer query and must survive unwrap.
             let mut stmt = lower_query_stmt(inner)?;
             attach_dml_with(&mut stmt, with)?;
+            attach_outer_order_limit(&mut stmt, query)?;
             Ok(stmt)
         }
         SetExpr::Insert(stmt) | SetExpr::Update(stmt) | SetExpr::Delete(stmt) => {
@@ -10162,6 +11760,42 @@ fn lower_set_opr(query: &Query) -> Result<SetOprStmt> {
         offset,
         with: None,
     })
+}
+
+/// Apply outer-query `ORDER BY` / `LIMIT` onto a statement lowered from an
+/// inner parenthesized body (`(SELECT…UNION…) ORDER BY a LIMIT 2`).
+fn attach_outer_order_limit(stmt: &mut Statement, outer: &Query) -> Result<()> {
+    let (limit, offset) = lower_limit(outer.limit_clause.as_ref())?;
+    let order_by = lower_order_by(outer.order_by.as_ref())?;
+    if limit.is_none() && offset.is_none() && order_by.is_empty() {
+        return Ok(());
+    }
+    match stmt {
+        Statement::SetOpr(set) => {
+            if set.order_by.is_empty() {
+                set.order_by = order_by;
+            }
+            if set.limit.is_none() {
+                set.limit = limit;
+            }
+            if set.offset.is_none() {
+                set.offset = offset;
+            }
+        }
+        Statement::Select(select) => {
+            if select.order_by.is_empty() {
+                select.order_by = order_by;
+            }
+            if select.limit.is_none() {
+                select.limit = limit;
+            }
+            if select.offset.is_none() {
+                select.offset = offset;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
@@ -10401,6 +12035,23 @@ fn flatten_set_expr(expr: &SetExpr) -> Result<(SelectStmt, Vec<(SetOprType, Sele
             right,
         } => {
             let tp = map_set_opr(*op, *set_quantifier)?;
+            // Parentheses on either side keep their own grouping scope
+            // (`(a UNION ALL b) INTERSECT c` must not flatten into
+            // `a UNION ALL b INTERSECT c`, which INTERSECT-precedence would
+            // then rewrite to `a UNION ALL (b ∩ c)`).
+            if let SetExpr::Query(group) = left.as_ref()
+                && matches!(group.body.as_ref(), SetExpr::SetOperation { .. })
+            {
+                let first = isolate_setopr_group(group)?;
+                if let SetExpr::Query(right_group) = right.as_ref()
+                    && matches!(right_group.body.as_ref(), SetExpr::SetOperation { .. })
+                    && set_group_needs_isolation(tp, right_group.body.as_ref())
+                {
+                    return Ok((first, vec![(tp, isolate_setopr_group(right_group)?)]));
+                }
+                let right_arm = lower_set_operand(right)?;
+                return Ok((first, vec![(tp, right_arm)]));
+            }
             let (first, mut rest) = flatten_set_expr(left)?;
             // `a UNION (b UNION ALL c)` is not the same left-deep chain as
             // `a UNION b UNION ALL c`. Keep a parenthesized set-op group as an
@@ -12908,6 +14559,8 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         select,
         shard_row_id_bits,
         pre_split_regions,
+        checks: Vec::new(),
+        placement_policy: None,
     }))
 }
 

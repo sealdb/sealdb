@@ -26,6 +26,10 @@ const MAX_ALLOWED_PACKET: usize = 67_108_864;
 const DECIMAL_MAX_PRECISION: usize = 65;
 
 thread_local! {
+    /// Base column names (`col_3`) whose FieldType charset is `binary`.
+    /// LOWER/UPPER are no-ops on those columns (TiDB / MySQL binary charset).
+    static BINARY_COLUMN_NAMES: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
     static COLLATION_MODE: RefCell<CollateMode> = const { RefCell::new(CollateMode::Bin) };
     static SQL_MODE: RefCell<String> = const { RefCell::new(String::new()) };
     static TIME_ZONE: RefCell<String> = const { RefCell::new(String::new()) };
@@ -1356,9 +1360,10 @@ pub fn with_user_vars<T>(
 /// Eval-time `@v` read (assignment statements bypass plan-time substitution).
 fn user_var_lookup(name: &str) -> Option<Datum> {
     USER_VARS.with(|cell| {
-        cell.borrow()
-            .as_ref()
-            .and_then(|vars| vars.get(&name.trim_start_matches('@').to_ascii_lowercase()).cloned())
+        cell.borrow().as_ref().and_then(|vars| {
+            vars.get(&name.trim_start_matches('@').to_ascii_lowercase())
+                .cloned()
+        })
     })
 }
 
@@ -1950,6 +1955,37 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "LOWER" | "LCASE" => eval_case_convert(func, schema, row, false),
         "UPPER" | "UCASE" => eval_case_convert(func, schema, row, true),
         "SUBSTRING" | "SUBSTR" | "MID" => eval_substring(func, schema, row),
+        // MySQL `TO_BASE64(str)` / `FROM_BASE64(str)`.
+        "TO_BASE64" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "TO_BASE64 requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            Ok(Datum::Bytes(mysql_base64_encode(&v.as_bytes())))
+        }
+        "FROM_BASE64" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "FROM_BASE64 requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text = String::from_utf8_lossy(&v.as_bytes()).into_owned();
+            match crate::builtin_binary_plan::base64_decode_std(text.trim()) {
+                Ok(bytes) => Ok(Datum::Bytes(bytes)),
+                Err(_) => Ok(Datum::Null),
+            }
+        }
         // MySQL `REPEAT(str, count)`: repeat the argument `count` times; a
         // non-positive count yields the empty string.
         "REPEAT" => {
@@ -2156,6 +2192,37 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             Ok(Datum::I64(0))
         }
         "FROM_UNIXTIME" => eval_from_unixtime(func, schema, row),
+        // MySQL `FROM_DAYS(N)`: the date `N` days after year 0, rendering the
+        // `YYYY-MM-DD` text TiDB returns in a string context.
+        "FROM_DAYS" => {
+            let Some(arg) = func.args.first() else {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "FROM_DAYS requires 1 argument",
+                ));
+            };
+            let value = eval_expr_with_row(arg, schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let (y, m, d) = civil_from_days(value.as_i64()? - 719528);
+            Ok(Datum::Bytes(format!("{y:04}-{m:02}-{d:02}").into_bytes()))
+        }
+        // MySQL `CHAR(N, …)`: the utf8mb4 string of the given code points.
+        "CHAR" => {
+            let mut out = String::new();
+            for arg in &func.args {
+                let value = eval_expr_with_row(arg, schema, row)?;
+                if value.is_null() {
+                    continue;
+                }
+                let code = (value.as_i64()? as u64 & u64::from(u32::MAX)) as u32;
+                if let Some(ch) = char::from_u32(code) {
+                    out.push(ch);
+                }
+            }
+            Ok(Datum::Bytes(out.into_bytes()))
+        }
         "YEAR" => eval_date_part(func, schema, row, |t| i64::from(t.year)),
         "MONTH" => eval_date_part(func, schema, row, |t| i64::from(t.month)),
         "DAY" | "DAYOFMONTH" => eval_date_part(func, schema, row, |t| i64::from(t.day)),
@@ -2395,7 +2462,10 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             if !ok_args {
                 return Err(Error::new(
                     sealdb_errno::ERR_WRONG_ARGUMENTS,
-                    format!("{name} requires {} argument(s)", if name == "LOG" { "1 or 2" } else { "1" }),
+                    format!(
+                        "{name} requires {} argument(s)",
+                        if name == "LOG" { "1 or 2" } else { "1" }
+                    ),
                 ));
             }
             let mut vals = Vec::with_capacity(func.args.len());
@@ -3075,8 +3145,64 @@ fn format_number(value: f64, decimals: usize) -> String {
     grouped
 }
 
+/// Clear binary-charset column names registered for the current statement.
+pub fn clear_binary_columns() {
+    BINARY_COLUMN_NAMES.with(|set| set.borrow_mut().clear());
+}
+
+/// Register a column's base name as binary-charset (LOWER/UPPER no-op).
+pub fn note_binary_column(name: &str) {
+    let base = name
+        .rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .trim_start_matches('\u{1}')
+        .to_ascii_lowercase();
+    if base.is_empty() {
+        return;
+    }
+    BINARY_COLUMN_NAMES.with(|set| {
+        set.borrow_mut().insert(base);
+    });
+}
+
+/// Register every binary-charset column from a table's FieldTypes.
+pub fn note_binary_columns_from_table(info: &TableInfo) {
+    for col in &info.columns {
+        if col.field_type.charset == "binary" {
+            note_binary_column(col.name.o());
+        }
+    }
+}
+
+/// Whether `name` (possibly `db.t.col`) is registered as binary-charset.
+pub fn column_base_is_binary(name: &str) -> bool {
+    let base = name
+        .rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .trim_start_matches('\u{1}')
+        .to_ascii_lowercase();
+    BINARY_COLUMN_NAMES.with(|set| set.borrow().contains(&base))
+}
+
+fn column_name_is_binary(name: &str) -> bool {
+    column_base_is_binary(name)
+}
+
+fn expr_is_binary_charset(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Column(col) => column_name_is_binary(&col.name),
+        // CAST(... AS BINARY) / binary literals stay binary under case convert.
+        ExprNode::Cast(c) if c.target.to_ascii_uppercase().contains("BINARY") => true,
+        ExprNode::Value(v) if matches!(v.datum, Datum::Bit(_)) => true,
+        _ => false,
+    }
+}
+
 /// MySQL `LOWER(str)` / `UPPER(str)` (also `LCASE` / `UCASE`): NULL in → NULL,
-/// non-text arguments go through their string form.
+/// non-text arguments go through their string form. Binary-charset arguments
+/// are unchanged (TiDB: no case mapping for `binary` / VARBINARY).
 fn eval_case_convert(
     func: &FuncCallExpr,
     schema: &[String],
@@ -3089,9 +3215,23 @@ fn eval_case_convert(
             format!("{} requires 1 argument", func.name),
         ));
     }
+    let binary_arg = expr_is_binary_charset(&func.args[0]);
     let v = eval_expr_with_row(&func.args[0], schema, row)?;
     if v.is_null() {
         return Ok(Datum::Null);
+    }
+    // Propagate binary-ness of resolved columns named only in the schema
+    // (`Column#N` from an agg over a VARBINARY source).
+    let binary = binary_arg
+        || matches!(&v, Datum::Bit(_))
+        || matches!(&func.args[0], ExprNode::Column(col) if {
+            // Resolve schema slot name when the AST column is `Column#N`.
+            schema.iter().any(|name| {
+                column_matches(col, name) && column_name_is_binary(name)
+            })
+        });
+    if binary {
+        return Ok(Datum::Bytes(v.as_bytes()));
     }
     let text = String::from_utf8_lossy(&v.as_bytes()).into_owned();
     let out = if upper {
@@ -3104,6 +3244,31 @@ fn eval_case_convert(
 
 /// MySQL `SUBSTRING(str, pos[, len])`: 1-based; negative `pos` counts from the
 /// end; `pos = 0`, negative `len` yield `''`. Character-based (utf8mb4).
+/// MySQL `TO_BASE64` alphabet (standard base64 with padding).
+fn mysql_base64_encode(data: &[u8]) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 63]);
+        out.push(ALPHABET[(n >> 12) as usize & 63]);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6) as usize & 63]);
+        } else {
+            out.push(b'=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[n as usize & 63]);
+        } else {
+            out.push(b'=');
+        }
+    }
+    out
+}
+
 fn eval_substring(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     if !(2..=3).contains(&func.args.len()) {
         return Err(Error::new(
@@ -3356,24 +3521,19 @@ fn truncate_decimal(decimal: MyDecimal, scale: i64) -> Result<Datum> {
 /// `WEIGHT_STRING` argument that is a plain literal, if any.
 fn weight_string_literal(expr: &ExprNode) -> Option<String> {
     match expr {
-        ExprNode::Value(value) => Some(String::from_utf8_lossy(&value.datum.as_bytes()).into_owned()),
+        ExprNode::Value(value) => {
+            Some(String::from_utf8_lossy(&value.datum.as_bytes()).into_owned())
+        }
         _ => None,
     }
 }
 
 fn looks_like_collation(text: &str) -> bool {
     text == "binary"
-        || (text.contains('_')
-            && text
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        || (text.contains('_') && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
-fn eval_weight_string(
-    func: &FuncCallExpr,
-    schema: &[String],
-    row: &[Datum],
-) -> Result<Datum> {
+fn eval_weight_string(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     let Some(first) = func.args.first() else {
         return Err(Error::new(
             sealdb_errno::ERR_WRONG_ARGUMENTS,
@@ -3761,7 +3921,8 @@ fn eval_date_part(
     schema: &[String],
     row: &[Datum],
     part: impl Fn(&Time) -> i64,
-) -> Result<Datum> {    if func.args.len() != 1 {
+) -> Result<Datum> {
+    if func.args.len() != 1 {
         return Err(Error::new(
             sealdb_errno::ERR_WRONG_ARGUMENTS,
             format!("{} requires 1 argument", func.name),
@@ -4107,9 +4268,7 @@ fn leading_int_prefix(text: &str) -> Option<i128> {
     let mut any = false;
     for b in rest.iter().take_while(|b| b.is_ascii_digit()) {
         any = true;
-        v = v
-            .saturating_mul(10)
-            .saturating_add(i128::from(b - b'0'));
+        v = v.saturating_mul(10).saturating_add(i128::from(b - b'0'));
     }
     if !any {
         return None;
@@ -4235,9 +4394,7 @@ fn interval_micros(d: &Datum, scale: i128, string_is_number: bool) -> Result<Opt
             // String amounts truncate toward zero (`"2.9"` micro → 2).
             let scaled = sealdb_types::datum::mysql_numeric_prefix(&text) * scale as f64;
             let truncated = scaled.trunc();
-            if !truncated.is_finite()
-                || truncated < i64::MIN as f64
-                || truncated > i64::MAX as f64
+            if !truncated.is_finite() || truncated < i64::MIN as f64 || truncated > i64::MAX as f64
             {
                 return Ok(None);
             }
@@ -4275,10 +4432,7 @@ fn composite_interval_layout(unit: &str) -> Option<(usize, usize)> {
 /// fields right to left (`"2.2" HOUR_MINUTE` → 2 hours 2 minutes). The
 /// microsecond field is a fraction padded right to six digits (`"2"` →
 /// 200000 µs), which is why `INTERVAL -2 SECOND_MICROSECOND` subtracts 0.2 s.
-fn parse_composite_interval(
-    unit: &str,
-    text: &str,
-) -> Result<Option<(i64, i64, i64, i128)>> {
+fn parse_composite_interval(unit: &str, text: &str) -> Result<Option<(i64, i64, i64, i128)>> {
     let Some((start, max_fields)) = composite_interval_layout(unit) else {
         return Ok(None);
     };
@@ -4352,9 +4506,8 @@ fn parse_composite_interval(
         micro = micro * 10 + i128::from(d - b'0');
     }
     micro *= 10i128.pow((6 - taken) as u32);
-    let truncated = |v: i128| -> i64 {
-        i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
-    };
+    let truncated =
+        |v: i128| -> i64 { i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX }) };
     let to_days: i128 = i128::from(hours) * 3600 + i128::from(minutes) * 60 + i128::from(seconds);
     let day_part = days as i128 + to_days / 86_400;
     let second_part = to_days % 86_400;
@@ -4515,9 +4668,7 @@ fn datetime_overflow() -> Error {
 /// through the civil-date helper.
 fn add_micros(mut t: Time, micros: i128) -> Result<Time> {
     const DAY_MICROS: i128 = 86_400_000_000;
-    let base = (i128::from(t.hour) * 3600
-        + i128::from(t.minute) * 60
-        + i128::from(t.second))
+    let base = (i128::from(t.hour) * 3600 + i128::from(t.minute) * 60 + i128::from(t.second))
         * 1_000_000
         + i128::from(t.micro);
     let total = base + micros;
@@ -4558,9 +4709,7 @@ fn add_interval_amount_datum(
     };
     match result {
         Ok(t) => Ok(Datum::Time(t)),
-        Err(err)
-            if err.code == sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW && !strict_dml() =>
-        {
+        Err(err) if err.code == sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW && !strict_dml() => {
             push_warning(
                 sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW,
                 "Datetime function: datetime field overflow",
@@ -5028,9 +5177,7 @@ fn eval_add_sub_time(
     t.tp = TimeType::Datetime;
     match add_micros(t, signed) {
         Ok(t) => Ok(Datum::Time(t)),
-        Err(err)
-            if err.code == sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW && !strict_dml() =>
-        {
+        Err(err) if err.code == sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW && !strict_dml() => {
             push_warning(
                 sealdb_errno::ERR_DATETIME_FUNCTION_OVERFLOW,
                 "Datetime function: datetime field overflow",
@@ -5072,11 +5219,10 @@ fn normalize_zero_date(t: &mut Time) -> bool {
 fn duration_micros(d: &Datum) -> Option<i128> {
     match d {
         Datum::Time(t) => {
-            let micros = (i128::from(t.hour) * 3600
-                + i128::from(t.minute) * 60
-                + i128::from(t.second))
-                * 1_000_000
-                + i128::from(t.micro);
+            let micros =
+                (i128::from(t.hour) * 3600 + i128::from(t.minute) * 60 + i128::from(t.second))
+                    * 1_000_000
+                    + i128::from(t.micro);
             Some(if t.neg { -micros } else { micros })
         }
         Datum::Bytes(bytes) => parse_duration_micros(&String::from_utf8_lossy(bytes)),
@@ -5109,10 +5255,7 @@ fn parse_duration_micros(text: &str) -> Option<i128> {
             };
             let micro = match frac {
                 Some(frac) => {
-                    let digits: String = frac
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect();
+                    let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if digits.is_empty() {
                         0
                     } else {
@@ -5125,8 +5268,8 @@ fn parse_duration_micros(text: &str) -> Option<i128> {
         }
         None => (0, 0),
     };
-    let total = ((days * 86_400 + hour * 3600 + minute * 60 + second) * 1_000_000)
-        + i128::from(micro);
+    let total =
+        ((days * 86_400 + hour * 3600 + minute * 60 + second) * 1_000_000) + i128::from(micro);
     Some(if neg { -total } else { total })
 }
 
@@ -5134,9 +5277,7 @@ fn parse_duration_micros(text: &str) -> Option<i128> {
 /// `-838:59:59.999999 ..= 838:59:59.999999` range (NULL outside it).
 fn add_time_micros(t: Time, micros: i128) -> Datum {
     const LIMIT: i128 = 838 * 3_600_000_000 + 59 * 60_000_000 + 59_999_999;
-    let base = (i128::from(t.hour) * 3600
-        + i128::from(t.minute) * 60
-        + i128::from(t.second))
+    let base = (i128::from(t.hour) * 3600 + i128::from(t.minute) * 60 + i128::from(t.second))
         * 1_000_000
         + i128::from(t.micro);
     let total = (if t.neg { -base } else { base }) + micros;

@@ -211,6 +211,29 @@ fn flip_cmp(op: Op) -> Op {
     }
 }
 
+/// `Some(ci)` when `expr` is an `expr COLLATE name` wrapper; `ci` is true for
+/// a case-insensitive collation name.
+fn explicit_collation_ci(expr: &sealdb_parser::ast::expressions::ExprNode) -> Option<bool> {
+    use sealdb_parser::ast::expressions::ExprNode;
+    let ExprNode::Func(func) = expr else {
+        return None;
+    };
+    if !func.name.eq_ignore_ascii_case("__collate") {
+        return None;
+    }
+    let Some(ExprNode::Value(value)) = func.args.get(1) else {
+        return None;
+    };
+    let sealdb_types::Datum::Bytes(name) = &value.datum else {
+        return None;
+    };
+    Some(
+        String::from_utf8_lossy(name)
+            .to_ascii_lowercase()
+            .ends_with("_ci"),
+    )
+}
+
 fn const_i64(expr: &sealdb_parser::ast::expressions::ExprNode) -> Option<i64> {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_types::Datum;
@@ -231,6 +254,10 @@ fn const_datum(expr: &sealdb_parser::ast::expressions::ExprNode) -> Option<seald
         .map(sealdb_types::Datum::I64)
         .or_else(|| match expr {
             ExprNode::Value(v) => Some(v.datum.clone()),
+            // `literal COLLATE name` stays a comparison constant.
+            ExprNode::Func(f) if f.name.eq_ignore_ascii_case("__collate") => {
+                f.args.first().and_then(const_datum)
+            }
             _ => None,
         })
 }
@@ -268,6 +295,16 @@ fn comparison_rows(
     let stats = table.column(col)?;
     stats.value_counts.as_ref()?;
     let rows = table.count as f64;
+    // A `COLLATE` on the literal takes the comparison out of the column's
+    // statistics: TiDB keeps no range estimates for inequalities with an
+    // explicit collation, and a `*_ci` literal cannot reuse the binary column
+    // statistics. Equality against a `*_ci` column still estimates normally.
+    if let Some(explicit_ci) = explicit_collation_ci(left).or_else(|| explicit_collation_ci(right))
+    {
+        if op != Op::Eq || (explicit_ci && !stats.ci) {
+            return Some(rows * 0.8);
+        }
+    }
     let point = || stats.exact_point_count(&datum).map(|c| c as f64);
     match op {
         Op::Eq => point(),

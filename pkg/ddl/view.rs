@@ -493,6 +493,8 @@ pub fn create_view(
         pre_split_regions: None,
         refer_table: None,
         select: None,
+        checks: Vec::new(),
+        placement_policy: None,
     };
     let mut info = build_table_info(&create, table_id)?;
     info.view = Some(ViewInfo {

@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 118,
-      "in_progress": 9,
+      "green": 125,
+      "in_progress": 10,
       "local": 8,
-      "pending": 117
+      "pending": 109
     },
     "by_wave": {
       "D": 2,
@@ -306,7 +306,7 @@
     {
       "name": "ddl/db_partition",
       "wave": "R3",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/db_partition.test",
       "result": "r/ddl/db_partition.result",
       "has_result": true,
@@ -686,7 +686,7 @@
     {
       "name": "executor/explainfor",
       "wave": "R3",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/explainfor.test",
       "result": "r/executor/explainfor.result",
       "has_result": true,
@@ -736,7 +736,7 @@
     {
       "name": "executor/index_lookup_join",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/index_lookup_join.test",
       "result": "r/executor/index_lookup_join.result",
       "has_result": true,
@@ -746,7 +746,7 @@
     {
       "name": "executor/index_lookup_merge_join",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/index_lookup_merge_join.test",
       "result": "r/executor/index_lookup_merge_join.result",
       "has_result": true,
@@ -756,7 +756,7 @@
     {
       "name": "executor/index_lookup_pushdown",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/index_lookup_pushdown.test",
       "result": "r/executor/index_lookup_pushdown.result",
       "has_result": true,
@@ -766,7 +766,7 @@
     {
       "name": "executor/index_lookup_pushdown_partition",
       "wave": "R3",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/index_lookup_pushdown_partition.test",
       "result": "r/executor/index_lookup_pushdown_partition.result",
       "has_result": true,
@@ -1282,7 +1282,7 @@
     {
       "name": "expression/explain",
       "wave": "R3",
-      "status": "pending",
+      "status": "green",
       "test": "t/expression/explain.test",
       "result": "r/expression/explain.result",
       "has_result": true,
@@ -1992,7 +1992,7 @@
     {
       "name": "planner/core/indexjoin",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/planner/core/indexjoin.test",
       "result": "r/planner/core/indexjoin.result",
       "has_result": true,

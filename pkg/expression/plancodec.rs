@@ -139,11 +139,7 @@ fn plan_field_len(info: &PlanInfo, indent: &[char], col: usize) -> usize {
     }
 }
 
-fn find_parent_index(
-    depths: &[usize],
-    child: usize,
-    cache: &mut HashMap<usize, usize>,
-) -> usize {
+fn find_parent_index(depths: &[usize], child: usize, cache: &mut HashMap<usize, usize>) -> usize {
     cache.insert(depths[child], child);
     let Some(parent_depth) = depths[child].checked_sub(1) else {
         return 0;

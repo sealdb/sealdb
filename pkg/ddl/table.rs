@@ -79,10 +79,19 @@ pub fn create_table(
             ));
         }
         if let Some(spec) = &built.partition {
+            // TiDB 1562: temporary tables cannot be partitioned.
+            if built.temporary || built.on_commit_delete_rows {
+                return Err(Error::new(
+                    1562,
+                    "Cannot create temporary table with partitions",
+                ));
+            }
             crate::partition::attach_partitions(meta, &mut info, spec)?;
         }
+        info.temporary = built.temporary || built.on_commit_delete_rows;
+        info.on_commit_delete_rows = built.on_commit_delete_rows;
         if let Some(raw) = &built.affinity {
-            info.affinity = affinity_setting(raw, false, info.partition.is_some())?;
+            info.affinity = affinity_setting(raw, info.temporary, info.partition.is_some())?;
         }
         info
     };

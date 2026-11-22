@@ -201,11 +201,13 @@ fn conjunction_key_ranges(
             }
             // A `LIKE 'prefix%'` only bounds the key; the pattern still has to
             // filter the rows the range returns, so it is never consumed.
+            // Check LIKE before `conjunct_bound_sets` — that helper also
+            // models prefix LIKE for selectivity, which would mark it encoded.
             let (name, bounds, encoded) =
-                if let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) {
-                    (name, bounds, true)
-                } else if let Some((name, low, high)) = pseudo::like_prefix_bound(conjunct) {
+                if let Some((name, low, high)) = pseudo::like_prefix_bound(conjunct) {
                     (name, vec![(Some((low, true)), Some((high, false)))], false)
+                } else if let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) {
+                    (name, bounds, true)
                 } else {
                     continue;
                 };
@@ -376,11 +378,12 @@ pub fn index_access_range(
     // of the range estimate, so it must not shrink the filter's row count.
     let mut bound_conjuncts: Vec<ExprNode> = Vec::new();
     for conjunct in conjuncts {
+        // Prefer LIKE so prefix patterns stay residual (see index_key_ranges).
         let (name, bounds, encoded) =
-            if let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) {
-                (name, bounds, true)
-            } else if let Some((name, low, high)) = pseudo::like_prefix_bound(conjunct) {
+            if let Some((name, low, high)) = pseudo::like_prefix_bound(conjunct) {
                 (name, vec![(Some((low, true)), Some((high, false)))], false)
+            } else if let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) {
+                (name, bounds, true)
             } else {
                 continue;
             };
@@ -591,9 +594,7 @@ fn enum_member_points(
 /// Does either side of a bound come from a string label (`e > 'b'`) rather
 /// than an ENUM ordinal (`e > 2`)?
 fn bounds_have_label(low: &Option<(Datum, bool)>, high: &Option<(Datum, bool)>) -> bool {
-    let is_label = |bound: &Option<(Datum, bool)>| {
-        matches!(bound, Some((Datum::Bytes(_), _)))
-    };
+    let is_label = |bound: &Option<(Datum, bool)>| matches!(bound, Some((Datum::Bytes(_), _)));
     is_label(low) || is_label(high)
 }
 

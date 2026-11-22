@@ -1,10 +1,11 @@
 // parallel sort workers (TiDB pkg/executor/sortexec/parallel_sort_worker.go).
 // Completeness wave / not this feature: chunk-channel fetcher, parallel spill helper.
-use crate::sortexec::sort::compare_rows;
+use crate::sortexec::sort::{compare_rows, with_order_collations};
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_expression::{collation_mode, with_collation};
 use sealdb_parser::ast::ByItem;
 use sealdb_types::Datum;
+use sealdb_util::collate::CollateMode;
 use std::thread;
 
 pub fn sort_concurrency() -> usize {
@@ -46,14 +47,20 @@ pub fn parallel_sort_rows_with(
         parts.push(rows.drain(..take).collect::<Vec<_>>());
     }
     let mode = collation_mode();
+    // Propagate per-key ORDER BY collations into worker threads (TLS does not
+    // cross thread boundaries).
+    let order_modes: Vec<CollateMode> = crate::sortexec::sort::order_collations_snapshot();
     let mut handles = Vec::with_capacity(parts.len());
     for mut part in parts {
         let by = by.to_vec();
         let schema = schema.to_vec();
+        let order_modes = order_modes.clone();
         handles.push(thread::spawn(move || {
             with_collation(mode, || {
-                part.sort_by(|a, b| compare_rows(a, b, &by, &schema));
-                part
+                with_order_collations(order_modes, || {
+                    part.sort_by(|a, b| compare_rows(a, b, &by, &schema));
+                    part
+                })
             })
         }));
     }

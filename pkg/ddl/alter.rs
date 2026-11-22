@@ -10,7 +10,8 @@ use crate::create_table::{
 };
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
 use crate::partition::{
-    add_partitions, drop_partitions, exchange_partition, repartition, truncate_partitions,
+    add_partitions, coalesce_partitions, drop_partitions, exchange_partition, remove_partitioning,
+    reorganize_partitions, repartition, truncate_partitions,
 };
 use crate::table::resolve_name;
 use sealdb_errno::{
@@ -190,20 +191,51 @@ pub fn alter_table(
             }
             // ALGORITHM/LOCK and storage table options are accepted and
             // ignored; SealDB DDL is in-place and engine-independent.
-            AlterTableSpec::Algorithm(_)
-            | AlterTableSpec::Lock(_)
-            | AlterTableSpec::TableOption { .. } => {}
+            AlterTableSpec::Algorithm(_) | AlterTableSpec::Lock(_) => {}
+            AlterTableSpec::TableOption { name, value } => {
+                if name.eq_ignore_ascii_case("PLACEMENT_POLICY") {
+                    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+                    let db = snapshot.schema_by_name(&schema).ok_or_else(|| {
+                        Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'"))
+                    })?;
+                    let mut info = snapshot
+                        .table_by_name(&schema, &table)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::new(
+                                ERR_NO_SUCH_TABLE,
+                                format!("Table '{schema}.{table}' doesn't exist"),
+                            )
+                        })?;
+                    if value.eq_ignore_ascii_case("default") {
+                        info.placement_policy = None;
+                    } else {
+                        info.placement_policy =
+                            Some(value.trim_matches(|c| c == '\'' || c == '"').to_string());
+                    }
+                    meta.update_table(db.id, &info)?;
+                    meta.gen_schema_version()?;
+                }
+            }
             AlterTableSpec::Cache { cached } => {
                 alter_cache(meta, &snapshot, stmt, *cached, current_db)?
             }
-            AlterTableSpec::AddPartition { defs } => {
+            AlterTableSpec::AddPartition { defs, count } => {
                 check_affinity_partition_op(
                     &snapshot,
                     &stmt.table,
                     current_db,
                     "Unsupported ADD PARTITION of a table with AFFINITY option",
                 )?;
-                add_partitions(meta, &snapshot, &stmt.table, defs, current_db)?;
+                add_partitions(
+                    meta,
+                    &snapshot,
+                    &stmt.table,
+                    defs,
+                    *count,
+                    current_db,
+                    storage,
+                )?;
             }
             AlterTableSpec::Repartition(option) => {
                 check_affinity_partition_op(
@@ -237,7 +269,14 @@ pub fn alter_table(
                     partition,
                     with_table,
                     current_db,
+                    storage,
                 )?;
+                // TiDB always asks for fresh statistics after a successful
+                // EXCHANGE PARTITION (`SHOW WARNINGS` right after shows 1105).
+                sealdb_expression::note_warning(
+                    1105,
+                    "after the exchange, please analyze related table of the exchange to update statistics",
+                );
             }
             AlterTableSpec::DropPartition { if_exists, names } => {
                 check_affinity_partition_op(
@@ -297,25 +336,59 @@ pub fn alter_table(
                     current_db,
                     "Unsupported REMOVE PARTITIONING of a table with AFFINITY option",
                 )?;
-                return Err(Error::unsupported("REMOVE PARTITIONING"));
+                remove_partitioning(meta, &snapshot, &stmt.table, current_db, storage)?;
             }
-            AlterTableSpec::CoalescePartition(_) => {
+            AlterTableSpec::CoalescePartition(num) => {
                 check_affinity_partition_op(
                     &snapshot,
                     &stmt.table,
                     current_db,
                     "Unsupported COALESCE PARTITION of a table with AFFINITY option",
                 )?;
-                return Err(Error::unsupported("COALESCE PARTITION"));
+                coalesce_partitions(meta, &snapshot, &stmt.table, *num, current_db, storage)?;
             }
-            AlterTableSpec::ReorganizePartition => {
+            AlterTableSpec::UnsupportedPartitionOp(msg) => {
+                return Err(Error::new(
+                    ERR_UNSUPPORTED_DDL_OPERATION,
+                    format!("Unsupported {msg}"),
+                ));
+            }
+            AlterTableSpec::FirstPartition { bound } => {
+                crate::partition::first_partition(
+                    meta,
+                    &snapshot,
+                    &stmt.table,
+                    bound,
+                    current_db,
+                    storage,
+                )?;
+            }
+            AlterTableSpec::LastPartition { bound } => {
+                crate::partition::last_partition(
+                    meta,
+                    &snapshot,
+                    &stmt.table,
+                    bound,
+                    current_db,
+                    storage,
+                )?;
+            }
+            AlterTableSpec::ReorganizePartition { names, defs } => {
                 check_affinity_partition_op(
                     &snapshot,
                     &stmt.table,
                     current_db,
                     "Unsupported REORGANIZE PARTITION of a table with AFFINITY option",
                 )?;
-                return Err(Error::unsupported("REORGANIZE PARTITION"));
+                reorganize_partitions(
+                    meta,
+                    &snapshot,
+                    &stmt.table,
+                    names,
+                    defs,
+                    current_db,
+                    storage,
+                )?;
             }
             AlterTableSpec::AddForeignKey(fk) => {
                 add_foreign_key_spec(meta, &snapshot, stmt, fk, current_db)?
@@ -2122,7 +2195,37 @@ fn convert_column_value(
             sealdb_types::Datum::I64(clamped as i64)
         });
     }
-    let mut out = value.cast(ft)?;
+    // TiDB `KindMysqlBit` → string/blob/varbinary uses the unsigned decimal
+    // spelling (`b'10101'` → `21`), while `KindBinaryLiteral` keeps raw bytes.
+    // SealDB stores both as `Datum::Bit`; `Datum::cast` keeps raw bytes for
+    // BLOB/VARBINARY so hex literals insert correctly. Column reorg from a
+    // BIT source must take the MysqlBit path instead.
+    let bit_to_binary_text = matches!(
+        ft.tp,
+        sealdb_types::field_type::TYPE_BLOB
+            | sealdb_types::field_type::TYPE_TINY_BLOB
+            | sealdb_types::field_type::TYPE_MEDIUM_BLOB
+            | sealdb_types::field_type::TYPE_LONG_BLOB
+    ) || (matches!(
+        ft.tp,
+        sealdb_types::field_type::TYPE_VAR_STRING
+            | sealdb_types::field_type::TYPE_VARCHAR
+            | sealdb_types::field_type::TYPE_STRING
+    ) && ft.charset == "binary");
+    let mut out = if bit_to_binary_text && let sealdb_types::Datum::Bit(bytes) = value {
+        let n = bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+        let mut text = n.to_string().into_bytes();
+        // `BINARY(N)` is fixed-length: zero-pad / truncate like `Datum::cast`.
+        if ft.tp == sealdb_types::field_type::TYPE_STRING && ft.flen > 0 {
+            let len = ft.flen as usize;
+            if text.len() != len {
+                text.resize(len, 0);
+            }
+        }
+        sealdb_types::Datum::Bytes(text)
+    } else {
+        value.cast(ft)?
+    };
     // FLOAT(M,D) / DOUBLE(M,D) keep D decimal digits: the reorg rounds the
     // stored value (`36.43` into FLOAT(6,1) is `36.4`).
     if matches!(

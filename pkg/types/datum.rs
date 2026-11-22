@@ -478,15 +478,13 @@ impl Datum {
                         // out-of-range magnitude to the bound.
                         Datum::Decimal(d) => {
                             let rounded = d.with_frac(0).to_string();
-                            Ok(Datum::I64(
-                                rounded.parse::<i64>().unwrap_or_else(|_| {
-                                    if rounded.starts_with('-') {
-                                        i64::MIN
-                                    } else {
-                                        i64::MAX
-                                    }
-                                }),
-                            ))
+                            Ok(Datum::I64(rounded.parse::<i64>().unwrap_or_else(|_| {
+                                if rounded.starts_with('-') {
+                                    i64::MIN
+                                } else {
+                                    i64::MAX
+                                }
+                            })))
                         }
                         other => Ok(Datum::I64(other.as_i64()?)),
                     }
@@ -502,8 +500,29 @@ impl Datum {
                 }
             }
             EvalType::String => {
-                // A BIT value renders as its unsigned integer (`b'10101'` → '21').
+                // SealDB stores both TiDB `KindBinaryLiteral` (hex/bit
+                // literals) and `KindMysqlBit` (BIT columns) as `Datum::Bit`.
+                // TiDB splits them on cast: BinaryLiteral keeps raw bytes,
+                // MysqlBit becomes the unsigned decimal (`b'10101'` → `21`),
+                // even for `BINARY(n)`. Approximate BinaryLiteral with BLOB /
+                // VARBINARY targets (`INSERT … VALUES (x'7a')` → `z`) and keep
+                // the decimal form for CHAR/VARCHAR/BINARY so `ALTER … BIT →
+                // CHAR` and `BIT → BINARY` stay correct.
                 let mut bytes = match self {
+                    Datum::Bit(b)
+                        if matches!(
+                            ft.tp,
+                            crate::field_type::TYPE_BLOB
+                                | crate::field_type::TYPE_TINY_BLOB
+                                | crate::field_type::TYPE_MEDIUM_BLOB
+                                | crate::field_type::TYPE_LONG_BLOB
+                        ) || (matches!(
+                            ft.tp,
+                            crate::field_type::TYPE_VAR_STRING | crate::field_type::TYPE_VARCHAR
+                        ) && ft.charset == "binary") =>
+                    {
+                        b.clone()
+                    }
                     Datum::Bit(b) => bit_as_u64(b).to_string().into_bytes(),
                     other => other.as_bytes(),
                 };
@@ -1186,4 +1205,97 @@ fn format_float(v: f64) -> String {
     // TiDB prints FLOAT/DOUBLE like Go `%v` (`1.0` → `1`); DECIMAL keeps its
     // scale through `Datum::Decimal` instead.
     v.to_string()
+}
+
+/// Sort/equality fold for the case-insensitive collations this engine
+/// implements (`utf8mb4_general_ci` and friends): ASCII case folding plus the
+/// Latin-1/Latin-Extended accents TiDB's UCA table treats as the base letter
+/// (`ä` folds to `a`). Matches `model::partition::ci_sort_key`.
+pub fn ci_fold_str(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let lower = c.to_lowercase().next().unwrap_or(c);
+            match lower {
+                'à'..='å' | 'ā' | 'ă' | 'ą' => 'a',
+                'ç' | 'ć' | 'č' => 'c',
+                'è'..='ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
+                'ì'..='ï' | 'ī' | 'ĭ' | 'į' => 'i',
+                'ñ' | 'ń' | 'ň' => 'n',
+                'ò'..='ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => 'o',
+                'ù'..='ü' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+                'ý' | 'ÿ' => 'y',
+                'ś' | 'š' | 'ş' => 's',
+                'ź' | 'ż' | 'ž' => 'z',
+                'ł' => 'l',
+                'đ' | 'ð' => 'd',
+                'þ' => 't',
+                'æ' => 'e',
+                'œ' => 'o',
+                other => other,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod bit_cast_tests {
+    use super::*;
+    use crate::field_type::{FieldType, TYPE_BLOB, TYPE_STRING};
+
+    #[test]
+    fn bit_to_char_is_decimal() {
+        let bit = Datum::Bit(vec![0x15]); // b'10101'
+        let mut ft = FieldType::new_string();
+        ft.tp = TYPE_STRING;
+        ft.flen = 20;
+        ft.charset = "utf8mb4".into();
+        ft.collate = "utf8mb4_bin".into();
+        let out = bit.cast(&ft).unwrap();
+        assert_eq!(out, Datum::Bytes(b"21".to_vec()), "got {out:?}");
+    }
+
+    #[test]
+    fn bit_to_blob_keeps_bytes() {
+        let bit = Datum::Bit(vec![0x7a]); // x'7a'
+        let mut ft = FieldType::default();
+        ft.tp = TYPE_BLOB;
+        ft.charset = "binary".into();
+        ft.collate = "binary".into();
+        let out = bit.cast(&ft).unwrap();
+        assert_eq!(out, Datum::Bytes(vec![0x7a]), "got {out:?}");
+    }
+
+    #[test]
+    fn bit_to_binary_is_decimal() {
+        let bit = Datum::Bit(vec![0x15]); // b'10101'
+        let mut ft = FieldType::new_string();
+        ft.tp = TYPE_STRING;
+        ft.flen = 10;
+        ft.charset = "binary".into();
+        ft.collate = "binary".into();
+        let out = bit.cast(&ft).unwrap();
+        assert_eq!(
+            out,
+            Datum::Bytes(b"21\0\0\0\0\0\0\0\0".to_vec()),
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn bit_to_varbinary_keeps_bytes() {
+        // Hex literal into VARBINARY must keep raw bytes (TiDB BinaryLiteral),
+        // not the unsigned decimal spelling used for BIT → CHAR/BINARY.
+        let bit = Datum::Bit(vec![0x61, 0x78, 0x4f, 0x4b]); // x'61784f4b'
+        let mut ft = FieldType::new_string();
+        ft.tp = crate::field_type::TYPE_VAR_STRING;
+        ft.flen = 23;
+        ft.charset = "binary".into();
+        ft.collate = "binary".into();
+        let out = bit.cast(&ft).unwrap();
+        assert_eq!(
+            out,
+            Datum::Bytes(vec![0x61, 0x78, 0x4f, 0x4b]),
+            "got {out:?}"
+        );
+    }
 }

@@ -8,10 +8,10 @@ use sealdb_errno::{
     ERR_DATA_OUT_OF_RANGE, ERR_DATA_TOO_LONG, ERR_DUP_ENTRY, ERR_FIELD_NOT_DEFAULT,
     ERR_FIELD_SPECIFIED_TWICE, ERR_INVALID_AUTO_RANDOM, ERR_NO_DB,
     ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
-    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_TRUNCATED_WRONG_VALUE,
-    ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD, ERR_UNKNOWN_ERROR, ERR_UNKNOWN_PARTITION,
-    ERR_WARN_DATA_OUT_OF_RANGE, ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error,
-    Result,
+    ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN, ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
+    ERR_TRUNCATED_WRONG_VALUE, ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD, ERR_UNKNOWN_ERROR,
+    ERR_UNKNOWN_PARTITION, ERR_WARN_DATA_OUT_OF_RANGE, ERR_WARN_DATA_TRUNCATED,
+    ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
@@ -875,6 +875,24 @@ fn eval_insert_row(
             values.push(value);
             continue;
         }
+        // Writing a generated column is only legal via bare `DEFAULT` or
+        // `DEFAULT(itself)` (TiDB 3105); any other expression is refused.
+        if let Some(target) = column_at(info, columns, i)
+            && target.generated_expr.is_some()
+        {
+            let allowed = default_column_arg(expr)
+                .is_some_and(|name| name.eq_ignore_ascii_case(target.name.o()));
+            if !allowed {
+                return Err(Error::new(
+                    ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN,
+                    format!(
+                        "The value specified for generated column '{}' in table '{}' is not allowed.",
+                        target.name.o(),
+                        info.name.o()
+                    ),
+                ));
+            }
+        }
         // `DEFAULT(col)` names the column it takes the default of, so it is
         // independent of the value's position in the row.
         if let Some(name) = default_column_arg(expr) {
@@ -896,6 +914,19 @@ fn eval_insert_row(
         // after the row has been assigned to its columns.
         let start = sealdb_expression::warnings_len();
         let value = subquery.eval(expr, &[], &[])?;
+        // TiDB binary literals (`0x…` / `x'…'`) are strings in a character
+        // context: `INSERT INTO vc VALUES (0x5c27090a)` stores the raw bytes,
+        // not the decimal value of the literal.
+        let value = match (expr, &value) {
+            (ExprNode::Value(v), Datum::Bit(b))
+                if column_at(info, columns, i)
+                    .is_some_and(|col| col.field_type.is_character_type()) =>
+            {
+                let _ = v;
+                Datum::Bytes(b.clone())
+            }
+            _ => value,
+        };
         if row.len() == 1 && matches!(expr, ExprNode::Cast(_)) {
             deferred_warnings = sealdb_expression::take_warnings_from(start);
         }
@@ -1424,6 +1455,17 @@ pub(crate) fn fill_generated_columns(
                 continue;
             }
             let value = eval_expr_with_row(&expr, &schema, values)?;
+            // TiDB binary literals (`0x…` / `x'…'`) are strings in a character
+            // context: `INSERT INTO vc VALUES (0x5c27090a)` stores the raw
+            // bytes, not the decimal value of the literal.
+            let value = match (&expr, &value) {
+                (sealdb_parser::ast::expressions::ExprNode::Value(v), Datum::Bit(b))
+                    if col.field_type.is_character_type() =>
+                {
+                    Datum::Bytes(b.clone())
+                }
+                _ => value,
+            };
             values[offset] = cast_for_column(&value, col)?;
         }
         Ok(())
@@ -1669,8 +1711,10 @@ pub(crate) fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Resul
     // `NO_ZERO_IN_DATE` / `NO_ZERO_DATE` policy decides whether the row can be
     // written. Strict mode rejects the value with 1292; otherwise it is stored
     // as the zero date with a 1292 warning.
-    if matches!(col.field_type.tp, TYPE_DATE | TYPE_DATETIME | sealdb_types::TYPE_TIMESTAMP)
-        && matches!(v, Datum::Bytes(_))
+    if matches!(
+        col.field_type.tp,
+        TYPE_DATE | TYPE_DATETIME | sealdb_types::TYPE_TIMESTAMP
+    ) && matches!(v, Datum::Bytes(_))
         && let Datum::Time(t) = out
     {
         let zero_date = t.year == 0 && t.month == 0 && t.day == 0;
@@ -1683,11 +1727,8 @@ pub(crate) fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Resul
                 || (zero_date && sealdb_expression::sql_mode_flag("NO_ZERO_DATE"))
         };
         if rejected {
-            let err = temporal_column_error(
-                v,
-                col,
-                Error::new(ERR_TRUNCATED_WRONG_VALUE, String::new()),
-            );
+            let err =
+                temporal_column_error(v, col, Error::new(ERR_TRUNCATED_WRONG_VALUE, String::new()));
             if strict_sql_mode() {
                 return Err(err);
             }

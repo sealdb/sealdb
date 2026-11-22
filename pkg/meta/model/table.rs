@@ -66,6 +66,9 @@ thread_local! {
     /// `BuildTableInfo` need not thread session state through the DDL layer.
     static CLUSTERED_INDEX_MODE: Cell<ClusteredIndexMode> =
         const { Cell::new(ClusteredIndexMode::On) };
+    /// TiDB `tidb_enable_check_constraint` (default ON): EXCHANGE PARTITION
+    /// validates ENFORCED CHECK expressions when this is true.
+    static ENABLE_CHECK_CONSTRAINT: Cell<bool> = const { Cell::new(true) };
 }
 
 pub fn clustered_index_mode() -> ClusteredIndexMode {
@@ -78,6 +81,17 @@ pub fn with_clustered_index_mode<T>(mode: ClusteredIndexMode, f: impl FnOnce() -
     let previous = CLUSTERED_INDEX_MODE.with(|cell| cell.replace(mode));
     let out = f();
     CLUSTERED_INDEX_MODE.with(|cell| cell.set(previous));
+    out
+}
+
+pub fn enable_check_constraint() -> bool {
+    ENABLE_CHECK_CONSTRAINT.with(|c| c.get())
+}
+
+pub fn with_enable_check_constraint<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let previous = ENABLE_CHECK_CONSTRAINT.with(|cell| cell.replace(on));
+    let out = f();
+    ENABLE_CHECK_CONSTRAINT.with(|cell| cell.set(previous));
     out
 }
 
@@ -254,6 +268,19 @@ pub struct TableInfo {
     /// DELETE ROWS`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub on_commit_delete_rows: bool,
+    /// Column / table `CHECK (expr) [NOT] ENFORCED` constraints (TiDB).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CheckConstraint>,
+    /// TiDB `PLACEMENT POLICY='name'` table option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_policy: Option<String>,
+}
+
+/// One `CHECK` constraint captured at CREATE TABLE time.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CheckConstraint {
+    pub expr: String,
+    pub enforced: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -319,6 +346,8 @@ impl TableInfo {
             affinity: String::new(),
             temporary: false,
             on_commit_delete_rows: false,
+            checks: Vec::new(),
+            placement_policy: None,
         }
     }
 

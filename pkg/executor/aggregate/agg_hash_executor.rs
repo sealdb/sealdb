@@ -78,6 +78,9 @@ impl HashAggExec {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| match &field.expr {
                     ExprNode::Column(col) => col.name.clone(),
+                    // A literal's name is its unquoted value (`SELECT 'p0'` →
+                    // `p0`), not the source text `'p0'`.
+                    ExprNode::Value(_) => crate::builder::field_output_name(field),
                     _ => field
                         .orig_text
                         .as_deref()
@@ -255,6 +258,31 @@ impl Executor for HashAggExec {
     fn open(&mut self) -> Result<()> {
         self.child.open()?;
         self.expand_stars();
+        // Agg over a binary-charset column (e.g. `min(col_3) as r4`) inherits
+        // binary so LOWER/UPPER on the alias stay no-ops.
+        for (i, item) in self.outputs.iter().enumerate() {
+            let OutputItem::Agg(ai) = item else {
+                continue;
+            };
+            let Some(name) = self.schema.get(i) else {
+                continue;
+            };
+            let func = &self.agg_specs[*ai];
+            let inherits = !func.args.is_empty()
+                && func.args.iter().all(|arg| match arg {
+                    ExprNode::Column(col) => sealdb_expression::column_base_is_binary(&col.name),
+                    // Constants / non-columns don't block inheritance when at
+                    // least one Column arg is binary (checked below).
+                    _ => true,
+                })
+                && func
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg, ExprNode::Column(col) if sealdb_expression::column_base_is_binary(&col.name)));
+            if inherits {
+                sealdb_expression::note_binary_column(name);
+            }
+        }
         self.spilled = false;
         let input_schema = self.child.schema().to_vec();
         let mut buf: Vec<Vec<Datum>> = Vec::new();
