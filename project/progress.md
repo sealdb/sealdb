@@ -4900,3 +4900,26 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - `planner/core/indexmerge_path` / `range_scan_for_like`：把 0900 权重表
     扩到非 ASCII 脚本（平假名/谚文），其余差异仍是间隔列排序与 planID。
+
+### 2026-11-22 — `planner/core/indexmerge_path` triage（25 段差异，未转绿）
+
+- **Phase**: R3 下一目标（`pending`，无金样改动）
+- **复跑**: `SEALDB_ITEST_RUN_PENDING=1 … -t planner/core/indexmerge_path`
+  → 1295 行金样 / 25 段差异，可归为 8 类根因：
+  1. `ALTER TABLE … ADD INDEX` 后新索引应为 `stats:partial[i:missing]` 且合并估
+     `1.00`；当前走 `stats:pseudo` + `0.00`。
+  2. `force index(mvi) where isnull(i) or json_contains(j,'1')`：TiDB 建 union 且把
+     `isnull(i)` 当 `TableFullScan(Build)` 臂（0.00），当前退回
+     `TableReader + Selection`。
+  3. MVIndex union 之上 residual `or(json_overlaps …, json_memberof …)` 的选择率
+     （0.01 vs 0.32、8.00 vs 9.60、0.00 vs 0.88、6.41 vs 26.99）。
+  4. `not(like …)`/`like …` 作为 cop `Selection(Build)` 的 est（0.00 vs 0.30）。
+  5. 臂 residual（`not(like …)`）应留在 probe `Selection`，当前被下沉成每个臂上的
+     `Selection(Build)`。
+  6. DISTINCT/聚合 + IndexMerge 形状（`HashAgg` 去重 / `Projection` 直出）。
+  7. 单列区间多出 handle 键（`range:[1 1,1 1]` vs `range:[1,1]`）。
+  8. 部分 union 估为 0（0.03 vs 33.73、0.20 vs 0.00）。
+- **结论**: 第 1/2 类是结构性小改动，第 3/8 类需重做 MVIndex 的 DNF 选择率合并，
+  第 5 类牵动臂 residual 下沉规则；按第 1→2→3 顺序拆分提交。
+- **下一步**: 先做 `stats:partial[…:missing]`（`ALTER ADD INDEX` 后的新索引 + 合并
+  估 1.00），它同时惠及 `explain_complex*` 的 partial 渲染。
