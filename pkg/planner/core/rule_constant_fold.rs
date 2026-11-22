@@ -206,6 +206,13 @@ fn fold_constants_opts(expr: &ExprNode, collapse_conflicts: bool) -> Option<Expr
     if !changed && !is_constant(&rebuilt) {
         return None;
     }
+    // A JSON cast is part of the predicate TiDB prints (`cast(1, json BINARY)`);
+    // folding it to a JSON literal would lose the comparison type information.
+    if let ExprNode::Cast(cast) = &rebuilt
+        && cast.target.to_ascii_lowercase().contains("json")
+    {
+        return changed.then_some(rebuilt);
+    }
     if let Some(folded) = try_eval(&rebuilt) {
         return Some(folded);
     }

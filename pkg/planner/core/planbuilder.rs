@@ -5749,7 +5749,11 @@ fn apply_order_limit(
         // join-cost: costed TopN vs Sort+Limit (offset forces Sort+Limit).
         // TiDB still uses TopN when offset=0; prefer_topn may also allow small offsets.
         let off = offset.unwrap_or(0);
-        if off == 0 && prefer_topn(est_rows, lim) {
+        // An IndexMerge whose arms only partially provide the order still keeps
+        // a root `TopN` (the merge itself is already the narrowed input), even
+        // with a non-zero offset.
+        let merge_topn = inner_merge(&plan).is_some();
+        if (off == 0 && prefer_topn(est_rows, lim)) || merge_topn {
             // Static prune: push TopN into each PartitionUnion arm while keeping
             // a root TopN that merges the per-partition tops (TiDB).
             if let PhysicalPlan::PartitionUnion { children } = plan {
@@ -8153,6 +8157,20 @@ pub fn cost_model_version() -> i32 {
     COST_MODEL_VERSION.with(|c| c.get())
 }
 
+/// TiDB optimizer fix control #52869: build an automatic IndexMerge union for
+/// `a = c1 and (b = c2 or c = c3 …)` instead of an IndexLookUp on `a` with the
+/// DNF as a residual filter. Set from the session's `tidb_opt_fix_control`.
+static OPT_FIX_52869: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_opt_fix_control_52869(on: bool) {
+    OPT_FIX_52869.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn opt_fix_control_52869(select: &SelectStmt) -> bool {
+    OPT_FIX_52869.load(std::sync::atomic::Ordering::Relaxed)
+        || select.text.to_ascii_lowercase().contains("52869:on")
+}
+
 /// TiDB `tidb_index_lookup_pushdown_policy` encoded as 0/1/2.
 pub const ILP_POLICY_HINT_ONLY: u8 = 0;
 pub const ILP_POLICY_FORCE: u8 = 1;
@@ -9607,7 +9625,15 @@ pub(crate) fn index_key_column_names(
             info.columns
                 .iter()
                 .find(|col| col.hidden && col.name.o().eq_ignore_ascii_case(c.name.o()))
-                .and_then(|col| col.generated_expr.clone())
+                .and_then(|col| col.generated_expr.as_deref())
+                .map(|text| {
+                    // TiDB renders an expression key part with the stored
+                    // `GeneratedExprString` shape (`cast(json_extract(`j`,
+                    // _utf8mb4'$.p') as signed array)`), not the DDL spelling.
+                    sealdb_parser::sqlparser_bridge::parse_expr(text)
+                        .map(|expr| expr.restore_string_generated())
+                        .unwrap_or_else(|_| text.to_string())
+                })
                 .unwrap_or_else(|| c.name.o().to_string())
         })
         .collect()
@@ -9914,8 +9940,15 @@ fn hidden_table_info<'a>(
 ) -> Option<&'a sealdb_meta::model::table::TableInfo> {
     let from = select.from.as_ref()?;
     let (db, table) = from.qualified(current_db);
-    is?.table_by_name(&db, &table)
-        .filter(|info| info.columns.iter().any(|c| c.hidden))
+    is?.table_by_name(&db, &table).filter(|info| {
+        info.columns.iter().any(|c| {
+            c.hidden
+                && !c
+                    .generated_expr
+                    .as_deref()
+                    .is_some_and(|text| text.to_ascii_uppercase().contains("ARRAY"))
+        })
+    })
 }
 
 /// Does the access path read an index that has an expression key part?
@@ -9927,7 +9960,13 @@ fn plan_reads_expr_index(plan: &PhysicalPlan, info: &sealdb_meta::model::table::
         info.indices
             .iter()
             .find(|index| index.name.o().eq_ignore_ascii_case(name))
-            .is_some_and(|index| super::expr_index::has_expression_part(info, index))
+            // A multi-valued index's hidden column never reaches the
+            // DataSource schema: TiDB keeps `SELECT *` without an extra
+            // Projection when the merge only reads MVIndex arms.
+            .is_some_and(|index| {
+                super::expr_index::has_expression_part(info, index)
+                    && !index_is_multi_valued(info, index)
+            })
     };
     match plan {
         PhysicalPlan::IndexReader { index, .. } | PhysicalPlan::IndexLookUpReader { index, .. } => {
@@ -10608,6 +10647,23 @@ fn projection_column_base(
                 })
                 .unwrap_or(6)
         }
+        // An IndexMerge over a multi-valued index carries that index's hidden
+        // generated column, so derived columns start one id later.
+        PhysicalPlan::IndexMerge { indexes, .. } => table
+            .map(|info| {
+                let parts = indexes
+                    .iter()
+                    .filter_map(|name| {
+                        info.indices
+                            .iter()
+                            .find(|idx| idx.name.o().eq_ignore_ascii_case(name))
+                    })
+                    .map(|idx| super::expr_index::expression_parts(info, idx).len())
+                    .max()
+                    .unwrap_or(0);
+                table_column_base(info) + parts
+            })
+            .unwrap_or(6),
         // TiDB allocates one plan column id per DataSource schema column (hidden
         // columns included) plus `_tidb_rowid` when the handle is not a
         // clustered index; the first derived expression column follows.
@@ -10622,7 +10678,19 @@ fn projection_column_base(
 /// TiDB plan column-id base after a fresh single-table `DataSource`.
 fn table_column_base(info: &sealdb_meta::model::table::TableInfo) -> usize {
     let rowid = usize::from(!info.pk_is_handle && !info.common_handle);
-    info.columns.len() + rowid + 1
+    // A multi-valued index's hidden column is never materialised in the
+    // DataSource, so it does not consume a plan column id.
+    let visible = info
+        .columns
+        .iter()
+        .filter(|c| {
+            !(c.hidden
+                && c.generated_expr
+                    .as_deref()
+                    .is_some_and(|text| text.to_ascii_uppercase().contains("ARRAY")))
+        })
+        .count();
+    visible + rowid + 1
 }
 
 /// Metadata of the single base table in `FROM`, when there is exactly one.
@@ -11316,6 +11384,13 @@ fn coerce_comparison_literals(
     let mut changed = false;
     if let Some(selection) = select.selection.as_ref() {
         let coerced = expand_casted_in_lists(&coerce_numeric_literals(selection, info));
+        if std::env::var("SEALDB_DEBUG_COERCE").is_ok() {
+            eprintln!(
+                "COERCE in={} out={}",
+                selection.restore_string(),
+                coerced.restore_string(),
+            );
+        }
         // `Time` datums restore back to the quoted literal, so compare the
         // expression trees too or the coercion would be dropped as a no-op.
         if coerced.restore_string() != selection.restore_string()
@@ -11571,6 +11646,15 @@ fn index_visible(from: &TableName, index: &sealdb_meta::model::IndexInfo) -> boo
     !index.invisible
 }
 
+/// A multi-valued index keys on a hidden `CAST(<json> AS <type> ARRAY)` part.
+fn index_is_multi_valued(info: &sealdb_meta::TableInfo, index: &sealdb_meta::IndexInfo) -> bool {
+    index.columns.iter().any(|part| {
+        super::expr_index::hidden_column(info, part)
+            .and_then(|column| column.generated_expr.as_deref())
+            .is_some_and(|text| text.to_ascii_uppercase().contains("ARRAY"))
+    })
+}
+
 /// TiDB `USE INDEX` / `FORCE INDEX`: a named key that is missing or
 /// `INVISIBLE` (with default invisible-index policy) is `Error 1176`.
 fn validate_use_index_hints(
@@ -11599,7 +11683,10 @@ fn validate_use_index_hints(
                 format!("Key '{hint}' doesn't exist in table '{}'", info.name.o()),
             ));
         };
-        if idx.invisible {
+        // A multi-valued index hint on an invisible index is silently ignored:
+        // TiDB does not report 1176 for these JSON predicates, it just falls
+        // back to the table scan (planner/core/indexmerge_path).
+        if idx.invisible && !index_is_multi_valued(info, idx) {
             return Err(Error::new(
                 ERR_KEY_DOES_NOT_EXIST,
                 format!("Key '{hint}' doesn't exist in table '{}'", info.name.o()),
@@ -11634,6 +11721,7 @@ fn unique_index_eq_point(
             // handle is reached through the handle path instead of an index.
             && !(idx.primary && info.pk_is_handle)
             && !idx.invisible
+            && !index_is_multi_valued(info, idx)
             // A unique expression index pins its hidden key just like a plain
             // unique column (`where a+1 = 3` → `Point_Get`).
             && (idx.columns.len() > 1 || super::expr_index::has_expression_part(info, idx))
@@ -11708,6 +11796,7 @@ fn dnf_unique_point(
             // handle is reached through the handle path instead of an index.
             && !(idx.primary && info.pk_is_handle)
             && !idx.invisible
+            && !index_is_multi_valued(info, idx)
             && idx.columns.len() > 1
             && index_allowed(from, idx.name.o(), only_index)
             && super::expr_index::pinned_tuple(info, idx, &arms[0]).is_some()
@@ -11872,7 +11961,9 @@ fn in_list_plan(
     for (column, values, total) in lists {
         if let Some(index) = info
             .find_unique_index_on(&column)
-            .filter(|idx| index_allowed(from, idx.name.o(), only_index))
+            .filter(|idx| {
+                !index_is_multi_valued(info, idx) && index_allowed(from, idx.name.o(), only_index)
+            })
         {
             if !local_index_point_allowed(select, from, info, index, prune_mode) {
                 continue;
@@ -12717,6 +12808,17 @@ fn coerce_numeric_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Ex
                 {
                     left = value_expr(datum);
                 }
+                // JSON comparison: TiDB wraps the constant in
+                // `cast(…, json BINARY)` (`j = 1` → `eq(j, cast(1, json BINARY))`).
+                if column_class(&left, info) == Some(ColumnClass::Json)
+                    && right.const_datum().is_some()
+                {
+                    right = cast_json(right);
+                } else if column_class(&right, info) == Some(ColumnClass::Json)
+                    && left.const_datum().is_some()
+                {
+                    left = cast_json(left);
+                }
                 // `datetime_col = '1981-09-15'`: TiDB converts the constant to
                 // the column type, so the range/Selection carry a `Time` datum.
                 // A DATE column compares as DATETIME, a TIME column folds a
@@ -12776,6 +12878,19 @@ fn coerce_numeric_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Ex
                         .map(|item| match bytes_number(item) {
                             Some(datum) => value_expr(datum),
                             None => item.clone(),
+                        })
+                        .collect();
+                }
+                Some(ColumnClass::Json) => {
+                    coerced.list = coerced
+                        .list
+                        .iter()
+                        .map(|item| {
+                            if item.const_datum().is_some() {
+                                cast_json(item.clone())
+                            } else {
+                                item.clone()
+                            }
                         })
                         .collect();
                 }
@@ -12843,6 +12958,8 @@ enum ColumnClass {
     /// column's temporal type (TiDB `types.ParseTime`), so the range text and
     /// the pushed Selection both carry `1981-09-15 00:00:00`.
     Temporal,
+    /// JSON: comparison coerces the constant with `cast(…, json BINARY)`.
+    Json,
 }
 
 fn column_class(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Option<ColumnClass> {
@@ -12874,6 +12991,7 @@ fn column_class(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Option<Column
         sealdb_types::TYPE_DATE | sealdb_types::TYPE_DATETIME | sealdb_types::TYPE_TIMESTAMP => {
             ColumnClass::Temporal
         }
+        tp if tp == sealdb_types::field_type::TYPE_JSON => ColumnClass::Json,
         _ => return None,
     })
 }
@@ -13171,6 +13289,14 @@ fn cast_double(expr: ExprNode) -> ExprNode {
     ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
         expr: Box::new(expr),
         target: "DOUBLE".to_string(),
+        json: false,
+    })
+}
+
+fn cast_json(expr: ExprNode) -> ExprNode {
+    ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
+        expr: Box::new(expr),
+        target: "json".to_string(),
         json: false,
     })
 }
@@ -14459,6 +14585,8 @@ pub(crate) fn expr_range_plan(
         // A clustered PRIMARY KEY has no separate index path.
         !(idx.primary && info.pk_is_clustered())
             && !index_ignored(from, idx.name.o())
+            // An MVIndex has no plain access path: only its element IndexMerge.
+            && !index_is_multi_valued(info, idx)
             && super::expr_index::has_expression_part(info, idx)
             // A range over the leading part (`tidb_shard(a) = 8`, `a+1 > 2`, a
             // LIKE prefix), or one point range per DNF arm that pins every
@@ -14541,6 +14669,7 @@ fn dnf_same_index_plan(
         .filter(|idx| {
             !(idx.primary && info.pk_is_clustered())
                 && !index_ignored(from, idx.name.o())
+                && !index_is_multi_valued(info, idx)
                 && idx.columns.iter().all(|column| {
                     pinned
                         .iter()
@@ -14713,6 +14842,1522 @@ fn int_handle_pseudo_rows(table_rows: f64, ranges: &[sealdb_statistics::pseudo::
 
 /// One index arm: the seek range the index builds from `conds`, plus the
 /// conjuncts fully encoded by that range.
+// ---------------------------------------------------------------------------
+// Multi-valued index (MVIndex) merge arms.
+//
+// An MVIndex key part is a hidden generated column whose expression is
+// `cast(<json expr> as <type> array)`. TiDB can only use such a part through an
+// IndexMerge: each JSON array element becomes one point range on the hidden
+// column (`MEMBER OF`, `JSON_CONTAINS`, `JSON_OVERLAPS`). The mock TiKV store
+// executes the generated expression row by row, so a point range on the hidden
+// column is exact.
+
+/// Scalar type an MVIndex hidden column stores each JSON element as.
+#[derive(Clone, Debug, PartialEq)]
+enum MvIndexTarget {
+    Signed,
+    Unsigned,
+    Double,
+    Decimal,
+    Date,
+    Datetime,
+    Time,
+    Char(usize),
+    Year,
+}
+
+#[derive(Clone)]
+struct MvIndexPart {
+    pos: usize,
+    base: ExprNode,
+    target: MvIndexTarget,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MvCondKind {
+    Member,
+    Contains,
+    Overlaps,
+}
+
+/// The parts of an index that describe a multi-valued key.
+fn mv_index_parts(info: &sealdb_meta::TableInfo, index: &sealdb_meta::IndexInfo) -> Vec<MvIndexPart> {
+    let mut parts = Vec::new();
+    for (pos, part) in index.columns.iter().enumerate() {
+        let Some(hidden) = super::expr_index::hidden_column(info, part) else {
+            continue;
+        };
+        let Some(expr) = super::expr_index::part_expr(info, part) else {
+            continue;
+        };
+        let ExprNode::Cast(cast) = &expr else {
+            continue;
+        };
+        let lower = cast.target.to_ascii_lowercase();
+        let Some(base_ty) = lower.strip_suffix("array") else {
+            continue;
+        };
+        let base_ty = base_ty.trim();
+        let target = if base_ty == "signed" || base_ty == "bigint" {
+            MvIndexTarget::Signed
+        } else if base_ty == "unsigned" {
+            MvIndexTarget::Unsigned
+        } else if base_ty == "double" || base_ty == "float" || base_ty == "real" {
+            MvIndexTarget::Double
+        } else if base_ty.starts_with("decimal") {
+            MvIndexTarget::Decimal
+        } else if base_ty == "date" {
+            MvIndexTarget::Date
+        } else if base_ty.starts_with("datetime") || base_ty.starts_with("timestamp") {
+            MvIndexTarget::Datetime
+        } else if base_ty.starts_with("time") {
+            MvIndexTarget::Time
+        } else if let Some(rest) = base_ty.strip_prefix("char") {
+            let len = rest
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .parse::<usize>()
+                .unwrap_or(255);
+            MvIndexTarget::Char(len)
+        } else if base_ty == "year" {
+            MvIndexTarget::Year
+        } else {
+            continue;
+        };
+        // Only `cast(json_extract(...))` / `cast(<json col>)` are eligible.
+        let base = match cast.expr.as_ref() {
+            ExprNode::Func(_) | ExprNode::Column(_) => (*cast.expr).clone(),
+            _ => continue,
+        };
+        let _ = hidden;
+        parts.push(MvIndexPart { pos, base, target });
+    }
+    parts
+}
+
+/// Strip redundant JSON casts that wrap an MV constant.
+fn mv_unwrap_json_cast(expr: &ExprNode) -> &ExprNode {
+    let mut current = expr;
+    while let ExprNode::Cast(cast) = current {
+        if cast.target.to_ascii_lowercase().contains("json") {
+            current = cast.expr.as_ref();
+        } else {
+            break;
+        }
+    }
+    current
+}
+
+fn mv_expr_matches(expr: &ExprNode, base: &ExprNode) -> bool {
+    expr.expr_key().eq_ignore_ascii_case(&base.expr_key())
+}
+
+/// Convert one JSON value to the datum stored in an MVIndex hidden column.
+fn mv_target_datum(
+    target: &MvIndexTarget,
+    value: &serde_json::Value,
+    raw: Option<&Datum>,
+) -> Option<Datum> {
+    use sealdb_types::Datum;
+    match target {
+        MvIndexTarget::Signed => value.as_i64().map(Datum::I64),
+        MvIndexTarget::Unsigned => value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|v| u64::try_from(v).ok()))
+            .map(Datum::U64),
+        MvIndexTarget::Double => value.as_f64().map(Datum::F64),
+        MvIndexTarget::Decimal => value
+            .as_f64()
+            .and_then(|v| sealdb_types::MyDecimal::parse(&v.to_string()).ok())
+            .map(Datum::Decimal),
+        MvIndexTarget::Year => value.as_u64().map(Datum::U64),
+        MvIndexTarget::Char(_) => {
+            let text = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => return None,
+            };
+            Some(Datum::Bytes(text.into_bytes()))
+        }
+        MvIndexTarget::Date | MvIndexTarget::Datetime | MvIndexTarget::Time => {
+            if let Some(Datum::Time(time)) = raw
+                && matches!(
+                    (target, time.tp),
+                    (MvIndexTarget::Date, sealdb_types::TimeType::Date)
+                        | (MvIndexTarget::Datetime, sealdb_types::TimeType::Datetime)
+                        | (MvIndexTarget::Time, sealdb_types::TimeType::Time)
+                )
+            {
+                return Some(Datum::Time(time.clone()));
+            }
+            let text = value.as_str()?;
+            let parsed = match target {
+                MvIndexTarget::Date => sealdb_types::parse_date_literal(text).ok(),
+                MvIndexTarget::Datetime => sealdb_types::parse_datetime_literal(text).ok(),
+                _ => sealdb_types::parse_datetime_literal(text)
+                    .ok()
+                    .map(|mut time| {
+                        time.tp = sealdb_types::TimeType::Time;
+                        time
+                    }),
+            }?;
+            Some(Datum::Time(parsed))
+        }
+    }
+}
+
+/// One MVIndex constraint: its kind and the element datums it pins.
+#[derive(Clone)]
+struct MvCondition {
+    kind: MvCondKind,
+    values: Vec<Datum>,
+    /// The predicate as written, for the residual `Selection` / consumed set.
+    expr: ExprNode,
+}
+
+/// `MEMBER OF` needle, or a constant/array for `JSON_CONTAINS` /
+/// `JSON_OVERLAPS`, converted to the hidden column's element datum.
+fn mv_constant_values(
+    part: &MvIndexPart,
+    expr: &ExprNode,
+    reverse_member: bool,
+) -> Option<Vec<Datum>> {
+    use sealdb_types::Datum;
+    let inner = mv_unwrap_json_cast(expr);
+    // `JSON_ARRAY(...)` has no scalar evaluator: fold its arguments one by one
+    // so date / string arrays keep their element type (`json_array(cast('2023-01-01'
+    // as date), …)` becomes the three DATE ranges).
+    if !reverse_member
+        && let ExprNode::Func(func) = inner
+        && func.name.eq_ignore_ascii_case("json_array")
+    {
+        let mut values = Vec::with_capacity(func.args.len());
+        for arg in &func.args {
+            let raw = sealdb_expression::eval_expr(arg).ok()?;
+            let json = sealdb_expression::evaluator::json_arg_value(&raw);
+            values.push(mv_target_datum(&part.target, &json, Some(&raw))?);
+        }
+        return Some(values);
+    }
+    let raw = sealdb_expression::eval_expr(inner).ok()?;
+    if reverse_member {
+        // Quoted needles reach the planner as raw text (`'1'`, `"a"`).
+        // Numeric / temporal MV parts only accept a needle that parses as a
+        // JSON number; `"a"` on an int array and `"2023-01-01"` on a date array
+        // never build an arm (TiDB leaves the table scan).
+        if let Datum::Bytes(bytes) = &raw
+            && !matches!(part.target, MvIndexTarget::Char(_))
+        {
+            let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+            return mv_target_datum(&part.target, &value, Some(&raw)).map(|datum| vec![datum]);
+        }
+        let value = sealdb_expression::evaluator::json_arg_value(&raw);
+        return mv_target_datum(&part.target, &value, Some(&raw)).map(|datum| vec![datum]);
+    }
+    if let ExprNode::Func(func) = inner
+        && func.name.eq_ignore_ascii_case("json_array")
+    {
+        let mut values = Vec::with_capacity(func.args.len());
+        for arg in &func.args {
+            let raw = sealdb_expression::eval_expr(arg).ok()?;
+            let json = sealdb_expression::evaluator::json_arg_value(&raw);
+            values.push(mv_target_datum(&part.target, &json, Some(&raw))?);
+        }
+        return Some(values);
+    }
+    let json = sealdb_expression::evaluator::json_arg_value(&raw);
+    match json {
+        serde_json::Value::Array(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in &items {
+                values.push(mv_target_datum(&part.target, item, None)?);
+            }
+            Some(values)
+        }
+        other => mv_target_datum(&part.target, &other, Some(&raw)).map(|datum| vec![datum]),
+    }
+}
+
+/// Match one predicate against an MVIndex key part.
+fn mv_condition(part: &MvIndexPart, cond: &ExprNode) -> Option<MvCondition> {
+    let ExprNode::Func(func) = cond else {
+        return None;
+    };
+    let name = func.name.to_ascii_lowercase();
+    if name == "json_memberof" && func.args.len() == 2 {
+        if mv_expr_matches(&func.args[1], &part.base) {
+            let values = mv_constant_values(part, &func.args[0], true)?;
+            return Some(MvCondition {
+                kind: MvCondKind::Member,
+                values,
+                expr: cond.clone(),
+            });
+        }
+        return None;
+    }
+    if name == "json_contains" && func.args.len() >= 2 && mv_expr_matches(&func.args[0], &part.base)
+    {
+        let values = mv_constant_values(part, &func.args[1], false)?;
+        if values.is_empty() {
+            return None;
+        }
+        return Some(MvCondition {
+            kind: MvCondKind::Contains,
+            values,
+            expr: cond.clone(),
+        });
+    }
+    if name == "json_overlaps" && func.args.len() == 2 {
+        let (candidate, matched) = if mv_expr_matches(&func.args[0], &part.base) {
+            (&func.args[1], true)
+        } else if mv_expr_matches(&func.args[1], &part.base) {
+            (&func.args[0], true)
+        } else {
+            (&func.args[0], false)
+        };
+        if !matched {
+            return None;
+        }
+        let values = mv_constant_values(part, candidate, false)?;
+        if values.is_empty() {
+            return None;
+        }
+        return Some(MvCondition {
+            kind: MvCondKind::Overlaps,
+            values,
+            expr: cond.clone(),
+        });
+    }
+    None
+}
+
+fn mv_conditions(part: &MvIndexPart, conds: &[ExprNode]) -> Vec<MvCondition> {
+    conds
+        .iter()
+        .filter_map(|cond| mv_condition(part, cond))
+        .collect()
+}
+
+/// Equality point for `pos` in the index key, in key order.
+fn mv_key_point(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    conds: &[ExprNode],
+    pos: usize,
+) -> Option<Datum> {
+    let key = super::expr_index::part_key(info, &index.columns[pos]);
+    conds.iter().find_map(|cond| {
+        let (name, sets) = sealdb_statistics::pseudo::conjunct_bound_sets(cond)?;
+        if !name.eq_ignore_ascii_case(&key) {
+            return None;
+        }
+        let [(low, high)] = sets.as_slice() else {
+            return None;
+        };
+        match (low, high) {
+            (Some((low, true)), Some((high, true))) if low.compare(high).is_eq() => Some(low.clone()),
+            _ => None,
+        }
+    })
+}
+
+/// Conditions over key parts *after* the MV part that the arm leaves as a
+/// residual `Selection(Build)` filter (a range, `LIKE`, …).
+fn mv_suffix_is_truncated(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    pos: usize,
+) -> bool {
+    let Some(part) = index.columns.get(pos) else {
+        return false;
+    };
+    if part.length < 0 {
+        return false;
+    }
+    info.columns
+        .iter()
+        .find(|column| column.name.o().eq_ignore_ascii_case(part.name.o()))
+        .is_some_and(|column| part.length < column.field_type.flen)
+}
+
+/// Suffix predicates TiDB silently drops: a truncated suffix key part
+/// (`d(30)`) cannot check the full value, and the plan carries neither an
+/// index filter nor a probe filter for it.
+fn mv_dropped_suffix_filters(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    mv_pos: usize,
+    conds: &[ExprNode],
+    mv_expr: &ExprNode,
+) -> Vec<ExprNode> {
+    conds
+        .iter()
+        .filter(|cond| cond.restore_string() != mv_expr.restore_string())
+        .filter(|cond| {
+            !cond.referenced_columns().is_empty()
+                && cond.referenced_columns().iter().all(|(_, column)| {
+                    index
+                        .columns
+                        .iter()
+                        .position(|part| {
+                            super::expr_index::part_key(info, part).eq_ignore_ascii_case(column)
+                        })
+                        .is_some_and(|pos| pos > mv_pos && mv_suffix_is_truncated(info, index, pos))
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+fn mv_suffix_filters(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    mv_pos: usize,
+    conds: &[ExprNode],
+    mv_expr: &ExprNode,
+) -> Vec<ExprNode> {
+    let mut filters = Vec::new();
+    for cond in conds {
+        if cond.restore_string() == mv_expr.restore_string() {
+            continue;
+        }
+        let columns = cond.referenced_columns();
+        if columns.is_empty() {
+            continue;
+        }
+        let mut all_suffix = true;
+        for (_, column) in &columns {
+            let Some(pos) = index
+                .columns
+                .iter()
+                .position(|part| super::expr_index::part_key(info, part).eq_ignore_ascii_case(column))
+            else {
+                all_suffix = false;
+                break;
+            };
+            if pos < mv_pos {
+                all_suffix = false;
+                break;
+            }
+            // An equality on a suffix part is encoded in the seek key.
+            if pos > mv_pos && mv_key_point(info, index, conds, pos).is_some() {
+                all_suffix = false;
+                break;
+            }
+        }
+        let truncated_suffix = cond.referenced_columns().iter().any(|(_, column)| {
+            index
+                .columns
+                .iter()
+                .position(|part| {
+                    super::expr_index::part_key(info, part).eq_ignore_ascii_case(column)
+                })
+                .is_some_and(|pos| pos > mv_pos && mv_suffix_is_truncated(info, index, pos))
+        });
+        // Only conditions the ranger cannot turn into a key range become
+        // index filters (`b NOT LIKE '%test%'`). A suffix range (`c > 10`)
+        // stays a probe filter because the variable-length MV key cannot
+        // encode later key parts, and a truncated suffix part is dropped.
+        if all_suffix
+            && !truncated_suffix
+            && sealdb_statistics::pseudo::conjunct_bound_sets(cond).is_none()
+        {
+            filters.push(cond.clone());
+        }
+    }
+    filters
+}
+
+/// One point range per MV element on `index`, with equality prefix and suffix
+/// parts folded in. Returns the arms and the conjuncts they fully encode.
+fn mv_index_arms(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    part: &MvIndexPart,
+    condition: &MvCondition,
+    conds: &[ExprNode],
+    table_rows: f64,
+) -> Option<(Vec<IndexMergePath>, Vec<ExprNode>)> {
+    let mut prefix = Vec::new();
+    let mut consumed = Vec::new();
+    for pos in 0..part.pos {
+        let datum = mv_key_point(info, index, conds, pos)?;
+        // Ranger stores literals in the key part's type (`c = 1` on a FLOAT
+        // prefix encodes `3.0`, not the integer `3`).
+        prefix.push(
+            super::access_range::coerce_key_datum(info, index, pos, &datum).unwrap_or(datum),
+        );
+        let key = super::expr_index::part_key(info, &index.columns[pos]);
+        if let Some(cond) = conds.iter().find(|cond| {
+            sealdb_statistics::pseudo::conjunct_bound_sets(cond)
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case(&key))
+        }) {
+            consumed.push(cond.clone());
+        }
+    }
+    let mut suffix = Vec::new();
+    for pos in (part.pos + 1)..index.columns.len() {
+        if let Some(datum) = mv_key_point(info, index, conds, pos) {
+            suffix.push(
+                super::access_range::coerce_key_datum(info, index, pos, &datum).unwrap_or(datum),
+            );
+        }
+    }
+    let suffix_filters =
+        mv_suffix_filters(info, index, part.pos, conds, &condition.expr);
+    let dropped_suffix_filters =
+        mv_dropped_suffix_filters(info, index, part.pos, conds, &condition.expr);
+    if condition.kind != MvCondKind::Overlaps {
+        consumed.push(condition.expr.clone());
+    }
+    consumed.extend(suffix_filters.iter().cloned());
+    consumed.extend(dropped_suffix_filters);
+    for pos in (part.pos + 1)..index.columns.len() {
+        let key = super::expr_index::part_key(info, &index.columns[pos]);
+        if mv_key_point(info, index, conds, pos).is_some()
+            && let Some(cond) = conds.iter().find(|cond| {
+                sealdb_statistics::pseudo::conjunct_bound_sets(cond)
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case(&key))
+            })
+        {
+            consumed.push(cond.clone());
+        }
+    }
+    let key_len = super::access_range::index_key_part_count(info, index).unwrap_or(1);
+    let index_columns = index_key_column_names(info, index);
+    let mut paths = Vec::with_capacity(condition.values.len());
+    for value in &condition.values {
+        let mut key = prefix.clone();
+        key.push(value.clone());
+        key.extend(suffix.iter().cloned());
+        let range = sealdb_statistics::pseudo::KeyRange::point(key.clone());
+        let rows = sealdb_statistics::pseudo::index_key_ranges_rows(
+            table_rows,
+            std::slice::from_ref(&range),
+            key_len,
+            index.unique,
+        );
+        // `ranges` keeps the single-datum form for cardinality/other consumers;
+        // `seek` carries the full composite point key to the executor.
+        let seek = key
+            .first()
+            .cloned()
+            .unwrap_or_else(|| value.clone());
+        let seek_high = seek.clone();
+        paths.push(IndexMergePath {
+            index: index.name.o().to_string(),
+            range: Some(super::physical_plans::IndexScanRange {
+                text: sealdb_statistics::pseudo::key_range_text(&range),
+                rows,
+                filter_rows: rows,
+                pseudo: true,
+                partial: None,
+                keep_order: false,
+            }),
+            table_range: false,
+            index_columns: index_columns.clone(),
+            keep_order: false,
+            desc: false,
+            limit: None,
+            topn: None,
+            tid_selection: None,
+            residual_selection: ExprNode::compose_cnf(suffix_filters.clone()),
+            ranges: vec![(Some((seek, true)), Some((seek_high, true)))],
+            seek: Some(key.clone()),
+        });
+    }
+    Some((paths, consumed))
+}
+
+/// Outer `JSON_OVERLAPS` conjuncts that only constrain an MVIndex union
+/// through element ranges: TiDB re-checks them above the merge.
+fn mv_outer_overlaps(
+    info: &sealdb_meta::TableInfo,
+    indexes: &[&sealdb_meta::IndexInfo],
+    outer: &[ExprNode],
+) -> Vec<ExprNode> {
+    let mut overlaps = Vec::new();
+    for index in indexes {
+        for part in mv_index_parts(info, index) {
+            for condition in mv_conditions(&part, outer) {
+                if condition.kind == MvCondKind::Overlaps
+                    && !overlaps
+                        .iter()
+                        .any(|have: &ExprNode| have.restore_string() == condition.expr.restore_string())
+                {
+                    overlaps.push(condition.expr);
+                }
+            }
+        }
+    }
+    overlaps
+}
+
+/// Multi-valued key columns of the indexes a merge has already ranged over.
+fn mv_columns_for_indexes(
+    info: &sealdb_meta::TableInfo,
+    indexes: &[String],
+) -> Vec<String> {
+    info.indices
+        .iter()
+        .filter(|index| {
+            index_is_multi_valued(info, index)
+                && indexes
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(index.name.o()))
+        })
+        .flat_map(|index| {
+            index
+                .columns
+                .iter()
+                .map(|column| super::expr_index::part_key(info, column))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A JSON predicate on a column the merge already ranged over is enforcing the
+/// same index condition, so it does not shrink the probe row IDs again.
+fn mv_probe_residual_rows(
+    info: &sealdb_meta::TableInfo,
+    indexes: &[String],
+    residual: &[ExprNode],
+    rows: f64,
+    shrink_equalities: bool,
+) -> f64 {
+    let mv_columns = mv_columns_for_indexes(info, indexes);
+    let mv_bases: Vec<ExprNode> = info
+        .indices
+        .iter()
+        .filter(|index| {
+            index_is_multi_valued(info, index)
+                && indexes
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(index.name.o()))
+        })
+        .flat_map(|index| {
+            mv_index_parts(info, index)
+                .into_iter()
+                .map(|part| part.base)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let filtered: Vec<ExprNode> = residual
+        .iter()
+        .filter(|cond| {
+            let ExprNode::Func(func) = cond else {
+                // TiDB's MVIndex union does not reapply plain equality probe
+                // filters (`a = 20 and c = 10` beside a union of MV ranges);
+                // the merge already returns the same row IDs.
+                if !shrink_equalities
+                    && sealdb_statistics::pseudo::conjunct_bound_sets(cond).is_some_and(
+                        |(_, sets)| {
+                            sets.iter().all(|(low, high)| match (low, high) {
+                                (Some((lo, true)), Some((hi, true))) => {
+                                    lo.compare(hi) == std::cmp::Ordering::Equal
+                                }
+                                _ => false,
+                            })
+                        },
+                    )
+                {
+                    return false;
+                }
+                return true;
+            };
+            if !matches!(
+                func.name.to_ascii_lowercase().as_str(),
+                "json_memberof" | "json_contains" | "json_overlaps"
+            ) {
+                return true;
+            }
+            // A JSON MV predicate on this index already supplied the element
+            // ranges; TiDB re-checks it above the merge (root Selection) rather
+            // than shrinking the probe row IDs a second time. A JSON predicate
+            // on a *different* column still filters the probe rows.
+            !func.args.iter().any(|arg| {
+                mv_bases
+                    .iter()
+                    .any(|base| mv_expr_matches(arg, base))
+            })
+        })
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        rows
+    } else {
+        index_merge_residual_rows(&filtered, rows, info, None)
+    }
+}
+
+/// True when a probe filter only touches MVIndex key columns (or a JSON MV
+/// predicate): TiDB keeps the MVIndex merge at the merged row count then.
+fn mv_probe_uses_mv_columns(info: &sealdb_meta::TableInfo, residual: &[ExprNode]) -> bool {
+    let mv_columns: Vec<String> = info
+        .indices
+        .iter()
+        .filter(|index| index_is_multi_valued(info, index))
+        .flat_map(|index| {
+            index
+                .columns
+                .iter()
+                .map(|column| super::expr_index::part_key(info, column))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    residual.iter().any(|cond| {
+        if let ExprNode::Func(func) = cond
+            && matches!(
+                func.name.to_ascii_lowercase().as_str(),
+                "json_memberof" | "json_contains" | "json_overlaps"
+            )
+        {
+            return true;
+        }
+        cond.referenced_columns()
+            .iter()
+            .any(|(_, column)| mv_columns.iter().any(|mv| mv.eq_ignore_ascii_case(column)))
+    })
+}
+
+/// TiDB only falls back to a full-table-scan partial path for a DNF item that
+/// constrains a plain column (`isnull(i)` next to an MVIndex arm). Another MV
+/// JSON predicate that no hinted index covers makes the whole OR a table scan,
+/// not a merge with a full scan arm.
+fn mv_item_allows_table_scan_fallback(info: &sealdb_meta::TableInfo, conds: &[ExprNode]) -> bool {
+    let Some(handle) = clustered_handle_column(info) else {
+        return false;
+    };
+    conds.iter().any(|cond| {
+        is_null_column(cond).is_some_and(|name| name.eq_ignore_ascii_case(handle))
+            || sealdb_statistics::pseudo::conjunct_bound_sets(cond)
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case(handle))
+    })
+}
+
+/// One union arm for a DNF item. `JSON_CONTAINS` cannot drive a union arm
+/// (TiDB leaves the whole OR to the table scan).
+fn mv_union_item_arm(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    part: &MvIndexPart,
+    conds: &[ExprNode],
+    table_rows: f64,
+) -> Option<(Vec<IndexMergePath>, Vec<ExprNode>)> {
+    let conditions = mv_conditions(part, conds);
+    let condition = conditions
+        .iter()
+        .find(|condition| condition.kind != MvCondKind::Contains)
+        // A single-element `JSON_CONTAINS` is a point range, so it can drive
+        // a union arm (`json_contains(j, '[3]')`); a multi-element contains
+        // needs an intersection and TiDB leaves the whole OR to the table scan.
+        .or_else(|| {
+            conditions
+                .iter()
+                .find(|condition| condition.kind == MvCondKind::Contains && condition.values.len() == 1)
+        })?;
+    mv_index_arms(info, index, part, condition, conds, table_rows)
+}
+
+/// TiDB rewrites a `JSON_CONTAINS` / `JSON_OVERLAPS` string candidate to a
+/// `cast(…, json BINARY)` value before it becomes a merge root filter, so the
+/// plan text shows the cast (`json_overlaps(…, cast("[1, 2]", json BINARY))`).
+fn mv_cast_root_json_literals(expr: &ExprNode, base: &ExprNode) -> ExprNode {
+    mv_cast_root_json_literals_multi(expr, std::slice::from_ref(base))
+}
+
+fn mv_cast_root_json_literals_multi(expr: &ExprNode, bases: &[ExprNode]) -> ExprNode {
+    match expr {
+        ExprNode::Binary(binary)
+            if matches!(binary.op, Op::LogicOr | Op::LogicAnd) =>
+        {
+            let mut out = binary.clone();
+            out.left = Box::new(mv_cast_root_json_literals_multi(&binary.left, bases));
+            out.right = Box::new(mv_cast_root_json_literals_multi(&binary.right, bases));
+            ExprNode::Binary(out)
+        }
+        ExprNode::Func(func)
+            if (func.name.eq_ignore_ascii_case("json_overlaps")
+                || func.name.eq_ignore_ascii_case("json_contains"))
+                && func.args.len() >= 2 =>
+        {
+            let cast_json = |expr: &ExprNode| {
+                ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
+                    expr: Box::new(expr.clone()),
+                    target: "json".to_string(),
+                    json: false,
+                })
+            };
+            let is_mv = |arg: &ExprNode| bases.iter().any(|base| mv_expr_matches(arg, base));
+            let mut out = func.clone();
+            out.args = func
+                .args
+                .iter()
+                .map(|arg| {
+                    if is_mv(arg) {
+                        return arg.clone();
+                    }
+                    if let ExprNode::Value(value) = arg
+                        && matches!(value.datum, Datum::Bytes(_) | Datum::Time(_))
+                    {
+                        return cast_json(arg);
+                    }
+                    if let ExprNode::Func(inner) = arg
+                        && inner.name.eq_ignore_ascii_case("json_array")
+                    {
+                        let mut array = inner.clone();
+                        array.args = inner
+                            .args
+                            .iter()
+                            .map(|elem| match elem {
+                                ExprNode::Value(value)
+                                    if matches!(value.datum, Datum::Bytes(_) | Datum::Time(_)) =>
+                                {
+                                    cast_json(elem)
+                                }
+                                _ => elem.clone(),
+                            })
+                            .collect();
+                        return ExprNode::Func(array);
+                    }
+                    arg.clone()
+                })
+                .collect();
+            ExprNode::Func(out)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Build an MVIndex IndexMerge plan for a filter over `index`, when the
+/// predicate shape is one TiDB can push to the hidden generated column.
+fn mv_index_merge_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    table_rows: f64,
+    shrink_equalities: bool,
+    allow_fallback: bool,
+) -> Option<PhysicalPlan> {
+    let selection = select.selection.as_ref()?;
+    let cnf = selection.split_cnf();
+    let part = mv_index_parts(info, index).into_iter().next()?;
+    // A truncated key part before the MV part cannot pin the full column
+    // (`b(3) = 'abcdefg'`), so the derived MV key is not seekable.
+    if index
+        .columns
+        .iter()
+        .take(part.pos)
+        .any(|column| column.length >= 0)
+    {
+        return None;
+    }
+    let conditions = mv_conditions(&part, &cnf);
+    if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+        eprintln!(
+            "MV index={} base={:?} conds={:?} matches={}",
+            index.name.o(),
+            part.base.expr_key(),
+            cnf.iter().map(|c| c.restore_string()).collect::<Vec<_>>(),
+            conditions.len()
+        );
+    }
+    let or_pos = cnf
+        .iter()
+        .position(|conjunct| conjunct.split_dnf().len() > 1);
+    if conditions.is_empty() && or_pos.is_none() {
+        return None;
+    }
+    let mut residual: Vec<ExprNode> = Vec::new();
+    let mut root_residual: Vec<ExprNode> = Vec::new();
+    let (mut paths, intersection) = if let Some(or_pos) = or_pos {
+        let items = cnf[or_pos].split_dnf();
+        // CNF conjuncts outside the DNF still constrain the MVIndex key prefix
+        // (`(overlaps(…) or 2 member of …) and c = 10`); TiDB folds them into
+        // every arm's range but keeps them as the probe filter.
+        let outer: Vec<ExprNode> = cnf
+            .iter()
+            .enumerate()
+            .filter(|(pos, _)| *pos != or_pos)
+            .map(|(_, conjunct)| conjunct.clone())
+            .collect();
+        let outer_keys: std::collections::HashSet<String> =
+            outer.iter().map(ExprNode::restore_string).collect();
+        let mut paths = Vec::new();
+        let mut fully_consumed = true;
+        for item in &items {
+            let conds = item.split_cnf();
+            let mut all_conds = conds.clone();
+            all_conds.extend(outer.iter().cloned());
+            let mut built = mv_union_item_arm(info, index, &part, &all_conds, table_rows);
+            if built.is_none() && allow_fallback {
+                let all_indexes = IndexMergeHint {
+                    indexes: Vec::new(),
+                    disabled: false,
+                };
+                built = index_merge_union_arm(
+                    info,
+                    &all_indexes,
+                    &conds,
+                    &all_conds,
+                    table_rows,
+                    None,
+                )
+                .map(|(path, consumed)| (vec![path], consumed))
+                .or_else(|| {
+                    if !mv_item_allows_table_scan_fallback(info, &conds) {
+                        return None;
+                    }
+                    let consumed = all_conds.clone();
+                    let path = IndexMergePath {
+                        index: String::new(),
+                        range: None,
+                        table_range: true,
+                        index_columns: Vec::new(),
+                        keep_order: false,
+                        desc: false,
+                        limit: None,
+                        topn: None,
+                        tid_selection: None,
+                        residual_selection: None,
+                        ranges: Vec::new(),
+                        seek: None,
+                    };
+                    Some((vec![path], consumed))
+                });
+            }
+            if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+                eprintln!(
+                    "MV or item conds={:?} built={}",
+                    conds.iter().map(|c| c.restore_string()).collect::<Vec<_>>(),
+                    built.is_some()
+                );
+            }
+            let (mut arms, consumed) = built?;
+            let consumed: Vec<ExprNode> = consumed
+                .into_iter()
+                .filter(|used| !outer_keys.contains(&used.restore_string()))
+                .collect();
+            if consumed.len() != conds.len() {
+                fully_consumed = false;
+            }
+            paths.append(&mut arms);
+        }
+        residual = outer.clone();
+        // A `JSON_OVERLAPS` conjunct outside the DNF still only constrains the
+        // union through its element ranges, so TiDB re-checks it above the
+        // merge rather than in the probe filter (`… and (c=1 or c=2) and
+        // json_overlaps(j, '[4,5,6]')`).
+        let outer_overlaps: Vec<ExprNode> = mv_conditions(&part, &outer)
+            .into_iter()
+            .filter(|condition| condition.kind == MvCondKind::Overlaps)
+            .map(|condition| condition.expr)
+            .collect();
+        if !outer_overlaps.is_empty() {
+            residual.retain(|conjunct| {
+                !outer_overlaps
+                    .iter()
+                    .any(|used| used.restore_string() == conjunct.restore_string())
+            });
+            root_residual.extend(outer_overlaps);
+        }
+        if !fully_consumed {
+            let has_overlaps = items.iter().any(|item| {
+                mv_conditions(&part, &item.split_cnf())
+                    .iter()
+                    .any(|condition| condition.kind == MvCondKind::Overlaps)
+            });
+            if has_overlaps {
+                root_residual.push(cnf[or_pos].clone());
+            } else {
+                residual.push(cnf[or_pos].clone());
+            }
+        }
+        (paths, false)
+    } else {
+        // One MVIndex predicate: `JSON_CONTAINS` intersects its element arms,
+        // `MEMBER OF` / `JSON_OVERLAPS` union them.
+        let condition = conditions.first()?;
+        let (paths, consumed) = mv_index_arms(info, index, &part, condition, &cnf, table_rows)?;
+        let intersection = condition.kind == MvCondKind::Contains;
+        for conjunct in &cnf {
+            if consumed
+                .iter()
+                .any(|used| used.restore_string() == conjunct.restore_string())
+            {
+                continue;
+            }
+            if conjunct.restore_string() == condition.expr.restore_string()
+                && condition.kind == MvCondKind::Overlaps
+            {
+                root_residual.push(conjunct.clone());
+            } else {
+                residual.push(conjunct.clone());
+            }
+        }
+        (paths, intersection)
+    };
+    if paths.is_empty() {
+        return None;
+    }
+    // TiDB `RemoveDupExprs`.
+    let dedup = |conds: Vec<ExprNode>| {
+        let mut seen = std::collections::HashSet::new();
+        conds
+            .into_iter()
+            .filter(|cond| seen.insert(cond.restore_string()))
+            .collect::<Vec<_>>()
+    };
+    let residual = dedup(residual);
+    let root_residual = dedup(root_residual);
+    let path_rows = |path: &IndexMergePath| {
+        if path.table_range && path.range.is_none() {
+            0.0
+        } else {
+            path.range.as_ref().map_or(table_rows, |r| r.rows)
+        }
+    };
+    let mut rowid_est = if intersection {
+        paths
+            .iter()
+            .fold(1.0, |acc, path| acc * path_rows(path) / table_rows)
+            * table_rows
+    } else {
+        let mut selectivity = 0.0;
+        for path in &paths {
+            let arm = (path_rows(path) / table_rows).clamp(0.0, 1.0);
+            selectivity = selectivity + arm - selectivity * arm;
+        }
+        table_rows * selectivity
+    };
+    // A LIMIT the merge can sink shrinks each arm and the merge root.
+    let expected = select
+        .limit
+        .map(|count| (count + select.offset.unwrap_or(0)) as f64);
+    if let Some(expected) = expected
+        && rowid_est > 0.0
+    {
+        let factor = (expected / rowid_est).min(1.0);
+        for path in &mut paths {
+            if let Some(range) = path.range.as_mut() {
+                range.rows = (range.rows * factor).min(range.rows);
+                range.filter_rows = range.filter_rows.min(range.rows);
+            }
+        }
+        rowid_est *= factor;
+    }
+    // TiDB keeps the MVIndex merge root at the probe cardinality. Probe
+    // filters over MVIndex key columns (or another JSON MV predicate) do not
+    // shrink it, while a plain column filter (`a < 10`) does.
+    let probe_est = if residual.is_empty() {
+        rowid_est
+    } else {
+        mv_probe_residual_rows(
+            info,
+            &[index.name.o().to_string()],
+            &residual,
+            rowid_est,
+            shrink_equalities,
+        )
+    };
+    if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+        eprintln!(
+            "MV finish rowid={rowid_est} probe={probe_est} residual={:?}",
+            residual.iter().map(|c| c.restore_string()).collect::<Vec<_>>()
+        );
+    }
+    let merge_est = probe_est;
+    let embedded = select.limit.map(|count| (0u64, count));
+    if let Some(limit) = embedded {
+        for path in &mut paths {
+            path.limit = Some(limit);
+        }
+    }
+    let root_est = if root_residual.is_empty() {
+        None
+    } else {
+        Some((rowid_est * sealdb_statistics::pseudo::SELECTION_FACTOR).clamp(0.0, table_rows))
+    };
+    let merge = PhysicalPlan::IndexMerge {
+        table: scan_table_label(from),
+        indexes: vec![index.name.o().to_string()],
+        partitions: Vec::new(),
+        pushed: None,
+        intersection,
+        paths,
+        est_rows: Some(merge_est),
+        probe_est: rowid_est,
+        probe_selection: ExprNode::compose_cnf(residual),
+        limit: embedded,
+        keep_order: false,
+        order_column: None,
+        order_desc: false,
+        partition_access: String::new(),
+    };
+    Some(match root_est {
+        Some(est) => {
+            let filter: Vec<ExprNode> = root_residual
+                .iter()
+                .map(|cond| mv_cast_root_json_literals(cond, &part.base))
+                .collect();
+            PhysicalPlan::Selection {
+                child: Box::new(merge),
+                filter: ExprNode::compose_cnf(filter)?,
+                est_rows: Some(est),
+            }
+        }
+        None => merge,
+    })
+}
+
+/// Build the `IndexMerge` node (and its root `Selection`) from a set of arms.
+fn finish_mv_merge_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    mut paths: Vec<IndexMergePath>,
+    intersection: bool,
+    residual: Vec<ExprNode>,
+    root_residual: Vec<ExprNode>,
+    bases: &[ExprNode],
+    table_rows: f64,
+    shrink_equalities: bool,
+) -> Option<PhysicalPlan> {
+    if paths.is_empty() {
+        return None;
+    }
+    let dedup = |conds: Vec<ExprNode>| {
+        let mut seen = std::collections::HashSet::new();
+        conds
+            .into_iter()
+            .filter(|cond| seen.insert(cond.restore_string()))
+            .collect::<Vec<_>>()
+    };
+    let residual = dedup(residual);
+    let root_residual = dedup(root_residual);
+    let path_rows = |path: &IndexMergePath| {
+        if path.table_range && path.range.is_none() {
+            0.0
+        } else {
+            path.range.as_ref().map_or(table_rows, |r| r.rows)
+        }
+    };
+    let mut rowid_est = if intersection {
+        paths
+            .iter()
+            .fold(1.0, |acc, path| acc * path_rows(path) / table_rows)
+            * table_rows
+    } else {
+        let mut selectivity = 0.0;
+        for path in &paths {
+            let arm = (path_rows(path) / table_rows).clamp(0.0, 1.0);
+            selectivity = selectivity + arm - selectivity * arm;
+        }
+        table_rows * selectivity
+    };
+    let expected = select
+        .limit
+        .map(|count| (count + select.offset.unwrap_or(0)) as f64);
+    if let Some(expected) = expected
+        && rowid_est > 0.0
+    {
+        let factor = (expected / rowid_est).min(1.0);
+        for path in &mut paths {
+            if let Some(range) = path.range.as_mut() {
+                range.rows = (range.rows * factor).min(range.rows);
+                range.filter_rows = range.filter_rows.min(range.rows);
+            }
+        }
+        rowid_est *= factor;
+    }
+    // TiDB keeps the MVIndex merge root at the probe cardinality. Probe
+    // filters over MVIndex key columns (or another JSON MV predicate) do not
+    // shrink it, while a plain column filter (`a < 10`) does.
+    let probe_names: Vec<String> = paths.iter().map(|path| path.index.clone()).collect();
+    let probe_est = if residual.is_empty() {
+        rowid_est
+    } else {
+        mv_probe_residual_rows(
+            info,
+            &probe_names,
+            &residual,
+            rowid_est,
+            shrink_equalities || paths.iter().any(|path| path.table_range),
+        )
+    };
+    if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+        eprintln!(
+            "MV finish rowid={rowid_est} probe={probe_est} residual={:?}",
+            residual.iter().map(|c| c.restore_string()).collect::<Vec<_>>()
+        );
+    }
+    let merge_est = probe_est;
+    let embedded = select.limit.map(|count| (0u64, count));
+    if let Some(limit) = embedded {
+        for path in &mut paths {
+            path.limit = Some(limit);
+        }
+    }
+    let root_est = if root_residual.is_empty() {
+        None
+    } else {
+        Some((rowid_est * sealdb_statistics::pseudo::SELECTION_FACTOR).clamp(0.0, table_rows))
+    };
+    let mut indexes: Vec<String> = Vec::new();
+    for path in &paths {
+        if !path.index.is_empty()
+            && !indexes
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&path.index))
+        {
+            indexes.push(path.index.clone());
+        }
+    }
+    let merge = PhysicalPlan::IndexMerge {
+        table: scan_table_label(from),
+        indexes,
+        partitions: Vec::new(),
+        pushed: None,
+        intersection,
+        paths,
+        est_rows: Some(merge_est),
+        probe_est: rowid_est,
+        probe_selection: ExprNode::compose_cnf(residual),
+        limit: embedded,
+        keep_order: false,
+        order_column: None,
+        order_desc: false,
+        partition_access: String::new(),
+    };
+    Some(match root_est {
+        Some(est) => {
+            let filter: Vec<ExprNode> = root_residual
+                .iter()
+                .map(|cond| mv_cast_root_json_literals_multi(cond, bases))
+                .collect();
+            PhysicalPlan::Selection {
+                child: Box::new(merge),
+                filter: ExprNode::compose_cnf(filter)?,
+                est_rows: Some(est),
+            }
+        }
+        None => merge,
+    })
+}
+
+/// A hinted `USE_INDEX_MERGE` over several indexes on a pure CNF filter
+/// (`3 member of a and 3 member of c and b > 'abc' …`) builds an intersection:
+/// one MVIndex element range per hinted multi-valued index plus the ordinary
+/// index/table ranges, all of which must match.
+fn mv_cnf_intersection_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    candidates: &[&sealdb_meta::IndexInfo],
+    cnf: &[ExprNode],
+    table_rows: f64,
+) -> Option<PhysicalPlan> {
+    let mut paths = Vec::new();
+    let mut consumed: Vec<ExprNode> = Vec::new();
+    let mut bases: Vec<ExprNode> = Vec::new();
+    for index in candidates {
+        if index_is_multi_valued(info, index) {
+            if index.where_clause.is_some() {
+                continue;
+            }
+            for part in mv_index_parts(info, index) {
+                for condition in mv_conditions(&part, cnf) {
+                    if let Some((mut arms, mut used)) =
+                        mv_index_arms(info, index, &part, &condition, cnf, table_rows)
+                    {
+                        paths.append(&mut arms);
+                        consumed.append(&mut used);
+                        bases.push(part.base.clone());
+                    }
+                }
+            }
+            continue;
+        }
+        let built = if index.primary && info.pk_is_clustered() {
+            index_merge_handle_arm(info, cnf, table_rows)
+        } else {
+            index_merge_index_arm(info, index, cnf, table_rows, None)
+        };
+        if let Some((path, used)) = built {
+            paths.push(path);
+            consumed.extend(used);
+        }
+    }
+    if paths.len() < 2 {
+        return None;
+    }
+    let residual: Vec<ExprNode> = cnf
+        .iter()
+        .filter(|conjunct| {
+            !consumed
+                .iter()
+                .any(|used| used.restore_string() == conjunct.restore_string())
+        })
+        .cloned()
+        .collect();
+    finish_mv_merge_plan(
+        select,
+        from,
+        info,
+        paths,
+        true,
+        residual,
+        Vec::new(),
+        &bases,
+        table_rows,
+        false,
+    )
+}
+
+/// A hinted `USE_INDEX_MERGE` over several indexes (MV and ordinary) builds a
+/// union whose DNF item is served by the first named index that can seek it.
+fn mv_multi_index_merge_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    candidates: &[&sealdb_meta::IndexInfo],
+    table_rows: f64,
+) -> Option<PhysicalPlan> {
+    if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+        eprintln!("MV multi called sel={:?}", select.selection.is_some());
+    }
+    let selection = select.selection.as_ref()?;
+    let cnf = selection.split_cnf();
+    let Some(or_pos) = cnf
+        .iter()
+        .position(|conjunct| conjunct.split_dnf().len() > 1)
+    else {
+        return mv_cnf_intersection_plan(select, from, info, candidates, &cnf, table_rows);
+    };
+    if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+        eprintln!("MV multi enter or_pos={or_pos} cnf={:?}", cnf.iter().map(|c| c.restore_string()).collect::<Vec<_>>());
+    }
+    let items = cnf[or_pos].split_dnf();
+    let outer: Vec<ExprNode> = cnf
+        .iter()
+        .enumerate()
+        .filter(|(pos, _)| *pos != or_pos)
+        .map(|(_, conjunct)| conjunct.clone())
+        .collect();
+    let outer_keys: std::collections::HashSet<String> =
+        outer.iter().map(ExprNode::restore_string).collect();
+    let mut paths = Vec::new();
+    let mut fully_consumed = true;
+    for item in &items {
+        let conds = item.split_cnf();
+        let mut all_conds = conds.clone();
+        all_conds.extend(outer.iter().cloned());
+        let mut built = None;
+        for index in candidates {
+            built = if index_is_multi_valued(info, index) {
+                mv_index_parts(info, index)
+                    .into_iter()
+                    .next()
+                    .and_then(|part| {
+                        mv_union_item_arm(info, index, &part, &all_conds, table_rows)
+                    })
+            } else if index.primary && info.pk_is_clustered() {
+                index_merge_handle_arm(info, &all_conds, table_rows)
+                    .map(|(path, consumed)| (vec![path], consumed))
+            } else {
+                index_merge_index_arm(info, index, &all_conds, table_rows, None)
+                    .map(|(path, consumed)| (vec![path], consumed))
+            };
+            if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+                eprintln!(
+                    "MV multi item={:?} index={} built={}",
+                    conds.iter().map(|c| c.restore_string()).collect::<Vec<_>>(),
+                    index.name.o(),
+                    built.is_some()
+                );
+            }
+            if built.is_some() {
+                break;
+            }
+        }
+        if built.is_none() {
+            // A DNF item outside the MV predicates (`isnull(i) or
+            // json_contains(j, '1')`) still becomes a union arm: TiDB falls
+            // back to any ordinary index on the item and, when none fits, to
+            // a full table scan arm next to the MVIndex arm.
+            let all_indexes = IndexMergeHint {
+                indexes: Vec::new(),
+                disabled: false,
+            };
+            built = index_merge_union_arm(
+                info,
+                &all_indexes,
+                &conds,
+                &all_conds,
+                table_rows,
+                None,
+            )
+            .map(|(path, consumed)| (vec![path], consumed))
+            .or_else(|| {
+                if !mv_item_allows_table_scan_fallback(info, &conds) {
+                    return None;
+                }
+                let consumed = all_conds.clone();
+                let path = IndexMergePath {
+                    index: String::new(),
+                    range: None,
+                    table_range: true,
+                    index_columns: Vec::new(),
+                    keep_order: false,
+                    desc: false,
+                    limit: None,
+                    topn: None,
+                    tid_selection: None,
+                    residual_selection: None,
+                    ranges: Vec::new(),
+                    seek: None,
+                };
+                Some((vec![path], consumed))
+            });
+        }
+        let (mut arms, consumed) = built?;
+        let consumed: Vec<ExprNode> = consumed
+            .into_iter()
+            .filter(|used| !outer_keys.contains(&used.restore_string()))
+            .collect();
+        if consumed.len() != conds.len() {
+            fully_consumed = false;
+        }
+        paths.append(&mut arms);
+    }
+    let mut residual = outer;
+    let mut root_residual = Vec::new();
+    let outer_overlaps = mv_outer_overlaps(info, candidates, &residual);
+    if !outer_overlaps.is_empty() {
+        residual.retain(|conjunct| {
+            !outer_overlaps
+                .iter()
+                .any(|used| used.restore_string() == conjunct.restore_string())
+        });
+        root_residual.extend(outer_overlaps);
+    }
+    if !fully_consumed {
+        let has_overlaps = items.iter().any(|item| {
+            candidates.iter().any(|index| {
+                index_is_multi_valued(info, index)
+                    && mv_index_parts(info, index).into_iter().any(|part| {
+                        mv_conditions(&part, &item.split_cnf())
+                            .iter()
+                            .any(|condition| condition.kind == MvCondKind::Overlaps)
+                    })
+            })
+        });
+        if has_overlaps {
+            root_residual.push(cnf[or_pos].clone());
+        } else {
+            residual.push(cnf[or_pos].clone());
+        }
+    }
+    let bases: Vec<ExprNode> = candidates
+        .iter()
+        .filter(|index| index_is_multi_valued(info, index))
+        .filter_map(|index| mv_index_parts(info, index).into_iter().next())
+        .map(|part| part.base)
+        .collect();
+    finish_mv_merge_plan(
+        select,
+        from,
+        info,
+        paths,
+        false,
+        residual,
+        root_residual,
+        &bases,
+        table_rows,
+        false,
+    )
+}
+
+/// First MVIndex of `info` over which `select`'s filter builds a merge plan.
+fn find_mv_index_merge_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    table_rows: f64,
+    hint: Option<&IndexMergeHint>,
+    shrink_equalities: bool,
+) -> Option<PhysicalPlan> {
+    if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+        eprintln!("MV find hint={:?}", hint.map(|h| h.indexes.clone()));
+    }
+    if let Some(hint) = hint
+        && hint.indexes.len() > 1
+    {
+        let hinted: Vec<&sealdb_meta::IndexInfo> = hint
+            .indexes
+            .iter()
+            .filter_map(|name| hint_index(info, name))
+            .collect();
+        if hinted.iter().any(|idx| index_is_multi_valued(info, idx))
+            && let Some(plan) = mv_multi_index_merge_plan(select, from, info, &hinted, table_rows)
+        {
+            return Some(plan);
+        }
+    }
+    let candidates: Vec<&sealdb_meta::IndexInfo> = match hint {
+        Some(hint) if !hint.indexes.is_empty() => hint
+            .indexes
+            .iter()
+            .filter_map(|name| hint_index(info, name))
+            .collect(),
+        _ => info.indices.iter().collect(),
+    };
+    if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+        eprintln!(
+            "MV candidates={:?}",
+            candidates
+                .iter()
+                .map(|idx| (idx.name.o().to_string(), mv_index_parts(info, idx).len()))
+                .collect::<Vec<_>>()
+        );
+    }
+    let usable: Vec<&sealdb_meta::IndexInfo> = candidates
+        .into_iter()
+        .filter(|index| index_is_multi_valued(info, index) && index.where_clause.is_none())
+        .filter(|index| {
+            !index.invisible
+                || hint.is_some_and(|hint| {
+                    hint.indexes
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(index.name.o()))
+                })
+        })
+        .collect();
+    // A hinted union names every arm index; try the strict builders first so a
+    // later hinted MVIndex can serve a DNF item (`mvi1, mvi3` over
+    // `member of a or member of d`) before a full-scan fallback arm makes an
+    // earlier index look usable.
+    for allow_fallback in [false, true] {
+        for index in &usable {
+            if let Some(plan) = mv_index_merge_plan(
+                select,
+                from,
+                info,
+                index,
+                table_rows,
+                shrink_equalities,
+                allow_fallback,
+            ) {
+                return Some(plan);
+            }
+        }
+    }
+    None
+}
+
 fn index_merge_index_arm(
     info: &sealdb_meta::TableInfo,
     index: &sealdb_meta::IndexInfo,
@@ -14720,6 +16365,12 @@ fn index_merge_index_arm(
     table_rows: f64,
     table_stats: Option<&super::access_range::TableStats>,
 ) -> Option<(IndexMergePath, Vec<ExprNode>)> {
+    // A multi-valued index is only reachable through its element ranges
+    // (`MEMBER OF` / `JSON_CONTAINS` / `JSON_OVERLAPS`), never as a plain key
+    // range over its hidden generated column.
+    if index_is_multi_valued(info, index) {
+        return None;
+    }
     // TiDB ranger turns `col IS NULL` into the NULL point range, so the index
     // over that column is a usable merge arm (`IndexRangeScan range:[NULL,NULL]`,
     // sized by the pseudo NULL share `table_rows / 1000`). `conjunct_bound_sets`
@@ -14756,9 +16407,11 @@ fn index_merge_index_arm(
                 keep_order: false,
                 desc: false,
                 limit: None,
+            topn: None,
                 tid_selection: None,
                 residual_selection: None,
                 ranges,
+                seek: None,
             },
             vec![cond.clone()],
         ));
@@ -14774,9 +16427,11 @@ fn index_merge_index_arm(
             keep_order: false,
             desc: false,
             limit: None,
+            topn: None,
             tid_selection: None,
             residual_selection: None,
             ranges: access.ranges,
+            seek: None,
         },
         access.consumed,
     ))
@@ -14865,9 +16520,11 @@ fn index_merge_handle_arm(
             keep_order: false,
             desc: false,
             limit: None,
+            topn: None,
             tid_selection: None,
             residual_selection: None,
             ranges,
+            seek: None,
         },
         consumed,
     ))
@@ -14897,6 +16554,8 @@ fn index_merge_arm_candidates<'a>(
     let usable = |idx: &&sealdb_meta::IndexInfo| {
         !(idx.primary && info.pk_is_handle)
             && !idx.invisible
+            // MVIndex arms come from the dedicated JSON element builder.
+            && !index_is_multi_valued(info, idx)
             // Partial indexes are not merge arms: TiDB rejects the whole
             // `USE_INDEX_MERGE` hint when one listed index carries a predicate.
             && idx.where_clause.is_none()
@@ -14912,6 +16571,7 @@ fn index_merge_arm_candidates<'a>(
 fn index_merge_union_arm(
     info: &sealdb_meta::TableInfo,
     hint: &IndexMergeHint,
+    item_conds: &[ExprNode],
     conds: &[ExprNode],
     table_rows: f64,
     table_stats: Option<&super::access_range::TableStats>,
@@ -14952,7 +16612,13 @@ fn index_merge_union_arm(
     {
         return index_merge_handle_arm(info, conds, table_rows);
     }
-    let candidates = index_merge_arm_candidates(info, hint, conds);
+    // Prefer an index the DNF item itself seeks; an outer CNF conjunct only
+    // supplies the key prefix (`id = 1 and (a = 1 or b = 1)`) when the item
+    // alone does not name a leading key column.
+    let mut candidates = index_merge_arm_candidates(info, hint, item_conds);
+    if candidates.is_empty() {
+        candidates = index_merge_arm_candidates(info, hint, conds);
+    }
     let bounded: Vec<String> = conds
         .iter()
         .filter_map(|cond| {
@@ -15044,9 +16710,21 @@ fn index_merge_union_paths(
     }
     let mut paths = Vec::with_capacity(items.len());
     let mut fully_consumed = true;
+    // CNF conjuncts outside the OR (`id = 1 and (a = 1 or b = 1)`) seek every
+    // arm's index prefix; TiDB folds them into each partial path and drops
+    // them from the probe filter only when all arms consumed them.
+    let outer: Vec<ExprNode> = cnf
+        .iter()
+        .enumerate()
+        .filter(|(pos, _)| *pos != or_pos)
+        .map(|(_, conjunct)| conjunct.clone())
+        .collect();
+    let mut outer_consumed_by_all = outer.clone();
     for item in &items {
-        let conds = item.split_cnf();
-        let built = index_merge_union_arm(info, hint, &conds, table_rows, table_stats);
+        let mut conds = item.split_cnf();
+        let item_conds = conds.clone();
+        conds.extend(outer.iter().cloned());
+        let built = index_merge_union_arm(info, hint, &item_conds, &conds, table_rows, table_stats);
         if std::env::var("SEALDB_DEBUG_IM").is_ok() {
             eprintln!(
                 "IM arm conds={:?} ok={}",
@@ -15055,15 +16733,31 @@ fn index_merge_union_paths(
             );
         }
         let (path, consumed) = built?;
-        if consumed.len() != conds.len() {
+        // Only the DNF item's own conditions must be covered by the arm; an
+        // outer conjunct left for the probe filter (`a = 1 and (b = 2 or …)`)
+        // does not make the OR itself residual.
+        let item_keys: std::collections::HashSet<String> =
+            item_conds.iter().map(ExprNode::restore_string).collect();
+        if !item_keys
+            .iter()
+            .all(|key| consumed.iter().any(|used| used.restore_string() == *key))
+        {
             fully_consumed = false;
         }
+        let consumed_keys: std::collections::HashSet<String> =
+            consumed.iter().map(ExprNode::restore_string).collect();
+        outer_consumed_by_all.retain(|cond| consumed_keys.contains(&cond.restore_string()));
         paths.push(path);
     }
     let mut residual: Vec<ExprNode> = cnf
         .iter()
         .enumerate()
         .filter(|(pos, _)| *pos != or_pos)
+        .filter(|(_, conjunct)| {
+            !outer_consumed_by_all
+                .iter()
+                .any(|used| used.restore_string() == conjunct.restore_string())
+        })
         .map(|(_, conjunct)| conjunct.clone())
         .collect();
     // A DNF filter survives in the probe plan unless every arm fully covers it.
@@ -15398,11 +17092,17 @@ fn index_merge_dnf_item_rows(
     if items.is_empty() {
         return None;
     }
-    let mut selectivity = 0.0;
+    // TiDB keeps one stats node per *index*: every DNF item an index can range
+    // belongs to that index's node, whose selectivity is the sum of the item
+    // counts (`b = '2' or b = '4'` on `index(b)` reads 20 rows). The nodes then
+    // combine under the independence assumption. Grouping is visible at the
+    // second decimal: four items on two indexes read `39.96`, not the per-arm
+    // union `39.94`.
+    let mut groups: Vec<(String, f64, Vec<String>)> = Vec::new();
     for conds in items {
         // The row handle is a partial path of its own: `a = 10` on an integer
         // PK pins one row, and the item's estimate is its access count.
-        let mut item_rows: Option<f64> = None;
+        let mut best: Option<(String, f64)> = None;
         if clustered_handle_column(info).is_some_and(|handle| {
             conds.iter().any(|cond| {
                 sealdb_statistics::pseudo::conjunct_bound_sets(cond)
@@ -15411,11 +17111,9 @@ fn index_merge_dnf_item_rows(
         }) && let Some((path, _)) = index_merge_handle_arm(info, conds, table_rows)
         {
             let fallback = path.range.as_ref().map_or(table_rows, |range| range.rows);
-            item_rows = Some(pseudo_unsigned_int_handle_rows(
-                info,
-                table_rows,
-                &path.ranges,
-                fallback,
+            best = Some((
+                "\u{1}handle".to_string(),
+                pseudo_unsigned_int_handle_rows(info, table_rows, &path.ranges, fallback),
             ));
         }
         for index in &info.indices {
@@ -15459,12 +17157,33 @@ fn index_merge_dnf_item_rows(
             if keyed.len() < conds.len() {
                 rows *= sealdb_statistics::pseudo::SELECTION_FACTOR;
             }
-            item_rows = Some(item_rows.map_or(rows, |best: f64| best.min(rows)));
+            let node = index.name.o().to_ascii_lowercase();
+            if best.as_ref().is_none_or(|(_, best_rows)| rows < *best_rows) {
+                best = Some((node, rows));
+            }
         }
         // A DNF item no index can range-scan keeps the caller's arm-wise model.
-        let item_rows = item_rows?;
+        let (node, item_rows) = best?;
         let item_sel = (item_rows / table_rows).clamp(0.0, 1.0);
-        selectivity = selectivity + item_sel - selectivity * item_sel;
+        let item_key = conds
+            .iter()
+            .map(|cond| cond.restore_string())
+            .collect::<Vec<_>>()
+            .join("\u{1}");
+        match groups.iter_mut().find(|(name, _, _)| *name == node) {
+            Some((_, sum, seen)) => {
+                if !seen.contains(&item_key) {
+                    *sum += item_sel;
+                    seen.push(item_key);
+                }
+            }
+            None => groups.push((node, item_sel, vec![item_key])),
+        }
+    }
+    let mut selectivity = 0.0;
+    for (_, group_sel, _) in groups {
+        let group_sel = group_sel.min(1.0);
+        selectivity = selectivity + group_sel - selectivity * group_sel;
     }
     Some(table_rows * selectivity)
 }
@@ -15479,26 +17198,83 @@ fn index_merge_residual_rows(
     info: &sealdb_meta::TableInfo,
     table: Option<&super::access_range::TableStats>,
 ) -> f64 {
+    let debug = std::env::var("SEALDB_DEBUG_IM").is_ok();
     let mut selectivity = 1.0;
     for conjunct in residual.iter().flat_map(|conjunct| conjunct.split_cnf()) {
         let items = conjunct.split_dnf();
         if items.len() > 1 {
-            // An OR group unions its items' selectivities (`1 - Π(1 - sᵢ)`)
-            // instead of charging the `0.8` default for the whole group.
-            let mut union = 0.0;
+            // An OR group unions its items' selectivities instead of charging
+            // the `0.8` default for the whole group. TiDB keeps one stats node
+            // per column (or index): every item on the same column set lands in
+            // one node whose selectivity is the *sum* of its item selectivities
+            // (duplicates fold), and the nodes then combine under independence.
+            // `c = 13 or c = 15 or c = 5 or b = '12' or c = 13 or b = '11'`
+            // reads `0.003` for `c` plus `0.002` for `b`.
+            let mut groups: Vec<(Vec<String>, f64, Vec<String>)> = Vec::new();
             for item in items {
+                let conds = item.split_cnf();
+                let mut cols: Vec<String> = conds
+                    .iter()
+                    .flat_map(|cond| {
+                        cond.referenced_columns()
+                            .into_iter()
+                            .map(|(_, name)| name.to_ascii_lowercase())
+                    })
+                    .collect();
+                cols.sort();
+                cols.dedup();
                 let mut item_sel = 1.0;
-                for cond in item.split_cnf() {
-                    item_sel *= conjunct_selectivity(&cond, info, table);
+                for cond in &conds {
+                    item_sel *= mv_residual_selectivity(cond, info, table);
                 }
-                union = union + item_sel - union * item_sel;
+                let item_key = item.restore_string();
+                match groups.iter_mut().find(|(group, _, _)| *group == cols) {
+                    Some((_, sum, seen)) => {
+                        if !seen.contains(&item_key) {
+                            *sum += item_sel;
+                            seen.push(item_key);
+                        }
+                    }
+                    None => groups.push((cols, item_sel, vec![item_key])),
+                }
+            }
+            let mut union = 0.0;
+            for (_, group_sel, _) in groups {
+                let group_sel = group_sel.min(1.0);
+                union = union + group_sel - union * group_sel;
             }
             selectivity *= union;
         } else {
-            selectivity *= conjunct_selectivity(&conjunct, info, table);
+            selectivity *= mv_residual_selectivity(&conjunct, info, table);
         }
     }
+    if debug {
+        eprintln!(
+            "IM residual rows={rows} sel={selectivity} conds={:?}",
+            residual.iter().map(|c| c.restore_string()).collect::<Vec<_>>()
+        );
+    }
     (rows * selectivity).clamp(0.0, rows)
+}
+
+/// A JSON predicate an MVIndex arm could not encode has no usable range here:
+/// TiDB estimates it from the multi-valued element count (`1/1000` per
+/// element), which drives the probe rows of
+/// `… and (2 member of j1) and a<10` to `0.00`.
+fn mv_residual_selectivity(
+    cond: &ExprNode,
+    info: &sealdb_meta::TableInfo,
+    table: Option<&super::access_range::TableStats>,
+) -> f64 {
+    if let ExprNode::Func(func) = cond
+        && matches!(
+            func.name.to_ascii_lowercase().as_str(),
+            "json_memberof" | "json_contains" | "json_overlaps"
+        )
+    {
+        return 0.001;
+    }
+    conjunct_selectivity(cond, info, table)
 }
 
 /// Selectivity of one conjunct: TiDB `GetRowCountByIntColumnRanges` /
@@ -15515,6 +17291,14 @@ fn conjunct_selectivity(
     info: &sealdb_meta::TableInfo,
     table: Option<&super::access_range::TableStats>,
 ) -> f64 {
+    // TiDB sizes a bare `JSON_CONTAINS(col, …)` probe filter from the JSON
+    // element model (`1e-6`), which is what keeps
+    // `(json_contains(j,'[1,2]') or json_contains(j,'[3,4]'))` at `0.02` rows.
+    if let ExprNode::Func(func) = cond
+        && func.name.eq_ignore_ascii_case("json_contains")
+    {
+        return 1e-6;
+    }
     // `col IS NULL` / `NOT col IS NULL` read the column's null count: an
     // analyzed column without nulls filters everything away (`probe_topn`
     // `isnull(deleted_at)` leaves 0.00 rows), while the pseudo factor would
@@ -15587,6 +17371,33 @@ fn index_merge_plan(
         })
         .filter(super::plan_cost::has_real_stats);
     let cnf = selection.split_cnf();
+    // Multi-index hinted merge with at least one MVIndex: a DNF item may seek
+    // an ordinary index (`pk = 2`, `b = '2' and c = 20`) while another seeks a
+    // multi-valued index.
+    if let Some(hint) = hinted.as_ref()
+        && hint.indexes.len() > 1
+    {
+        let candidates: Vec<&sealdb_meta::IndexInfo> = hint
+            .indexes
+            .iter()
+            .filter_map(|name| hint_index(info, name))
+            .collect();
+        if candidates.iter().any(|idx| index_is_multi_valued(info, idx))
+            && let Some(plan) =
+                mv_multi_index_merge_plan(select, from, info, &candidates, table_rows)
+        {
+            return Some(plan);
+        }
+    }
+    // Multi-valued indexes never become a plain index access path: their
+    // hidden generated column can only be seeked element by element through an
+    // IndexMerge (`planner/core/indexmerge_path`). Try them before the ordinary
+    // union / intersection shapes.
+    if let Some(plan) =
+        find_mv_index_merge_plan(select, from, info, table_rows, hinted.as_ref(), false)
+    {
+        return Some(plan);
+    }
     let or_pos = cnf
         .iter()
         .position(|conjunct| conjunct.split_dnf().len() > 1);
@@ -15691,7 +17502,13 @@ fn index_merge_plan(
             return None;
         }
     }
-    let path_rows = |path: &IndexMergePath| path.range.as_ref().map_or(table_rows, |r| r.rows);
+    let path_rows = |path: &IndexMergePath| {
+        if path.table_range && path.range.is_none() {
+            0.0
+        } else {
+            path.range.as_ref().map_or(table_rows, |r| r.rows)
+        }
+    };
     // TiDB combine: union is `1 - Π(1 - selᵢ)`; intersection multiplies the
     // per-path selectivities (every arm must hold).
     let mut rowid_est = if intersection {
@@ -15737,28 +17554,36 @@ fn index_merge_plan(
     let mut order_desc = false;
     if !intersection
         && let Some((column, desc)) = &order
-        && paths.iter().all(|path| {
-            !path.table_range
+    {
+        order_column = Some(column.clone());
+        order_desc = *desc;
+        // An arm keeps key order only when every key part before the sort
+        // column is pinned to one value: `idx(a, c)` under `a = 1` reads `c` in
+        // order, while `idx(b, c)` under `b > 5` interleaves `c` across `b`.
+        for path in &mut paths {
+            path.keep_order = !path.table_range
                 && path
                     .index_columns
                     .iter()
                     .position(|key| key.eq_ignore_ascii_case(column))
-                    .is_some_and(|pos| pos > 0)
-        })
-    {
-        keep_order = true;
-        order_column = Some(column.clone());
-        order_desc = *desc;
-        for path in &mut paths {
-            path.keep_order = true;
+                    .is_some_and(|pos| {
+                        pos > 0
+                            && path
+                                .range
+                                .as_ref()
+                                .is_some_and(|range| range_equality_prefix(&range.text) >= pos)
+                    });
             path.desc = *desc;
         }
+        keep_order = !paths.is_empty() && paths.iter().all(|path| path.keep_order);
     }
     // TiDB `AdjustRowCountForIndexScanByLimit`: a LIMIT that sinks into the
     // merge shrinks the merge's cardinality and each arm's scan
-    // (`expectedCnt / selectivity`). An ORDER BY the arms cannot answer becomes
-    // a cop `TopN` above the probe instead, leaving the arms unscaled.
-    let sink_limit = select.order_by.is_empty() || keep_order;
+    // (`expectedCnt / selectivity`). An ORDER BY the arms cannot all answer
+    // keeps the merge root unordered: each order-preserving arm gets a cop
+    // `Limit`, the others a cop `TopN`, and a root `TopN` merges them.
+    let ordered = !select.order_by.is_empty();
+    let sink_limit = !ordered || keep_order;
     let expected = select
         .limit
         .map(|count| (count + select.offset.unwrap_or(0)) as f64);
@@ -15784,11 +17609,29 @@ fn index_merge_plan(
     // BY, so the LIMIT sinks into the merge too (one `Limit(Build)` per arm).
     let embedded = select
         .limit
-        .filter(|_| select.order_by.is_empty() || keep_order)
+        .filter(|_| !ordered || keep_order)
         .map(|count| (0u64, count));
     if let Some(limit) = embedded {
         for path in &mut paths {
             path.limit = Some(limit);
+        }
+    }
+    // Root order remains partial: every arm that reads in order gets the LIMIT
+    // (`offset:0, count:offset+limit`, TiDB keeps the offset above the merge),
+    // the rest get a cop `TopN` over their full range. The root `TopN` is added
+    // by `apply_order_limit`.
+    if ordered
+        && !keep_order
+        && let Some((offset, count_limit)) = select.limit.map(|count| (select.offset.unwrap_or(0), count))
+    {
+        for path in &mut paths {
+            if path.keep_order {
+                path.limit = Some((0, offset + count_limit));
+            } else if !path.table_range {
+                // The root TopN re-merges the arms, so each unordered arm
+                // keeps the full prefix (`offset:0, count:offset+limit`).
+                path.topn = Some((0, offset + count_limit));
+            }
         }
     }
     let planned = resolve_partitions(
@@ -15850,7 +17693,11 @@ fn index_merge_plan(
         pushed: None,
         intersection,
         paths,
-        est_rows: Some(probe_est),
+        est_rows: Some(if ordered && !keep_order {
+            expected.map_or(probe_est, |expected| expected.min(probe_est))
+        } else {
+            probe_est
+        }),
         probe_est: rowid_est,
         probe_selection: ExprNode::compose_cnf(residual),
         limit: embedded,
@@ -16439,7 +18286,7 @@ fn group_by_index_plan(
         return None;
     }
     for index in &info.indices {
-        if index_ignored(from, index.name.o()) {
+        if index_ignored(from, index.name.o()) || index_is_multi_valued(info, index) {
             continue;
         }
         if !index_has_group_prefix(info, index, &group_cols) {
@@ -16533,6 +18380,7 @@ fn scalar_agg_index_plan(
         .iter()
         .filter(|idx| !(idx.primary && info.pk_is_clustered()))
         .filter(|idx| !index_ignored(from, idx.name.o()))
+        .filter(|idx| !index_is_multi_valued(info, idx))
         .filter(|idx| !super::expr_index::has_expression_part(info, idx))
         .filter(|idx| info.index_covers(idx, &needed))
         .min_by_key(|idx| idx.columns.len())?;
@@ -30751,6 +32599,12 @@ fn access_plan_inner(
     let join_keys = side_join_key_columns(select, from);
     let join_key_exprs = side_join_key_exprs(select, from);
     let select = side_select.as_ref().unwrap_or(select);
+    if std::env::var("SEALDB_DEBUG_COERCE").is_ok() {
+        eprintln!(
+            "ACCESS selection={:?}",
+            select.selection.as_ref().map(|s| s.restore_string())
+        );
+    }
     // Predicates over an `ENUM` / `SET` column reach cop through `cast_enum`;
     // with a blacklisted `enum` TiDB derives no access range from them, so the
     // access path is selected without them and predicate pushdown keeps them as
@@ -30861,12 +32715,77 @@ fn access_plan_inner(
                     {
                         return plan;
                     }
+                    // An MVIndex hint still produces an IndexMerge: TiDB never
+                    // reads a multi-valued hidden column as a plain access path.
+                    if index_is_multi_valued(info, index)
+                        && let Some(plan) = find_mv_index_merge_plan(
+                            select,
+                            from,
+                            info,
+                            table_row_count(stats, from, current_db).max(1.0),
+                            Some(&IndexMergeHint {
+                                indexes: vec![hint.clone()],
+                                disabled: false,
+                            }),
+                            true,
+                        )
+                    {
+                        return plan;
+                    }
+                    // Without an MV predicate an MVIndex hint is ignored: it
+                    // has no plain access path, so the table scan remains.
+                    if index_is_multi_valued(info, index) {
+                        continue;
+                    }
                     // The hint fixes the access path, but TiDB still drops the
                     // `Sort` when `ORDER BY` is a prefix of that index.
                     return ordered_index_plan(
                         select, from, info, index, prune_mode, &join_keys, stats, current_db,
                     );
                 }
+            }
+        }
+        // A multi-valued predicate has no plain index access path: try its
+        // IndexMerge before the ordinary per-column index selection, otherwise
+        // an unrelated range (`a > 10` on `idx2`) wins and hides the merge.
+        if from.use_indexes.is_empty() {
+            let hinted = index_merge_hint(&select.text, &from.name).or_else(|| {
+                from.physical
+                    .as_deref()
+                    .and_then(|name| index_merge_hint(&select.text, name))
+            });
+            if let Some(hint) = hinted.as_ref()
+                && !hint.disabled
+                && hint.indexes.len() > 1
+            {
+                let candidates: Vec<&sealdb_meta::IndexInfo> = hint
+                    .indexes
+                    .iter()
+                    .filter_map(|name| hint_index(info, name))
+                    .collect();
+                if candidates.iter().any(|idx| index_is_multi_valued(info, idx))
+                    && let Some(plan) = mv_multi_index_merge_plan(
+                        select,
+                        from,
+                        info,
+                        &candidates,
+                        table_row_count(stats, from, current_db).max(1.0),
+                    )
+                {
+                    return plan;
+                }
+            }
+            if hinted.as_ref().is_none_or(|hint| !hint.disabled)
+                && let Some(plan) = find_mv_index_merge_plan(
+                    select,
+                    from,
+                    info,
+                    table_row_count(stats, from, current_db).max(1.0),
+                    hinted.as_ref(),
+                    false,
+                )
+            {
+                return plan;
             }
         }
         // `USE_INDEX_MERGE(t, …)` on a conjunctive filter (`a = 1 and b = 2`)
@@ -31074,15 +32993,45 @@ fn access_plan_inner(
             }
             return plan;
         }
+        // A DNF group whose arms each seek a different secondary index builds
+        // an automatic union even when another equality (`a = 1`) could drive a
+        // single-index lookup with the OR as a residual filter:
+        // `a = 1 and (b = 2 or c = 3 or d = 4)` reads `IndexMerge` on b/c/d and
+        // keeps `a = 1` as the probe filter.
+        let merge_hint = index_merge_hint(&select.text, &from.name).or_else(|| {
+            from.physical
+                .as_deref()
+                .and_then(|name| index_merge_hint(&select.text, name))
+        });
+        if from.use_indexes.is_empty()
+            && (merge_hint
+                .as_ref()
+                .is_some_and(|hint| !hint.disabled)
+                || opt_fix_control_52869(select))
+            && select.selection.as_ref().is_some_and(|selection| {
+                selection
+                    .split_cnf()
+                    .iter()
+                    .any(|conjunct| conjunct.split_dnf().len() > 1)
+            })
+            && let Some(plan) =
+                index_merge_plan(select, from, info, prune_mode, stats, current_db)
+        {
+            return plan;
+        }
         for (column, value) in &eqs {
             // TiDB prefers the unique index on the column for a point get over
             // a composite index that merely shares its leading column.
             let covering = info
                 .find_index_covering(column)
-                .filter(|idx| !index_ignored(from, idx.name.o()));
+                .filter(|idx| {
+                    !index_ignored(from, idx.name.o()) && !index_is_multi_valued(info, idx)
+                });
             let preferred = info
                 .find_unique_index_on(column)
-                .filter(|idx| !index_ignored(from, idx.name.o()))
+                .filter(|idx| {
+                    !index_ignored(from, idx.name.o()) && !index_is_multi_valued(info, idx)
+                })
                 .or(covering);
             if let Some(index) = preferred {
                 // PointGet needs every column of a unique key constrained; a
@@ -31151,7 +33100,9 @@ fn access_plan_inner(
             }
             if info
                 .find_index_covering(&column)
-                .filter(|idx| !index_ignored(from, idx.name.o()))
+                .filter(|idx| {
+                    !index_ignored(from, idx.name.o()) && !index_is_multi_valued(info, idx)
+                })
                 .is_some()
             {
                 // A non-covering range lookup adds a table probe per row, so
@@ -31160,6 +33111,7 @@ fn access_plan_inner(
                 let candidates = info.indices.iter().filter(|idx| {
                     !(idx.primary && info.pk_is_clustered())
                         && !index_ignored(from, idx.name.o())
+                        && !index_is_multi_valued(info, idx)
                         && idx
                             .columns
                             .first()
@@ -31314,7 +33266,11 @@ fn access_plan_inner(
                 .indices
                 .iter()
                 .filter(|idx| {
-                    !(idx.primary && info.pk_is_clustered()) && !index_ignored(from, idx.name.o())
+                    !(idx.primary && info.pk_is_clustered())
+                        && !index_ignored(from, idx.name.o())
+                        // A multi-valued hidden key part is never a plain
+                        // access path; only its IndexMerge can read it.
+                        && !index_is_multi_valued(info, idx)
                 })
                 .filter(|idx| {
                     select_text_matches_index(info, idx, select)
@@ -32054,7 +34010,9 @@ fn order_by_index_plan(
         .indices
         .iter()
         .filter(|idx| {
-            !(idx.primary && info.pk_is_clustered()) && !index_ignored(from, idx.name.o())
+            !(idx.primary && info.pk_is_clustered())
+                && !index_ignored(from, idx.name.o())
+                && !index_is_multi_valued(info, idx)
         })
         .find(|idx| {
             let keys = super::expr_index::part_keys(info, idx);

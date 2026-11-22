@@ -104,6 +104,22 @@ pub fn index_key_part_count(info: &TableInfo, index: &IndexInfo) -> Option<usize
     index_key_parts(info, index).map(|parts| parts.len())
 }
 
+/// Coerce a seek key datum to the storage type of key part `pos`.
+///
+/// Ranger converts every literal bound to the index column's type before
+/// building the seek key, so `c = 1` on a FLOAT part must encode the same
+/// `3.0` the writer stored (`c` in `key mvi(c, (cast(j as unsigned array)))`).
+pub fn coerce_key_datum(
+    info: &TableInfo,
+    index: &IndexInfo,
+    pos: usize,
+    datum: &sealdb_types::Datum,
+) -> Option<sealdb_types::Datum> {
+    let parts = index_key_parts(info, index)?;
+    let part = parts.get(pos)?;
+    coerce_bound(&part.field_type, Some((datum.clone(), true))).map(|(value, _)| value)
+}
+
 /// Composite seek ranges of `index` decided by `conjuncts` alone (no
 /// statistics), or `None` when no range can be built.
 pub struct KeyRangeAccess {

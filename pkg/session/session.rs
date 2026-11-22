@@ -2053,7 +2053,7 @@ impl Session {
             return Ok(show_variables_result(self, show));
         }
         check_group_by_ambiguity(stmt)?;
-        check_only_full_group_by(self, stmt)?;
+        check_only_full_group_by(self, stmt, &is)?;
         if let Some(result) = system_var_result(self, stmt) {
             *self
                 .last_warnings
@@ -3484,7 +3484,11 @@ fn check_select_group_by_ambiguity(select: &SelectStmt) -> Result<()> {
 /// columns grouped by another column of that CTE are allowed (TiDB cte suite
 /// `select b from qn group by a`); base-table PK functional dependency is
 /// still out of scope.
-fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
+fn check_only_full_group_by(
+    session: &Session,
+    stmt: &Statement,
+    is: &InfoSchema,
+) -> Result<()> {
     let select = match stmt {
         Statement::Select(s) => s,
         Statement::Explain(e) => match e.stmt.as_ref() {
@@ -3510,7 +3514,7 @@ fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
         .lock()
         .expect("session current_db lock")
         .clone();
-    check_select_only_full_group_by(select, &current_db)
+    check_select_only_full_group_by(select, &current_db, is)
 }
 
 /// One SELECT block plus every nested block reachable from it.
@@ -3518,10 +3522,18 @@ fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
 /// Derived `FROM (SELECT …)` tables are lowered into synthetic CTEs on the
 /// same `SelectStmt`, so recursing through `with.ctes` also validates the
 /// bodies of derived tables (TiDB reports 1055 for those too).
-fn check_select_only_full_group_by(select: &SelectStmt, current_db: &str) -> Result<()> {
+fn check_select_only_full_group_by(
+    select: &SelectStmt,
+    current_db: &str,
+    is: &InfoSchema,
+) -> Result<()> {
     if !select.group_by.is_empty() {
         let cte_loose = cte_group_by_allows_peer_columns(select);
+        let unique_key_group = group_by_covers_unique_key(select, current_db, is);
         for (i, field) in select.fields.iter().enumerate() {
+            if unique_key_group {
+                continue;
+            }
             if select_field_ok_for_group_by(&field.expr, &select.group_by, select) {
                 continue;
             }
@@ -3536,19 +3548,54 @@ fn check_select_only_full_group_by(select: &SelectStmt, current_db: &str) -> Res
     }
     if let Some(with) = &select.with {
         for cte in &with.ctes {
-            check_select_only_full_group_by(&cte.query, current_db)?;
+            check_select_only_full_group_by(&cte.query, current_db, is)?;
             if let Some((_, arm)) = &cte.recursive {
-                check_select_only_full_group_by(arm, current_db)?;
+                check_select_only_full_group_by(arm, current_db, is)?;
             }
             for (_, arm) in &cte.recursive_rest {
-                check_select_only_full_group_by(arm, current_db)?;
+                check_select_only_full_group_by(arm, current_db, is)?;
             }
             for (_, arm) in &cte.set_rest {
-                check_select_only_full_group_by(arm, current_db)?;
+                check_select_only_full_group_by(arm, current_db, is)?;
             }
         }
     }
     Ok(())
+}
+
+/// A GROUP BY list that contains every column of a UNIQUE index determines a
+/// single row per group, so every other column in the block is functionally
+/// dependent on the grouping key and is legal under ONLY_FULL_GROUP_BY.
+fn group_by_covers_unique_key(select: &SelectStmt, current_db: &str, is: &InfoSchema) -> bool {
+    if !select.joins.is_empty() || select.from_item.is_some() {
+        return false;
+    }
+    let Some(from) = &select.from else {
+        return false;
+    };
+    let (db, table) = from.qualified(current_db);
+    let Some(info) = is.table_by_name(&db, &table) else {
+        return false;
+    };
+    let grouped: Vec<String> = select
+        .group_by
+        .iter()
+        .filter_map(|expr| match expr {
+            ExprNode::Column(col) => Some(col.name.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    if grouped.is_empty() {
+        return false;
+    }
+    info.indices.iter().any(|index| {
+        index.unique
+            && !index.columns.is_empty()
+            && index
+                .columns
+                .iter()
+                .all(|col| grouped.iter().any(|g| g.as_str() == col.name.l()))
+    })
 }
 
 /// TiDB names the offending column as `{db}.{table}.{col}` when it can
@@ -5863,6 +5910,47 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .auto_analyze_ratio
                     .lock()
                     .expect("session auto analyze ratio lock") = ratio;
+            }
+            "tidb_analyze_version" => {
+                // TiDB 8.x only accepts 1 and 2; version 1 is deprecated.
+                let version = if value.eq_ignore_ascii_case("DEFAULT") {
+                    2
+                } else {
+                    value.trim().parse::<i32>().map_err(|_| {
+                        sealdb_errno::Error::new(
+                            sealdb_errno::ERR_WRONG_ARGUMENTS,
+                            format!(
+                                "Variable 'tidb_analyze_version' can't be set to the value of '{value}'"
+                            ),
+                        )
+                    })?
+                };
+                if version != 1 && version != 2 {
+                    return Err(sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!(
+                            "Variable 'tidb_analyze_version' can't be set to the value of '{value}'"
+                        ),
+                    ));
+                }
+                if version == 1 {
+                    warnings.push((
+                        1287,
+                        "'tidb_analyze_version=1' is deprecated and will be removed in a future release. Please use tidb_analyze_version=2 instead"
+                            .to_string(),
+                    ));
+                }
+                session.domain.set_analyze_version(version);
+            }
+            "tidb_opt_fix_control" => {
+                // #52869 enables the automatic IndexMerge union for
+                // `a = c1 and (b = c2 or c = c3 …)`.
+                let enabled = !value.eq_ignore_ascii_case("DEFAULT")
+                    && value
+                        .to_ascii_lowercase()
+                        .split(',')
+                        .any(|item| item.trim() == "52869:on" || item.trim() == "52869:1");
+                sealdb_planner::set_opt_fix_control_52869(enabled);
             }
             "tidb_cost_model_version" => {
                 // `DEFAULT` resets to the 8.x model (v2). TiDB accepts 1 and 2.

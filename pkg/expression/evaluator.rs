@@ -6,7 +6,7 @@ use sealdb_errno::{
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::expressions::{
     BetweenExpr, BinaryOpExpr, CaseExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr,
-    InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, UnaryOpExpr,
+    InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, UnaryOpExpr, ValueExpr,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_parser::sqlparser_bridge::parse_expr;
@@ -2154,6 +2154,9 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "DATE_SUB" | "SUBDATE" => eval_date_add_sub(func, schema, row, true),
         "STR_TO_DATE" => eval_str_to_date(func, schema, row),
         "JSON_EXTRACT" | "JSON_EXTRACT_SCALAR" => eval_json_extract(func, schema, row),
+        "JSON_CONTAINS" => eval_json_contains(func, schema, row),
+        "JSON_OVERLAPS" => eval_json_overlaps(func, schema, row),
+        "JSON_MEMBEROF" | "JSON_MEMBER_OF" => eval_json_memberof(func, schema, row),
         "JSON_SET" => eval_json_set(func, schema, row),
         "JSON_UNQUOTE" => eval_json_unquote(func, schema, row),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
@@ -2872,6 +2875,171 @@ fn eval_json_extract(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> R
         }
     }
     Ok(Datum::Null)
+}
+
+/// MySQL `JSON_CONTAINS(target, candidate[, path])`: is every element of
+/// `candidate` present in `target`? Multi-valued index predicates use an array
+/// `target` with an array or scalar candidate.
+fn eval_json_contains(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() < 2 || func.args.len() > 3 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_contains'",
+        ));
+    }
+    let target = eval_expr_with_row(&func.args[0], schema, row)?;
+    let candidate = eval_expr_with_row(&func.args[1], schema, row)?;
+    if target.is_null() || candidate.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut target = json_arg_value(&target);
+    if func.args.len() == 3 {
+        let path = eval_expr_with_row(&func.args[2], schema, row)?;
+        if path.is_null() {
+            return Ok(Datum::Null);
+        }
+        let path = String::from_utf8_lossy(&path.as_bytes()).to_string();
+        match json_path_get(&target, &path) {
+            Some(found) => target = found.clone(),
+            None => return Ok(Datum::I64(0)),
+        }
+    }
+    let candidate = json_arg_value(&candidate);
+    Ok(Datum::I64(i64::from(json_contains_value(
+        &target, &candidate,
+    ))))
+}
+
+/// MySQL `JSON_OVERLAPS(a, b)`: two arrays share an element, two objects share
+/// a member, or two scalars are equal.
+fn eval_json_overlaps(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_overlaps'",
+        ));
+    }
+    let left = eval_expr_with_row(&func.args[0], schema, row)?;
+    let right = eval_expr_with_row(&func.args[1], schema, row)?;
+    if left.is_null() || right.is_null() {
+        return Ok(Datum::Null);
+    }
+    Ok(Datum::I64(i64::from(json_overlaps_value(
+        &json_arg_value(&left),
+        &json_arg_value(&right),
+    ))))
+}
+
+/// MySQL `JSON_MEMBEROF(needle, array)`: is `needle` an element of `array`?
+fn eval_json_memberof(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_memberof'",
+        ));
+    }
+    let needle = eval_expr_with_row(&func.args[0], schema, row)?;
+    let array = eval_expr_with_row(&func.args[1], schema, row)?;
+    if needle.is_null() || array.is_null() {
+        return Ok(Datum::Null);
+    }
+    let array = json_arg_value(&array);
+    // `'1' MEMBER OF (…)`: the rewrite wraps the needle in
+    // `cast('1' as json)`, which keeps a SQL string literal a JSON *string*.
+    // Parsing it as a JSON document would turn it into the number 1 and match
+    // a numeric array element.
+    let needle = match (&func.args[0], &needle) {
+        (
+            ExprNode::Cast(cast),
+            Datum::Bytes(bytes),
+        ) if cast.target.eq_ignore_ascii_case("json")
+            && matches!(
+                cast.expr.as_ref(),
+                ExprNode::Value(ValueExpr {
+                    datum: Datum::Bytes(_)
+                })
+            ) =>
+        {
+            serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
+        }
+        _ => json_arg_value(&needle),
+    };
+    let found = match &array {
+        serde_json::Value::Array(items) => items.iter().any(|item| json_value_eq(item, &needle)),
+        _ => false,
+    };
+    Ok(Datum::I64(i64::from(found)))
+}
+
+/// Interpret a function argument as JSON. Extracted scalar strings reach the
+/// evaluator unquoted (`json_extract` strips the quotes), so text that is not
+/// already a JSON document is treated as a JSON string.
+pub fn json_arg_value(datum: &Datum) -> serde_json::Value {
+    match datum {
+        Datum::Null => serde_json::Value::Null,
+        Datum::I64(v) => serde_json::Value::from(*v),
+        Datum::U64(v) => serde_json::Value::from(*v),
+        Datum::F64(v) => serde_json::Number::from_f64(*v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Datum::Year(v) => serde_json::Value::from(*v),
+        Datum::Decimal(d) => {
+            let text = d.to_string();
+            serde_json::from_str::<serde_json::Value>(&text)
+                .unwrap_or_else(|_| serde_json::Value::String(text))
+        }
+        Datum::Bytes(bytes) | Datum::Bit(bytes) => {
+            match serde_json::from_slice::<serde_json::Value>(bytes) {
+                Ok(value) => value,
+                Err(_) => serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned()),
+            }
+        }
+        Datum::Time(t) => serde_json::Value::String(t.to_string()),
+        Datum::Enum(e) => serde_json::Value::String(String::from_utf8_lossy(&e.label).into_owned()),
+    }
+}
+
+/// JSON equality with MySQL's numeric coercion (`1` matches `1.0`).
+fn json_value_eq(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    if let (serde_json::Value::Number(a), serde_json::Value::Number(b)) = (left, right) {
+        if let (Some(a), Some(b)) = (a.as_f64(), b.as_f64()) {
+            return a == b;
+        }
+    }
+    left == right
+}
+
+fn json_contains_value(target: &serde_json::Value, candidate: &serde_json::Value) -> bool {
+    match target {
+        serde_json::Value::Array(items) => match candidate {
+            serde_json::Value::Array(candidates) => candidates
+                .iter()
+                .all(|candidate| items.iter().any(|item| json_value_eq(item, candidate))),
+            candidate => items.iter().any(|item| json_value_eq(item, candidate)),
+        },
+        serde_json::Value::Object(target) => match candidate {
+            serde_json::Value::Object(candidates) => candidates.iter().all(|(key, value)| {
+                target
+                    .get(key)
+                    .is_some_and(|item| json_contains_value(item, value))
+            }),
+            _ => false,
+        },
+        _ => json_value_eq(target, candidate),
+    }
+}
+
+fn json_overlaps_value(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
+            a.iter().any(|item| b.iter().any(|other| json_value_eq(item, other)))
+        }
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => a.iter().any(|(key, value)| {
+            b.get(key)
+                .is_some_and(|other| json_contains_value(value, other))
+        }),
+        _ => json_value_eq(left, right),
+    }
 }
 
 /// MySQL `JSON_UNQUOTE(json_val)`: strips the quotes from a JSON string and

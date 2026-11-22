@@ -79,6 +79,21 @@ fn push_into(
         return plan;
     }
     match plan {
+        // An MVIndex merge keeps its `JSON_OVERLAPS` re-check at the merge root
+        // (TiDB cannot push it into the cop task). The predicate pushdown has
+        // already folded the WHERE conjuncts into the merge arms and the probe
+        // `Selection`; wrapping another `Selection` would double-count them.
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } if matches!(child.as_ref(), PhysicalPlan::IndexMerge { .. }) => {
+            PhysicalPlan::Selection {
+                child,
+                filter,
+                est_rows,
+            }
+        }
         PhysicalPlan::TableReader {
             table,
             partitions,

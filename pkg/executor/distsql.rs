@@ -539,6 +539,12 @@ impl Executor for IndexMergeExecutor {
                         &mut handles,
                     )?;
                 }
+                // An arm may carry a cop `Selection(Build)` over its index
+                // columns (`b NOT LIKE '%test%'` on the third part of
+                // `mvi1(c, mvi(j), b)`). TiDB filters the arm's row IDs before
+                // merging them, so it has to be applied per arm, not to the
+                // merged result.
+                let mut arm_rows: Vec<Vec<Datum>> = Vec::new();
                 for path in &self.paths {
                     if path.table_range {
                         continue;
@@ -550,22 +556,36 @@ impl Executor for IndexMergeExecutor {
                     else {
                         continue;
                     };
-                    let bounds: Vec<IndexAccess> = path
-                        .ranges
-                        .iter()
-                        .map(|(low, high)| IndexAccess::Range {
-                            low: low
-                                .as_ref()
-                                .map(|(value, _)| vec![value.clone()])
-                                .unwrap_or_default(),
-                            low_inclusive: low.as_ref().is_none_or(|(_, inclusive)| *inclusive),
-                            high: high
-                                .as_ref()
-                                .map(|(value, _)| vec![value.clone()])
-                                .unwrap_or_default(),
-                            high_inclusive: high.as_ref().is_none_or(|(_, inclusive)| *inclusive),
-                        })
-                        .collect();
+                    let bounds: Vec<IndexAccess> = match &path.seek {
+                        // A composite point key (`[c = 1, element = 4]`): the
+                        // element cannot be expressed as one `ranges` datum.
+                        Some(seek) => vec![IndexAccess::Range {
+                            low: seek.clone(),
+                            low_inclusive: true,
+                            high: seek.clone(),
+                            high_inclusive: true,
+                        }],
+                        None => path
+                            .ranges
+                            .iter()
+                            .map(|(low, high)| IndexAccess::Range {
+                                low: low
+                                    .as_ref()
+                                    .map(|(value, _)| vec![value.clone()])
+                                    .unwrap_or_default(),
+                                low_inclusive: low.as_ref().is_none_or(|(_, inclusive)| *inclusive),
+                                high: high
+                                    .as_ref()
+                                    .map(|(value, _)| vec![value.clone()])
+                                    .unwrap_or_default(),
+                                high_inclusive: high
+                                    .as_ref()
+                                    .is_none_or(|(_, inclusive)| *inclusive),
+                            })
+                            .collect(),
+                    };
+                    let mut arm_handles: Vec<(i64, i64)> = Vec::new();
+                    let mut arm_seen = HashSet::new();
                     collect_bounds(
                         txn,
                         index.clone(),
@@ -573,11 +593,44 @@ impl Executor for IndexMergeExecutor {
                         &physical,
                         self.lock,
                         self.wait,
-                        &mut seen,
-                        &mut handles,
+                        &mut arm_seen,
+                        &mut arm_handles,
                     )?;
+                    for (physical_id, handle) in arm_handles {
+                        let row_key = encode_row_key_with_handle(physical_id, handle);
+                        let Some(raw) = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?
+                        else {
+                            continue;
+                        };
+                        let decoded = decode_row(&raw, &info.col_field_types());
+                        let row: Vec<Datum> = info
+                            .columns
+                            .iter()
+                            .map(|col| {
+                                decoded
+                                    .iter()
+                                    .find(|(id, _)| *id == col.id)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or(Datum::Null)
+                            })
+                            .collect();
+                        if let Some(filter) = path.residual_selection.as_ref()
+                            && filter_rows(
+                                vec![row.clone()],
+                                &self.schema,
+                                Some(filter),
+                                Some(&info),
+                            )?
+                            .is_empty()
+                        {
+                            continue;
+                        }
+                        if seen.insert((physical_id, handle)) {
+                            arm_rows.push(row);
+                        }
+                    }
                 }
-                let mut rows = Vec::with_capacity(handles.len());
+                let mut rows = Vec::with_capacity(handles.len() + arm_rows.len());
                 for (physical_id, handle) in handles {
                     let row_key = encode_row_key_with_handle(physical_id, handle);
                     let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
@@ -597,6 +650,7 @@ impl Executor for IndexMergeExecutor {
                         );
                     }
                 }
+                rows.append(&mut arm_rows);
                 Ok(rows)
             })?
         };

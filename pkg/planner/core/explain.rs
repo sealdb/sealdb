@@ -6036,6 +6036,8 @@ fn emit_cop_children(
             probe_selection,
             probe_est,
             est_rows: root_est,
+            order_column,
+            order_desc,
             ..
         } => {
             let task = "cop[tikv]";
@@ -6083,7 +6085,16 @@ fn emit_cop_children(
                 return true;
             }
             for path in paths {
-                let arm_est = path.range.as_ref().map_or(1.0, |range| range.rows);
+                let arm_est = path.range.as_ref().map_or_else(
+                    || {
+                        if path.table_range && path.index.is_empty() && path.ranges.is_empty() {
+                            0.0
+                        } else {
+                            1.0
+                        }
+                    },
+                    |range| range.rows,
+                );
                 // The merge root names the partitions (`partition:pN`); the
                 // arms under it do not repeat the label.
                 let access = if path.table_range {
@@ -6111,7 +6122,11 @@ fn emit_cop_children(
                     info.push_str(", stats:pseudo");
                 }
                 let scan = if path.table_range {
-                    "TableRangeScan"
+                    if path.range.is_none() && path.index.is_empty() && path.ranges.is_empty() {
+                        "TableFullScan"
+                    } else {
+                        "TableRangeScan"
+                    }
                 } else {
                     "IndexRangeScan"
                 };
@@ -6177,7 +6192,11 @@ fn emit_cop_children(
                     );
                     continue;
                 }
-                let Some((offset, count)) = path.limit else {
+                let topn = path
+                    .topn
+                    .map(|(offset, count)| ("TopN", offset, count));
+                let limit = topn.or(path.limit.map(|(offset, count)| ("Limit", offset, count)));
+                let Some((wrapper, offset, count)) = limit else {
                     push_explain_row(
                         rows,
                         depth,
@@ -6196,17 +6215,45 @@ fn emit_cop_children(
                     }
                     continue;
                 };
+                let wrapper_info = if wrapper == "TopN" {
+                    // The merge's root TopN carries the schema-qualified
+                    // ORDER BY info (`db.t.c`); every arm repeats it.
+                    let base = topn_parent
+                        .map(|(by_info, _, _)| by_info.to_string())
+                        .unwrap_or_else(|| {
+                            order_column
+                                .as_ref()
+                                .map(|column| {
+                                    let schema = crate::core::planbuilder::explain_table_schema(table)
+                                        .unwrap_or_else(sealdb_expression::current_db_name);
+                                    format!("{schema}.{table}.{column}")
+                                })
+                                .unwrap_or_default()
+                        });
+                    let by = if *order_desc {
+                        format!("{base}:desc")
+                    } else {
+                        base
+                    };
+                    format!("{by}, offset:{offset}, count:{count}")
+                } else {
+                    format!("offset:{offset}, count:{count}")
+                };
                 push_explain_row(
                     rows,
                     depth,
                     false,
                     next_id,
                     CopRow {
-                        name: "Limit",
-                        est: arm_est.min((offset + count) as f64),
+                        name: wrapper,
+                        est: if wrapper == "TopN" {
+                            (offset + count) as f64
+                        } else {
+                            arm_est.min((offset + count) as f64)
+                        },
                         task,
                         access: String::new(),
-                        info: format!("offset:{offset}, count:{count}"),
+                        info: wrapper_info,
                     },
                 );
                 if let Some(last) = rows.last_mut() {
@@ -6275,9 +6322,39 @@ fn emit_cop_children(
                     },
                 );
             } else {
+                // The root TopN re-merges the unordered arms, so TiDB pushes a
+                // cop `TopN(Probe)` between the merge and the row-ID scan.
+                let merge_topn = topn_parent.filter(|_| !paths.iter().all(|path| path.keep_order));
+                if let Some((by_info, offset, count)) = merge_topn {
+                    let base = by_info.to_string();
+                    let by = if *order_desc {
+                        format!("{base}:desc")
+                    } else {
+                        base
+                    };
+                    // The probe-side TopN re-reads the merge's pre-offset
+                    // window, so it always starts at 0 with `offset + count`.
+                    let probe_count = offset + count;
+                    push_explain_row(
+                        rows,
+                        depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "TopN",
+                            est: probe_count as f64,
+                            task,
+                            access: String::new(),
+                            info: format!("{by}, offset:0, count:{probe_count}"),
+                        },
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Probe)");
+                    }
+                }
                 push_explain_row(
                     rows,
-                    depth,
+                    if merge_topn.is_some() { depth + 1 } else { depth },
                     true,
                     next_id,
                     CopRow {
@@ -6288,7 +6365,9 @@ fn emit_cop_children(
                         info: rowid_info,
                     },
                 );
-                if let Some(last) = rows.last_mut() {
+                if merge_topn.is_none()
+                    && let Some(last) = rows.last_mut()
+                {
                     last.id.push_str("(Probe)");
                 }
             }
@@ -8004,6 +8083,9 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                 bin.op,
                 Op::Plus | Op::Minus | Op::Mul | Op::Div | Op::IntDiv | Op::Mod
             );
+            if bin.op == Op::LogicOr {
+                return explain_or_chain(expr, table);
+            }
             format!(
                 "{op}({}, {})",
                 explain_binary_operand(&bin.left, table, arithmetic),
@@ -8021,7 +8103,18 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                 // TiDB prints the field type name plus the BINARY flag.
                 format!("{} BINARY", c.target.to_ascii_lowercase())
             };
-            format!("cast({}, {target})", explain_scalar_expr(&c.expr, table))
+            // A JSON document cast prints its string literal verbatim; TiDB does
+            // not escape the quotes inside `cast("["a", "b"]", json BINARY)`.
+            let inner = if upper.starts_with("JSON")
+                && let ExprNode::Value(ValueExpr {
+                    datum: Datum::Bytes(bytes),
+                }) = c.expr.as_ref()
+            {
+                format!("\"{}\"", String::from_utf8_lossy(bytes))
+            } else {
+                explain_scalar_expr(&c.expr, table)
+            };
+            format!("cast({inner}, {target})")
         }
         // Expression index key part (`tidb_shard(a) = 8`): TiDB prints the
         // scalar call with the same column spelling as its arguments. A string
@@ -8054,7 +8147,15 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                         };
                         match n {
                             Some(n) => format!("cast({n}, json BINARY)"),
-                            None => explain_scalar_expr(&f.args[0], table),
+                            None => match &v.datum {
+                                // A quoted string needle (`"2023-01-01" MEMBER OF`)
+                                // keeps its JSON cast in ExplainInfo.
+                                sealdb_types::Datum::Bytes(b) => format!(
+                                    "cast(\"{}\", json BINARY)",
+                                    String::from_utf8_lossy(b)
+                                ),
+                                _ => explain_scalar_expr(&f.args[0], table),
+                            },
                         }
                     }
                     other => explain_scalar_expr(other, table),
@@ -8063,6 +8164,60 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                     "json_memberof({left}, {})",
                     explain_scalar_expr(&f.args[1], table)
                 );
+            }
+            // TiDB coerces the JSON arguments of `JSON_CONTAINS` /
+            // `JSON_OVERLAPS` to `json`, so ExplainInfo shows the cast even
+            // when the logical expression kept the plain literal
+            // (`json_contains(j, cast("[4,5]", json BINARY))`).
+            if (name == "json_contains" || name == "json_overlaps") && f.args.len() >= 2 {
+                let render_json_arg = |arg: &ExprNode| -> String {
+                    match arg {
+                        ExprNode::Value(value)
+                            if matches!(
+                                value.datum,
+                                sealdb_types::Datum::Bytes(_) | sealdb_types::Datum::Time(_)
+                            ) =>
+                        {
+                            format!("cast({}, json BINARY)", explain_scalar_expr(arg, table))
+                        }
+                        ExprNode::Func(inner)
+                            if inner.name.eq_ignore_ascii_case("json_array") =>
+                        {
+                            let mut array = inner.clone();
+                            array.args = inner
+                                .args
+                                .iter()
+                                .map(|elem| match elem {
+                                    ExprNode::Value(value)
+                                        if matches!(
+                                            value.datum,
+                                            sealdb_types::Datum::Bytes(_)
+                                                | sealdb_types::Datum::Time(_)
+                                        ) =>
+                                    {
+                                        ExprNode::Cast(
+                                            sealdb_parser::ast::expressions::FuncCastExpr {
+                                                expr: Box::new(elem.clone()),
+                                                target: "json".to_string(),
+                                                json: false,
+                                            },
+                                        )
+                                    }
+                                    _ => elem.clone(),
+                                })
+                                .collect();
+                            explain_scalar_expr(&ExprNode::Func(array), table)
+                        }
+                        _ => explain_scalar_expr(arg, table),
+                    }
+                };
+                let args = f
+                    .args
+                    .iter()
+                    .map(render_json_arg)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return format!("{name}({args})");
             }
             let casts_to_string = matches!(name.as_str(), "md5" | "sha" | "sha1" | "sha2");
             let args = f
@@ -8118,11 +8273,16 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                 ),
                 other => explain_scalar_expr(other, table),
             };
-            format!(
+            let like = format!(
                 "like({}, {}, 92)",
                 explain_scalar_expr(&l.expr, table),
                 pattern
-            )
+            );
+            if l.not {
+                format!("not({like})")
+            } else {
+                like
+            }
         }
         ExprNode::IsNull(i) => {
             let inner = format!("isnull({})", explain_scalar_expr(&i.expr, table));
@@ -8289,6 +8449,39 @@ pub(crate) fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::Ex
 /// Operand of a rendered binary expression. TiDB spells out the implicit
 /// `cast(col, double BINARY)` that numeric arithmetic applies to an `ENUM` /
 /// `SET` column (`plus(cast(t.a, double BINARY), cast(t.b, double BINARY))`).
+/// TiDB rebuilds a flattened DNF chain as a balanced binary tree (split at
+/// `len / 2`), so `a or b or c or d` prints as `or(or(a, b), or(c, d))` and
+/// `a or b or c` as `or(a, or(b, c))`. Rendering the parser's left-deep tree
+/// would differ from the upstream EXPLAIN text.
+fn explain_or_chain(expr: &sealdb_parser::ast::ExprNode, table: &str) -> String {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    fn collect<'a>(expr: &'a ExprNode, out: &mut Vec<&'a ExprNode>) {
+        if let ExprNode::Binary(bin) = expr
+            && bin.op == Op::LogicOr
+        {
+            collect(&bin.left, out);
+            collect(&bin.right, out);
+            return;
+        }
+        out.push(expr);
+    }
+    fn render(items: &[&ExprNode], table: &str) -> String {
+        if items.len() == 1 {
+            return explain_scalar_expr(items[0], table);
+        }
+        let mid = items.len() / 2;
+        format!(
+            "or({}, {})",
+            render(&items[..mid], table),
+            render(&items[mid..], table)
+        )
+    }
+    let mut leaves = Vec::new();
+    collect(expr, &mut leaves);
+    render(&leaves, table)
+}
+
 fn explain_binary_operand(
     expr: &sealdb_parser::ast::ExprNode,
     table: &str,
@@ -9505,7 +9698,28 @@ fn conjunct_selectivity(expr: &sealdb_parser::ast::ExprNode) -> Option<f64> {
         && func.name.eq_ignore_ascii_case("json_memberof")
     {
         // TiDB sizes `1 MEMBER OF (…)` over an unanalyzed table at 10 rows.
+        // A non-numeric string needle cannot match an int MVIndex part, so it
+        // keeps the `selectionFactor` (`"2023-01-01" MEMBER OF` → 8000).
+        // The needle may already be a `cast(…, json BINARY)` node.
+        let mut needle = func.args.first();
+        while let Some(ExprNode::Cast(cast)) = needle {
+            needle = Some(&cast.expr);
+        }
+        if let Some(ExprNode::Value(value)) = needle
+            && let sealdb_types::Datum::Bytes(bytes) = &value.datum
+            && String::from_utf8_lossy(bytes).parse::<i64>().is_err()
+        {
+            return Some(0.8);
+        }
         return Some(0.001);
+    }
+    if let ExprNode::Func(func) = expr
+        && func.name.eq_ignore_ascii_case("json_contains")
+    {
+        // TiDB models a bare `JSON_CONTAINS(json_col, …)` probe filter from the
+        // JSON element estimate (`1e-6`), which is what keeps an MVIndex
+        // `json_contains` union at `0.02` rows.
+        return Some(1e-6);
     }
     if let ExprNode::Func(func) = expr
         && func.name.eq_ignore_ascii_case("ifnull")
@@ -9561,6 +9775,20 @@ fn expr_has_cast_operand(expr: &sealdb_parser::ast::ExprNode) -> bool {
     }
 }
 
+/// A comparison whose column operand is wrapped in a cast
+/// (`eq(cast(t.id, double BINARY), 0)`) cannot build a range on the column, so
+/// TiDB's DNF merge checker leaves every such item on its own.
+fn cast_wraps_column(expr: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    match expr {
+        ExprNode::Cast(cast) => {
+            !cast.expr.referenced_columns().is_empty() || cast_wraps_column(&cast.expr)
+        }
+        ExprNode::Binary(bin) => cast_wraps_column(&bin.left) || cast_wraps_column(&bin.right),
+        _ => false,
+    }
+}
+
 /// Selection selectivity: `AND` multiplies, `OR`/DNF uses `1 - Π(1 - s)`.
 /// `None` when a conjunct has no TiDB pseudo factor, so callers keep their
 /// existing estimates.
@@ -9573,10 +9801,40 @@ pub(crate) fn filter_selectivity(filter: &sealdb_parser::ast::ExprNode) -> Optio
     }
     let arms = filter.split_dnf();
     if arms.len() > 1 {
-        let mut product = 1.0;
+        // TiDB `MergeDNFItems4Col`: every range-buildable item on a single
+        // column merges into one stats node, whose selectivity is the *sum* of
+        // the item selectivities (duplicates fold). Items spanning several
+        // columns (or not range-buildable, e.g. JSON predicates) stay on their
+        // own. The nodes then combine under independence.
+        let mut groups: Vec<(String, f64, Vec<String>)> = Vec::new();
         for arm in &arms {
-            let sel = conjunct_list_selectivity(&arm.split_cnf())?;
-            product *= 1.0 - sel;
+            let conjuncts = arm.split_cnf();
+            let sel = conjunct_list_selectivity(&conjuncts)?;
+            let cols = arm.referenced_columns();
+            let mergeable = conjuncts.len() == 1
+                && cols.len() == 1
+                && !expr_has_cast_operand(&conjuncts[0])
+                && !cast_wraps_column(&conjuncts[0])
+                && sealdb_statistics::pseudo::conjunct_bound_sets(&conjuncts[0]).is_some();
+            let group_key = if mergeable {
+                format!("col:{}", cols[0].1.to_ascii_lowercase())
+            } else {
+                format!("expr:{}", arm.restore_string())
+            };
+            let item_key = arm.restore_string();
+            match groups.iter_mut().find(|(group, _, _)| *group == group_key) {
+                Some((_, sum, seen)) => {
+                    if !seen.contains(&item_key) {
+                        *sum += sel;
+                        seen.push(item_key);
+                    }
+                }
+                None => groups.push((group_key, sel, vec![item_key])),
+            }
+        }
+        let mut product = 1.0;
+        for (_, sel, _) in groups {
+            product *= 1.0 - sel.min(1.0);
         }
         return Some(1.0 - product);
     }

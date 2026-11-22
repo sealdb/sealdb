@@ -97,6 +97,10 @@ pub struct IndexMergePath {
     /// Limit embedded into the arm (`Limit(Build)` over the scan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<(u64, u64)>,
+    /// Arm whose index order does not satisfy the query ORDER BY: TiDB keeps a
+    /// cop `TopN(Build)` over the scan instead of a `Limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topn: Option<(u64, u64)>,
     /// A GLOBAL index arm under `FROM PARTITION (pN)` cannot tell the row's
     /// partition from the index key, so TiDB filters the arm with
     /// `_tidb_tid IN (…)`: the EXPLAIN `Selection(Build)` info text.
@@ -110,6 +114,11 @@ pub struct IndexMergePath {
     /// KV seek bounds; `range` carries the EXPLAIN text / cardinality.
     #[serde(skip)]
     pub ranges: Vec<IndexBounds>,
+    /// Exact seek key of the arm when the KV bounds cannot be expressed as one
+    /// datum per range (a multi-valued element inside a composite index key:
+    /// `[c = 1, element = 4, b = "x"]`). `None` falls back to `ranges`.
+    #[serde(skip)]
+    pub seek: Option<Vec<sealdb_types::Datum>>,
 }
 
 #[derive(Clone, Debug, Serialize)]

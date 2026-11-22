@@ -95,6 +95,12 @@ pub struct Domain {
     resource_control: AtomicBool,
     /// `tidb_analyze_skip_column_types`: column type names ANALYZE ignores.
     analyze_skip_column_types: Mutex<Vec<String>>,
+    /// `tidb_analyze_version` (session-scoped in TiDB; the executor sees only
+    /// the domain, so the last assignment is kept here).
+    analyze_version: AtomicU64,
+    /// Statistics version stored with each table's last full ANALYZE, keyed by
+    /// `schema.table` (TiDB keeps it in `mysql.stats_meta.version`).
+    analyze_stats_versions: Mutex<HashMap<String, i32>>,
     /// `mysql.opt_rule_blacklist` / `mysql.expr_pushdown_blacklist` snapshot.
     /// `None` until the first load (lazy) or `ADMIN RELOAD`.
     planner_blacklist: Mutex<Option<sealdb_planner::PlannerBlacklist>>,
@@ -234,6 +240,8 @@ impl Domain {
             resource_groups: Mutex::new(HashMap::new()),
             resource_control: AtomicBool::new(true),
             analyze_skip_column_types: Mutex::new(Vec::new()),
+            analyze_version: AtomicU64::new(2),
+            analyze_stats_versions: Mutex::new(HashMap::new()),
             planner_blacklist: Mutex::new(None),
         })
     }
@@ -727,6 +735,34 @@ impl Domain {
             .lock()
             .expect("analyze skip column types lock")
             .clone()
+    }
+
+    /// Session `tidb_analyze_version` (1 or 2) seen by the analyzer.
+    pub fn analyze_version(&self) -> i32 {
+        self.analyze_version.load(Ordering::SeqCst) as i32
+    }
+
+    pub fn set_analyze_version(&self, version: i32) {
+        self.analyze_version.store(version as u64, Ordering::SeqCst);
+    }
+
+    /// Statistics version stored with a table's statistics (`mysql.stats_meta`
+    /// `version`), `None` before the first ANALYZE.
+    pub fn table_analyze_version(&self, schema: &str, table: &str) -> Option<i32> {
+        let key = format!("{}.{}", schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+        self.analyze_stats_versions
+            .lock()
+            .expect("analyze stats versions lock")
+            .get(&key)
+            .copied()
+    }
+
+    pub fn set_table_analyze_version(&self, schema: &str, table: &str, version: i32) {
+        let key = format!("{}.{}", schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+        self.analyze_stats_versions
+            .lock()
+            .expect("analyze stats versions lock")
+            .insert(key, version);
     }
 
     /// Cached `mysql.opt_rule_blacklist` / `mysql.expr_pushdown_blacklist`

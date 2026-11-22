@@ -104,6 +104,70 @@ impl AnalyzeExec {
         } else {
             total_count
         };
+        // TiDB `ANALYZE` statistics version: an index-only analyze cannot
+        // migrate a table whose stored version differs from the session's, so
+        // it warns and keeps the existing version (only a full analyze can
+        // switch it).
+        let session_version = self.domain.analyze_version();
+        let stored_version = self.domain.table_analyze_version(&schema, &name);
+        let incompatible = !indexes.is_empty()
+            && stored_version.is_some_and(|version| version != session_version);
+        let effective_version = if incompatible {
+            stored_version.unwrap_or(session_version)
+        } else {
+            session_version
+        };
+        // TiDB's sampling pushdown appends the adjusted sample rate as a Note
+        // for whole-table tasks; a partition-scoped analyze task is built
+        // without `V2Options`, so it stays silent.
+        if effective_version == 2 && partitions.is_empty() {
+            // An empty table takes the "assume empty" reason for an index-only
+            // analyze; a table that was never analyzed still reads the pseudo
+            // row count (10000) and reports the plain ratio.
+            let reason = if count == 0 && !indexes.is_empty() {
+                "TiDB assumes that the table is empty, use sample-rate=1".to_string()
+            } else if count == 0 {
+                "use min(1, 110000/10000) as the sample-rate=1".to_string()
+            } else {
+                let sample = (110_000.0 / count as f64).min(1.0);
+                format!("use min(1, 110000/{count}) as the sample-rate={sample:.0}")
+            };
+            sealdb_expression::note_message(
+                1105,
+                format!(
+                    "Analyze use auto adjusted sample rate 1.000000 for table {schema}.{name}, reason to use this rate is \"{reason}\""
+                ),
+            );
+        }
+        if incompatible {
+            sealdb_expression::note_warning(
+                1105,
+                "The analyze version from the session is not compatible with the existing statistics of the table. Use the existing version instead",
+            );
+        }
+        if effective_version == 2 && !indexes.is_empty() {
+            sealdb_expression::note_warning(
+                1105,
+                "The version 2 would collect all statistics not only the selected indexes",
+            );
+        }
+        if effective_version == 1 {
+            for index in &info.indices {
+                if is_multi_valued_index(&info, index) {
+                    sealdb_expression::note_warning(
+                        1105,
+                        format!(
+                            "analyzing multi-valued indexes is not supported, skip {}",
+                            index.name.o()
+                        ),
+                    );
+                }
+            }
+            sealdb_expression::note_warning(
+                1681,
+                "ANALYZE with tidb_analyze_version=1 is deprecated and will be removed in a future release.",
+            );
+        }
         let index_cols = resolve_index_columns(&info, indexes)?;
         let skip_types = self.domain.analyze_skip_column_types();
         let analyzed_columns = collect_column_stats(
@@ -116,7 +180,13 @@ impl AnalyzeExec {
             topn_size,
         );
         let columns = analyzed_columns.clone();
-        let index_stats = collect_index_stats(&info, &rows, buckets, topn_size);
+        let index_stats = collect_index_stats(
+            &info,
+            &rows,
+            buckets,
+            topn_size,
+            effective_version == 1,
+        );
         // TiDB keeps a row count per physical table id in `mysql.stats_meta`; a
         // partition's `DATA_LENGTH` reads its own count, not the table total.
         let part_counts: Vec<(i64, u64)> = if info.partition.is_some() {
@@ -194,13 +264,13 @@ impl AnalyzeExec {
         };
         self.domain.stats().update(&schema, &name, stats);
         self.domain.persist_stats()?;
-        // Statistics version 2 collects every column regardless of the
-        // `INDEX` list, so a partition+index analyze reports it.
-        if !partitions.is_empty() && !indexes.is_empty() {
-            sealdb_expression::note_warning(
-                1105,
-                "The version 2 would collect all statistics not only the selected indexes",
-            );
+        match stored_version {
+            // A full ANALYZE can migrate a table to version 2; an existing
+            // version-2 table is never downgraded by a deprecated version-1 run.
+            Some(2) => {}
+            _ => self
+                .domain
+                .set_table_analyze_version(&schema, &name, effective_version),
         }
         let job_info = analyze_job_info(&info, &analyzed_columns, buckets, topn_size);
         let partition_name = match partitions {
@@ -323,12 +393,18 @@ fn collect_index_stats(
     rows: &[crate::table_reader::ScannedRow],
     buckets: Option<u64>,
     topn_size: Option<u64>,
+    skip_multi_valued: bool,
 ) -> Vec<(String, IndexStats)> {
     let max_buckets = buckets
         .map(|n| n as usize)
         .unwrap_or(Table::DEFAULT_HIST_BUCKETS);
     let mut out = Vec::new();
     for index in &info.indices {
+        // Statistics version 1 cannot analyze multi-valued indexes; TiDB skips
+        // them with a warning (the caller emits it).
+        if skip_multi_valued && is_multi_valued_index(info, index) {
+            continue;
+        }
         // A plain index is estimated from its key column's statistics; only an
         // expression key part (a hidden generated column) needs a histogram of
         // its own, which TiDB keeps as the index's encoded-key statistics.
@@ -416,8 +492,22 @@ fn collect_index_stats(
     out
 }
 
-fn resolve_index_columns(info: &TableInfo, indexes: &[String]) -> Result<Option<HashSet<String>>> {
-    if indexes.is_empty() {
+/// A multi-valued index keys on `CAST(<json> AS <type> ARRAY)`. TiDB models a
+/// row as one entry per array element, so only IndexMerge can read it.
+pub fn is_multi_valued_index(info: &TableInfo, index: &sealdb_meta::IndexInfo) -> bool {
+    index.columns.iter().any(|part| {
+        info.columns
+            .iter()
+            .find(|col| col.hidden && col.name.o().eq_ignore_ascii_case(part.name.o()))
+            .and_then(|col| col.generated_expr.as_deref())
+            .is_some_and(|text| {
+                let lower = text.trim().to_ascii_lowercase();
+                lower.contains("cast(") && lower.ends_with("array)")
+            })
+    })
+}
+
+fn resolve_index_columns(info: &TableInfo, indexes: &[String]) -> Result<Option<HashSet<String>>> {    if indexes.is_empty() {
         return Ok(None);
     }
     let mut cols = HashSet::new();

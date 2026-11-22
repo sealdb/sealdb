@@ -5367,7 +5367,8 @@ fn rewrite_member_of(sql: &str) -> String {
                             // fall through to non-rewrite.
                             String::new()
                         } else {
-                            // Find start of left primary: number, ident, or `)`.
+                            // Find start of left primary: number, ident, quoted
+                            // literal, or `)`.
                             let b = trimmed.as_bytes();
                             let mut s = b.len();
                             if s > 0 && b[s - 1] == b')' {
@@ -5385,6 +5386,27 @@ fn rewrite_member_of(sql: &str) -> String {
                                         }
                                         _ => {}
                                     }
+                                }
+                                trimmed[s..].to_string()
+                            } else if s > 0 && matches!(b[s - 1], b'\'' | b'"' | b'`') {
+                                // Quoted literal / identifier: walk back to its
+                                // opening quote, honouring backslash escapes.
+                                let quote = b[s - 1];
+                                s -= 1;
+                                while s > 0 {
+                                    if b[s - 1] == quote {
+                                        let mut escapes = 0;
+                                        let mut k = s - 1;
+                                        while k > 0 && b[k - 1] == b'\\' {
+                                            escapes += 1;
+                                            k -= 1;
+                                        }
+                                        if escapes % 2 == 0 {
+                                            s -= 1;
+                                            break;
+                                        }
+                                    }
+                                    s -= 1;
                                 }
                                 trimmed[s..].to_string()
                             } else {
