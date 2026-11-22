@@ -14,11 +14,11 @@
   "counts": {
     "total": 254,
     "by_status": {
+      "green": 127,
+      "pending": 109,
+      "in_progress": 8,
       "deferred": 2,
-      "green": 125,
-      "in_progress": 10,
-      "local": 8,
-      "pending": 109
+      "local": 8
     },
     "by_wave": {
       "D": 2,
@@ -1182,7 +1182,7 @@
     {
       "name": "explain_indexmerge_stats",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain_indexmerge_stats.test",
       "result": "r/explain_indexmerge_stats.result",
       "has_result": true,

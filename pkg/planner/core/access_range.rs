@@ -120,6 +120,57 @@ pub fn coerce_key_datum(
     coerce_bound(&part.field_type, Some((datum.clone(), true))).map(|(value, _)| value)
 }
 
+/// `utf8mb4_0900_ai_ci` index keys are stored as the collation sort key, and
+/// `ranger` builds the seek bounds on those keys, so EXPLAIN prints the encoded
+/// weights (`range:["\x1c@\x1c>…"]`) rather than the literal string.
+///
+/// Only the `range:…` text is encoded: the plan's `ranges`/`seek` bounds keep
+/// the literal datum the executor compares against the stored key.
+fn explain_key_ranges_text(
+    info: &TableInfo,
+    index: &IndexInfo,
+    ranges: &[pseudo::KeyRange],
+) -> String {
+    let parts = index_key_parts(info, index);
+    let encode = |pos: usize, datum: &Datum| -> Option<Datum> {
+        let part = parts.as_ref()?.get(pos)?;
+        if !part
+            .field_type
+            .collate
+            .eq_ignore_ascii_case("utf8mb4_0900_ai_ci")
+        {
+            return None;
+        }
+        let Datum::Bytes(bytes) = datum else {
+            return None;
+        };
+        let text = std::str::from_utf8(bytes).ok()?;
+        let key = sealdb_parser::charset::collate_0900::sort_key_0900_ai_ci(text)?;
+        Some(Datum::Bytes(key))
+    };
+    let display = |bound: &[(Datum, bool)]| -> Vec<(Datum, bool)> {
+        bound
+            .iter()
+            .enumerate()
+            .map(|(pos, (datum, inclusive))| {
+                (
+                    encode(pos, datum).unwrap_or_else(|| datum.clone()),
+                    *inclusive,
+                )
+            })
+            .collect()
+    };
+    let encoded: Vec<pseudo::KeyRange> = ranges
+        .iter()
+        .map(|range| pseudo::KeyRange {
+            low: display(&range.low),
+            high: display(&range.high),
+            ..range.clone()
+        })
+        .collect();
+    pseudo::key_ranges_text(&encoded)
+}
+
 /// Composite seek ranges of `index` decided by `conjuncts` alone (no
 /// statistics), or `None` when no range can be built.
 pub struct KeyRangeAccess {
@@ -518,7 +569,7 @@ pub fn index_access_range(
     };
     Some(IndexAccessRange {
         range: IndexScanRange {
-            text: pseudo::key_ranges_text(&key_ranges),
+            text: explain_key_ranges_text(info, index, &key_ranges),
             rows,
             filter_rows,
             pseudo: pseudo_scan,

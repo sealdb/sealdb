@@ -1,6 +1,6 @@
 # 整体进展报告（Status Report）
 
-> 生成时间：2026-11-22 15:30 (+08:00)
+> 生成时间：2026-11-22 21:20 (+08:00)
 > 事实来源：`project/regression/manifest.json`（suite 状态）、`project/parity/status.json`（包级对齐）、`git log`
 > 规范：[testing.md](./testing.md) · [parity-discipline.md](./parity-discipline.md) · [progress.md](./progress.md)
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **126 个** 登记为 `green`（R1 4 / R2 16 / R3 31 / R5 4 / R6 19 / R7 52）。本轮新增 `ddl/db_partition` 转绿：LIST/LIST COLUMNS 字面量与日期归一、RANGE COLUMNS 尾列类型强制、1526/1654 错误码分流、RANGE REORGANIZE PARTITION 行迁移与 `_tidb_rowid` 冲突重分配，以及 PREPARE 中 `\n` 转义与 INTERVAL RANGE 语句。R1 已收口，R2 完成 16/22，R3 完成 31/48，R7 完成 52/110；架构侧仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **127 个** 登记为 `green`（R1 4 / R2 16 / R3 32 / R5 4 / R6 19 / R7 52）。本轮新增 `explain_indexmerge_stats` 转绿：`utf8mb4_0900_ai_ci` 索引键的 UCA 排序键（ranger 区间按权重字节渲染）、IndexMerge 下 cop `TopN` 只在索引键覆盖排序列时下沉到臂、否则落在 merge 的 probe 侧，以及 merge 估算归零时根 `TopN` 保留 limit 上界。此前一轮新增 `ddl/db_partition`：LIST/LIST COLUMNS 字面量与日期归一、RANGE COLUMNS 尾列类型强制、1526/1654 错误码分流、RANGE REORGANIZE PARTITION 行迁移与 `_tidb_rowid` 冲突重分配，以及 PREPARE 中 `\n` 转义与 INTERVAL RANGE 语句。R1 已收口，R2 完成 16/22，R3 完成 32/48，R7 完成 52/110；架构侧仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -22,8 +22,8 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **126 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 126 | 49.6% |
-| `in_progress` | 9 | 3.5% |
+| `green` | 127 | 50.0% |
+| `in_progress` | 8 | 3.1% |
 | `pending` | 109 | 42.9% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
@@ -36,7 +36,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **126 个** �
 |---|---:|---:|---:|---|
 | R1（select / show / types） | 4 | 0 | 0 | **已收口** |
 | R2（join / subquery / agg / window / cte） | 16 | 5 | 1 | 主波完成 ~73% |
-| R3（point_get / index / partition / explain*） | 31 | 4 | 13 | 当前主攻波 |
+| R3（point_get / index / partition / explain*） | 32 | 3 | 13 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 4 | 0 | 8 | `session/txn` / `db_integration` / `session/variable` 已绿 |
 | R6 | 19 | 0 | 16 | DDL / infoschema 起步 |
@@ -46,13 +46,13 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **126 个** �
 
 ---
 
-## 3. 已绿 suite 清单（126）
+## 3. 已绿 suite 清单（127）
 
 | Wave | Suite |
 |---|---|
 | R1 | `select`, `show`, `types/const`, `types/time` |
 | R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_push_down`, `topn_pushdown`, `window_function` |
-| R3 | `access_path_selection`, `clustered_index`, `ddl/db_partition`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/explain`, `executor/explainfor`, `executor/index_lookup_pushdown_partition`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy`, `explain_easy_stats`, `explain_foreign_key`, `explain_generate_column_substitute`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `expression/explain`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `globalindex/point_get`, `partition`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
+| R3 | `access_path_selection`, `clustered_index`, `ddl/db_partition`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/explain`, `executor/explainfor`, `executor/index_lookup_pushdown_partition`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy`, `explain_easy_stats`, `explain_foreign_key`, `explain_generate_column_substitute`, `explain_indexmerge_stats`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `expression/explain`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `globalindex/point_get`, `partition`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
 | R5 | `session/txn`, `session/variable`, `db_integration`, `session/bootstrap_upgrade` |
 | R6 | `ddl/affinity`, `ddl/attributes_sql`, `ddl/column`, `ddl/column_change`, `ddl/column_modify`, `ddl/column_type_change`, `ddl/db_cache`, `ddl/db_change`, `ddl/db_foreign_key`, `ddl/db_rename`, `ddl/ddl_error`, `ddl/fail_db`, `ddl/index_modify`, `ddl/resource_group`, `ddl/table_modify`, `infoschema/cluster_tables`, `infoschema/v2`, `statistics/integration`, `statistics/lock_table_stats` |
 | R7 | `black_list`, `bindinfo/bind`, `bindinfo/session_handle`, `bindinfo/temptable`, `executor/adapter`, `executor/charset`, `executor/ddl`, `executor/distsql`, `executor/executor_txn`, `executor/index_advise`, `executor/index_lookup_join`, `executor/index_lookup_merge_join`, `executor/index_lookup_pushdown`, `executor/stale_txn`, `expression/enum_set`, `expression/format`, `expression/time`, `expression/vitess_hash`, `globalindex/expression_index`, `globalindex/information_schema`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `planner/core/casetest/index/partialindex`, `planner/core/memtable_predicate_extractor`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `sessiontxn/externals`, `table/cache`, `table/tables`, `table/temptable`, `util/admin`, `sessionctx/setvar`, `planner/core/indexjoin`, `planner/core/indexmerge_intersection`, `executor/compact_table`, `expression/constant_fold`, `executor/kv`, `planner/core/rule_result_reorder`, `table/index`, `executor/rowid`, `executor/analyze`, `executor/delete`, `executor/update`, `executor/insert`, `expression/cast`, `expression/noop_functions`, `planner/core/casetest/expression_rewriter`, `expression/misc` |
@@ -82,8 +82,12 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **126 个** �
 → PASS: memory=1
 ./tests/integrationtest/run-tests.sh -s tikv -k -t expression/explain
 → PASS: tikv=1
+./tests/integrationtest/run-tests.sh -s memory -t explain_indexmerge_stats
+→ PASS: memory=1
 ./tests/integrationtest/run-tests.sh -s memory
-→ PASS: memory=133 skipped=121（125 green + 8 local）
+→ PASS: memory=135 skipped=119（127 green + 8 local）
+./tests/integrationtest/run-tests.sh -s tikv -k
+→ PASS: tikv=133 skipped=121
 ```
 
 TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此前全量 TiKV gate 反复卡死的根因是本地 store 长期复用后膨胀到 **51 GB**（tombstone / 失效 region，日志持续 `skip invalid split key`）。处理方式：`project/scripts/run_local_pd_tikv.sh stop` + `rm -rf /tmp/sealdb-pd-tikv` 后重启全新单节点集群。实测每轮全量 gate 约增 20 GB store，因此全量 TiKV gate 前统一从空 store 起，并先用 `du -sh /tmp/sealdb-pd-tikv` 确认。
@@ -262,7 +266,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 ## 6. R2 剩余与 R3 队列
 
 - **R2 在研（5）**：`cte`, `explain_cte`, `planner/core/join_reorder2`, `planner/core/join_reorder_through_projection`, `planner/core/casetest/rule/rule_derive_topn_from_window`
-- **R3 在研（4）**：`explain_complex`, `explain_complex_stats`, `explain_indexmerge_stats`, `index_merge`
+- **R3 在研（3）**：`explain_complex`, `explain_complex_stats`, `index_merge`
 
 策略：优先吃「同一根因能一次带绿多套」的项——EXPLAIN 节点编号/树形、IndexJoin hint、Point_Get/IndexMerge 统计形状。
 
@@ -272,7 +276,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 |---|---|---|
 | `index_merge` | `c3 IN (SELECT …)` 留在 `Apply`、`use_index_merge` 未生效（`globalindex/mem_index_merge*` 已先行转绿：GLOBAL 索引 `_tidb_tid` 投影、保序 union 的 LIMIT 下沉、交叉臂 residual Selection） | 去关联成 semi/anti（含 marker 列）+ IndexMerge 提示 |
 | `executor/explain` | 视图 `EXPLAIN` 权限（1345/1142）、`explain analyze` 运行时统计、`statements_summary` | 视图权限位 + 运行时统计 + infoschema 表（**已转绿**） |
-| `explain_complex*` / `explain_indexmerge_stats` | 统计形状 + IndexMerge + 去关联的组合 | 同上 |
+| `explain_complex*` | 统计形状 + IndexMerge + 去关联的组合 | 同上 |
 | `cte` / `explain_cte` | `cte` 仅余 1 段（sub case-3）：共享非递归物化 CTE 上的 EXISTS 未转 `Apply` 半连接、缺 Non-Recursive CTE producer；`explain_cte` 同族 + 列号基数 | 物化非递归 CTE 的消费/生产渲染 |
 | `join_reorder2` / `join_reorder_through_projection` | MergeJoin 选择与 `Column#N` 编号 | cost 驱动 join 顺序 |
 
@@ -305,7 +309,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 ## 9. 下一步（有序队列）
 
 1. `index_merge`：IN 子查询去关联成 semi/anti + `use_index_merge` 提示（`globalindex/mem_index_merge*` 已转绿，IndexMerge 侧骨架可直接复用）。
-2. `explain_indexmerge_stats`：统计驱动的交叉臂选择与 sel 估算。
+2. `indexmerge_path` / `range_scan_for_like`：把 `utf8mb4_0900_ai_ci` 权重表补齐到非 ASCII 脚本（平假名/谚文），复用本轮落地的 `charset::collate_0900`。
 3. 回到 R2 剩余 `cte` / `explain_cte` / `join_reorder*`。
 4. 按波次推进 R4–R7；TiFlash/MPP 维持 deferred。
 
@@ -392,7 +396,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 23 | `explain_easy_stats` | green | 100% | ✓ | ✓ |
 | 24 | `explain_foreign_key` | green | 100% | ✓ | ✓ |
 | 25 | `explain_generate_column_substitute` | green | 100% | ✓ | ✓ |
-| 26 | `explain_indexmerge_stats` | in_progress | 96%（首差 196/203） | ✓ | — |
+| 26 | `explain_indexmerge_stats` | green | 100% | ✓ | ✓ |
 | 27 | `explain_join_stats` | green | 100% | ✓ | ✓ |
 | 28 | `explain_shard_index` | green | 100% | ✓ | ✓ |
 | 29 | `explain_stats` | green | 100% | ✓ | ✓ |

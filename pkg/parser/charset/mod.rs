@@ -1,6 +1,7 @@
 //! Session charset / collation names used by SET NAMES.
 //! Completeness wave: GBK / latin1 encode-decode MVB + collation dispatch.
 
+pub mod collate_0900;
 pub mod encoding_gbk;
 pub mod encoding_latin1;
 

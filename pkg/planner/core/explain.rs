@@ -6288,29 +6288,66 @@ fn emit_cop_children(
             } else {
                 "keep order:false".to_string()
             };
+            // The root TopN re-merges the unordered arms, so TiDB pushes a cop
+            // `TopN(Probe)` between the merge and the row-ID scan (or above its
+            // residual `Selection`).
+            let merge_topn = topn_parent.filter(|_| !paths.iter().all(|path| path.keep_order));
+            let probe_topn_info = merge_topn.map(|(by_info, offset, count)| {
+                let base = by_info.to_string();
+                let by = if *order_desc {
+                    format!("{base}:desc")
+                } else {
+                    base
+                };
+                // The probe-side TopN re-reads the merge's pre-offset window, so
+                // it always starts at 0 with `offset + count`.
+                let probe_count = offset + count;
+                (format!("{by}, offset:0, count:{probe_count}"), probe_count)
+            });
             if let Some(selection) = probe_selection {
+                let selection_est = root_est.as_ref().copied().unwrap_or(*probe_est);
+                if let Some((info, probe_count)) = &probe_topn_info {
+                    push_explain_row(
+                        rows,
+                        depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "TopN",
+                            est: selection_est.min(*probe_count as f64),
+                            task,
+                            access: String::new(),
+                            info: info.clone(),
+                        },
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Probe)");
+                    }
+                }
                 // The probe Selection is the merge root's last child; the
                 // TableRowIDScan it filters hangs below it, so it must not keep
                 // a sibling continuation bar.
                 push_explain_row(
                     rows,
-                    depth,
+                    if probe_topn_info.is_some() { depth + 1 } else { depth },
                     true,
                     next_id,
                     CopRow {
                         name: "Selection",
-                        est: root_est.as_ref().copied().unwrap_or(*probe_est),
+                        est: selection_est,
                         task,
                         access: String::new(),
                         info: explain_pushed_filter(table, selection),
                     },
                 );
-                if let Some(last) = rows.last_mut() {
+                if let Some(last) = rows.last_mut()
+                    && probe_topn_info.is_none()
+                {
                     last.id.push_str("(Probe)");
                 }
                 push_explain_row(
                     rows,
-                    depth + 1,
+                    if probe_topn_info.is_some() { depth + 2 } else { depth + 1 },
                     true,
                     next_id,
                     CopRow {
@@ -6322,19 +6359,7 @@ fn emit_cop_children(
                     },
                 );
             } else {
-                // The root TopN re-merges the unordered arms, so TiDB pushes a
-                // cop `TopN(Probe)` between the merge and the row-ID scan.
-                let merge_topn = topn_parent.filter(|_| !paths.iter().all(|path| path.keep_order));
-                if let Some((by_info, offset, count)) = merge_topn {
-                    let base = by_info.to_string();
-                    let by = if *order_desc {
-                        format!("{base}:desc")
-                    } else {
-                        base
-                    };
-                    // The probe-side TopN re-reads the merge's pre-offset
-                    // window, so it always starts at 0 with `offset + count`.
-                    let probe_count = offset + count;
+                if let Some((info, probe_count)) = &probe_topn_info {
                     push_explain_row(
                         rows,
                         depth,
@@ -6342,10 +6367,10 @@ fn emit_cop_children(
                         next_id,
                         CopRow {
                             name: "TopN",
-                            est: probe_count as f64,
+                            est: probe_est.min(*probe_count as f64),
                             task,
                             access: String::new(),
-                            info: format!("{by}, offset:0, count:{probe_count}"),
+                            info: info.clone(),
                         },
                     );
                     if let Some(last) = rows.last_mut() {
@@ -6354,7 +6379,7 @@ fn emit_cop_children(
                 }
                 push_explain_row(
                     rows,
-                    if merge_topn.is_some() { depth + 1 } else { depth },
+                    if probe_topn_info.is_some() { depth + 1 } else { depth },
                     true,
                     next_id,
                     CopRow {
@@ -6365,7 +6390,7 @@ fn emit_cop_children(
                         info: rowid_info,
                     },
                 );
-                if merge_topn.is_none()
+                if probe_topn_info.is_none()
                     && let Some(last) = rows.last_mut()
                 {
                     last.id.push_str("(Probe)");
@@ -10409,6 +10434,10 @@ fn est_rows_inner(plan: &PhysicalPlan) -> f64 {
                 selection_info: Some(sel),
                 ..
             } if topn_build_marker(sel).is_some() => est_rows(child),
+            // An `IndexMerge` whose estimate rounds to `0.00` has no usable
+            // cardinality (TiDB's reader prints `0.00` too), so the root `TopN`
+            // above it keeps the limit bound the logical plan carried.
+            PhysicalPlan::IndexMerge { .. } if est_rows(child) < 0.005 => *count as f64,
             _ => est_rows(child).min(*count as f64),
         },
         // Planner-computed join cardinality from the key NDVs.

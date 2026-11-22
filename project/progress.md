@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-22（green 125 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-22（green 127 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -4872,3 +4872,31 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     `PASS: memory=134 tikv=132 skipped=122`。
 - **下一步**:
   - 下一 R3 pending：`partition_pruner` / `physical_plan` 等。
+
+### 2026-11-22 — `explain_indexmerge_stats` 转绿（green 127）
+
+- **Phase**: R3 IndexMerge 统计形状 + 新排序规则键
+- **根因**（三处，最后一处是 `ORDER BY … LIMIT 1` 段）:
+  1. `utf8mb4_0900_ai_ci` 列的索引键在 TiDB 里是 UCA 排序键，`ranger`
+     用权重字节建区间，EXPLAIN 的 `range:` 也应当是权重字节；SealDB 直接
+     打印字面量。
+  2. `ORDER BY id LIMIT 1` 下 cop `TopN` 只应下沉到「索引键覆盖排序列」的臂；
+     否则 TiDB 把 `TopN(Probe)` 放在 merge 的 probe 侧（residual Selection 之上）。
+  3. merge 估算舍入为 `0.00` 时，根 `TopN` 保留 limit 上界（`1.00`），而不是
+     跟着归零。
+- **完成**:
+  - 新增 `charset::collate_0900`：DUCET 9.0.0 ASCII 主权重表 + CJK 隐式权重，
+    `sort_key_0900_ai_ci()` 生成 NO PAD 排序键（含单测）。
+  - `access_range::explain_key_ranges_text`：仅对 `utf8mb4_0900_ai_ci` 键部分
+    把展示用区间改成排序键字节，`ranges`/`seek` 仍保留字面量（执行路径不变）。
+  - IndexMerge 臂的 `TopN` 下沉增加「索引键含排序列」条件；probe 侧
+    `TopN(Probe)` 同时覆盖带 residual `Selection` 的形态（且该 Selection 不再带
+    `(Probe)` 后缀）。
+  - 根 `TopN` 在 `IndexMerge` 估算 <0.005 时取 `count`。
+- **验证**:
+  - `… -t explain_indexmerge_stats` memory → PASS；manifest → green（127）。
+  - 全量 memory → `PASS: memory=135 skipped=119`（127 green + 8 local）。
+  - 全量 TiKV → `PASS: memory=0 tikv=133 skipped=121`（无回归）。
+- **下一步**:
+  - `planner/core/indexmerge_path` / `range_scan_for_like`：把 0900 权重表
+    扩到非 ASCII 脚本（平假名/谚文），其余差异仍是间隔列排序与 planID。

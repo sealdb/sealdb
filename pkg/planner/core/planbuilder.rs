@@ -17618,8 +17618,11 @@ fn index_merge_plan(
     }
     // Root order remains partial: every arm that reads in order gets the LIMIT
     // (`offset:0, count:offset+limit`, TiDB keeps the offset above the merge),
-    // the rest get a cop `TopN` over their full range. The root `TopN` is added
-    // by `apply_order_limit`.
+    // the rest get a cop `TopN` over their full range — but only when the arm's
+    // index key carries the sort column, since the top is then read off the
+    // index alone. An arm whose index cannot answer the ORDER BY (`ORDER BY id`
+    // over `idx_auth_value(auth_value)`) leaves the `TopN` above the merge, on
+    // its probe side. The root `TopN` is added by `apply_order_limit`.
     if ordered
         && !keep_order
         && let Some((offset, count_limit)) = select.limit.map(|count| (select.offset.unwrap_or(0), count))
@@ -17627,7 +17630,13 @@ fn index_merge_plan(
         for path in &mut paths {
             if path.keep_order {
                 path.limit = Some((0, offset + count_limit));
-            } else if !path.table_range {
+            } else if !path.table_range
+                && order_column.as_ref().is_some_and(|column| {
+                    path.index_columns
+                        .iter()
+                        .any(|key| key.eq_ignore_ascii_case(column))
+                })
+            {
                 // The root TopN re-merges the arms, so each unordered arm
                 // keeps the full prefix (`offset:0, count:offset+limit`).
                 path.topn = Some((0, offset + count_limit));
