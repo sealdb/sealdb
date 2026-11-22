@@ -22,9 +22,9 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **128 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 128 | 50.4% |
+| `green` | 129 | 50.8% |
 | `in_progress` | 8 | 3.1% |
-| `pending` | 108 | 42.5% |
+| `pending` | 107 | 42.1% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
 
@@ -38,7 +38,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **128 个** �
 | R2（join / subquery / agg / window / cte） | 16 | 5 | 1 | 主波完成 ~73% |
 | R3（point_get / index / partition / explain*） | 32 | 3 | 13 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
-| R5 | 4 | 0 | 8 | `session/txn` / `db_integration` / `session/variable` 已绿 |
+| R5 | 5 | 0 | 7 | `session/txn` / `db_integration` / `session/variable` / `session/bootstrap_upgrade` / `session/session` 已绿 |
 | R6 | 20 | 0 | 15 | DDL / infoschema 起步 |
 | R7 | 52 | 0 | 58 | 零散长尾 |
 | D（TiFlash/MPP） | 0 | 0 | 2 | deferred |
@@ -46,14 +46,14 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **128 个** �
 
 ---
 
-## 3. 已绿 suite 清单（128）
+## 3. 已绿 suite 清单（129）
 
 | Wave | Suite |
 |---|---|
 | R1 | `select`, `show`, `types/const`, `types/time` |
 | R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_push_down`, `topn_pushdown`, `window_function` |
 | R3 | `access_path_selection`, `clustered_index`, `ddl/db_partition`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/explain`, `executor/explainfor`, `executor/index_lookup_pushdown_partition`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy`, `explain_easy_stats`, `explain_foreign_key`, `explain_generate_column_substitute`, `explain_indexmerge_stats`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `expression/explain`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `globalindex/point_get`, `partition`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
-| R5 | `session/txn`, `session/variable`, `db_integration`, `session/bootstrap_upgrade` |
+| R5 | `session/txn`, `session/variable`, `session/session`, `db_integration`, `session/bootstrap_upgrade` |
 | R6 | `ddl/affinity`, `ddl/attributes_sql`, `ddl/column`, `ddl/column_change`, `ddl/column_modify`, `ddl/column_type_change`, `ddl/db_cache`, `ddl/db_change`, `ddl/db_foreign_key`, `ddl/db_rename`, `ddl/ddl_error`, `ddl/fail_db`, `ddl/index_modify`, `ddl/resource_group`, `ddl/table_modify`, `infoschema/cluster_tables`, `infoschema/v2`, `statistics/integration`, `statistics/lock_table_stats`, `statistics/overflow_calc` |
 | R7 | `black_list`, `bindinfo/bind`, `bindinfo/session_handle`, `bindinfo/temptable`, `executor/adapter`, `executor/charset`, `executor/ddl`, `executor/distsql`, `executor/executor_txn`, `executor/index_advise`, `executor/index_lookup_join`, `executor/index_lookup_merge_join`, `executor/index_lookup_pushdown`, `executor/stale_txn`, `expression/enum_set`, `expression/format`, `expression/time`, `expression/vitess_hash`, `globalindex/expression_index`, `globalindex/information_schema`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `planner/core/casetest/index/partialindex`, `planner/core/memtable_predicate_extractor`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `sessiontxn/externals`, `table/cache`, `table/tables`, `table/temptable`, `util/admin`, `sessionctx/setvar`, `planner/core/indexjoin`, `planner/core/indexmerge_intersection`, `executor/compact_table`, `expression/constant_fold`, `executor/kv`, `planner/core/rule_result_reorder`, `table/index`, `executor/rowid`, `executor/analyze`, `executor/delete`, `executor/update`, `executor/insert`, `expression/cast`, `expression/noop_functions`, `planner/core/casetest/expression_rewriter`, `expression/misc` |
 
@@ -459,7 +459,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 12 | `planner/core/tests/prepare/issue` | pending | 0% | ✓ | — |
 | 13 | `planner/core/tests/prepare/prepare` | pending | 0% | ✓ | — |
 
-### R5（12 套，green 4）
+### R5（12 套，green 5）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
@@ -470,7 +470,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 5 | `session/common` | pending | 0% | ✓ | — |
 | 6 | `session/nontransactional` | pending | 0% | ✓ | — |
 | 7 | `session/privileges` | pending | 0% | ✓ | — |
-| 8 | `session/session` | pending | 0% | ✓ | — |
+| 8 | `session/session` | green | 100% | ✓ | ✓ |
 | 9 | `session/temporary_table` | pending | 0% | ✓ | — |
 | 10 | `session/txn` | green | 100% | ✓ | ✓ |
 | 11 | `session/variable` | green | 100% | ✓ | — |

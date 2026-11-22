@@ -16451,8 +16451,16 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
         }
     }
     let strip_marker = |part: &IndexPart, marker: &str| -> Option<IndexPart> {
-        let name = part.column_name()?;
-        name.strip_prefix(marker).map(IndexPart::column)
+        // The cluster marker is spliced in front of the first key part, so a
+        // prefix key (`PRIMARY KEY (c(5)) CLUSTERED`) arrives here as the
+        // prefix part `__sealdb_clustered__c(5)`; keep the prefix length.
+        match part {
+            IndexPart::Column(name) => name.strip_prefix(marker).map(IndexPart::column),
+            IndexPart::Prefix { name, length } => name
+                .strip_prefix(marker)
+                .map(|rest| IndexPart::prefix(rest, *length)),
+            IndexPart::Expression(_) => None,
+        }
     };
     let nonclustered = match strip_marker(&columns[0], NONCLUSTERED_MARKER) {
         Some(rest) => {

@@ -9,10 +9,11 @@
 
 use crate::create_table::field_type_from_name;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT,
+    ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_DUP_FIELDNAME, ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT,
     ERR_FUNCTIONAL_INDEX_ON_BLOB, ERR_FUNCTIONAL_INDEX_ON_FIELD,
     ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION,
-    ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED, ERR_WRONG_KEY_COLUMN, Error, Result,
+    ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED, ERR_TOO_LONG_KEY, ERR_WRONG_KEY_COLUMN,
+    ERR_WRONG_SUB_KEY, Error, Result,
 };
 use sealdb_meta::{ColumnInfo, IndexColumn, TableInfo};
 use sealdb_parser::ast::ExprNode;
@@ -92,6 +93,7 @@ pub(crate) fn resolve_index_parts(
                     })?;
                 let mut ic = IndexColumn::new(col.name.o(), col.offset);
                 ic.length = part.prefix_length();
+                check_index_part_length(col, ic.length)?;
                 columns.push(ic);
             }
             IndexPart::Expression(text) => {
@@ -142,6 +144,69 @@ pub(crate) fn resolve_index_parts(
         }
     }
     Ok((columns, hidden))
+}
+
+/// TiDB `checkIndexColumn`: a key part with an explicit prefix must name a
+/// string/BLOB column and fit its declared length and the 3072-byte key limit;
+/// a BLOB/TEXT column always needs a prefix (1170).
+fn check_index_part_length(col: &ColumnInfo, length: i32) -> Result<()> {
+    let ft = &col.field_type;
+    let blob = matches!(
+        ft.tp,
+        sealdb_types::field_type::TYPE_BLOB
+            | sealdb_types::field_type::TYPE_TINY_BLOB
+            | sealdb_types::field_type::TYPE_MEDIUM_BLOB
+            | sealdb_types::field_type::TYPE_LONG_BLOB
+    );
+    // `TEXT` / `BLOB` are length-less string types.
+    let text = ft.tp == sealdb_types::field_type::TYPE_VAR_STRING && ft.flen < 0;
+    if (blob || text) && length < 0 {
+        return Err(Error::new(
+            ERR_BLOB_USED_AS_KEY,
+            format!(
+                "BLOB/TEXT column '{}' used in key specification without a key length",
+                col.name.o()
+            ),
+        ));
+    }
+    if length < 0 {
+        return Ok(());
+    }
+    let correct_prefix = matches!(
+        ft.tp,
+        sealdb_types::field_type::TYPE_STRING
+            | sealdb_types::field_type::TYPE_VARCHAR
+            | sealdb_types::field_type::TYPE_VAR_STRING
+    ) || blob;
+    if !correct_prefix {
+        return Err(Error::new(ERR_WRONG_SUB_KEY, wrong_sub_key()));
+    }
+    // `CHAR(n)` cannot carry a prefix longer than `n` (MySQL `VARCHAR` can).
+    if ft.tp == sealdb_types::field_type::TYPE_STRING && ft.flen < length {
+        return Err(Error::new(ERR_WRONG_SUB_KEY, wrong_sub_key()));
+    }
+    let bytes = i64::from(length) * i64::from(charset_maxlen(&ft.charset));
+    if bytes > 3072 {
+        return Err(Error::new(
+            ERR_TOO_LONG_KEY,
+            format!("Specified key was too long ({bytes} bytes); max key length is 3072 bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn wrong_sub_key() -> &'static str {
+    "Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys"
+}
+
+/// Maximum bytes per character for the collation charsets TiDB accepts.
+fn charset_maxlen(charset: &str) -> i32 {
+    match charset.to_ascii_lowercase().as_str() {
+        "binary" | "ascii" | "latin1" => 1,
+        "gbk" | "gb18030" | "big5" | "sjis" | "cp932" | "eucjpms" => 2,
+        "utf8" | "utf8mb3" => 3,
+        _ => 4,
+    }
 }
 
 /// Field type TiDB derives for an expression index part.

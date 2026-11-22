@@ -1202,6 +1202,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_blob_prefix_primary_key_option() {
+        let parser = Parser::new();
+        let stmt = parser
+            .parse_one_stmt(
+                "create table t (a int, b char(10), c blob, primary key (c(5)) clustered)",
+            )
+            .unwrap();
+        match stmt {
+            crate::ast::Statement::CreateTable(create) => {
+                assert_eq!(create.indices.len(), 1);
+                // The CLUSTERED option rides on the first key part; stripping it
+                // must keep the prefix length.
+                assert_eq!(
+                    create.indices[0].columns,
+                    vec![crate::ast::IndexPart::prefix("c", 5)]
+                );
+                assert!(create.indices[0].clustered);
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_create_table_index() {
         let parser = Parser::new();
         let stmt = parser

@@ -3,7 +3,9 @@
 /// privilege checks. Grant state persists to Storage under `mprivilege`
 /// (mysql.user / mysql.db / mysql.tables_priv equivalent for SealDB).
 /// Completeness wave: dynamic privileges, column grants, LDAP, auth plugins.
-use sealdb_errno::{ERR_DBACCESS_DENIED_ERROR, ERR_TABLEACCESS_DENIED_ERROR, Error, Result};
+use sealdb_errno::{
+    ERR_DBACCESS_DENIED_ERROR, ERR_DEFINER_TOO_LONG, ERR_TABLEACCESS_DENIED_ERROR, Error, Result,
+};
 use sealdb_parser::ast::{
     CreateRoleStmt, CreateUserStmt, DropRoleStmt, DropUserStmt, GrantLevel, GrantLevelType,
     GrantRoleStmt, GrantStmt, PrivilegeType, RenameUserStmt, RevokeRoleStmt, RevokeStmt,
@@ -223,6 +225,7 @@ impl Manager {
     pub fn create_user(&self, stmt: &CreateUserStmt) -> Result<()> {
         let mut inner = self.inner.lock().expect("privilege lock");
         for spec in &stmt.users {
+            validate_account_name(&spec.user)?;
             let key = user_key(&spec.user);
             if inner.users.contains_key(&key) {
                 if stmt.if_not_exists {
@@ -843,6 +846,30 @@ fn has_priv(
     entries
         .iter()
         .any(|e| matches_scope(e, db, table) && e.privs.contains(wanted))
+}
+
+/// TiDB `ErrWrongStringLength`: account names above MySQL's limits (32-char
+/// user, 255-char host) are rejected with 1470.
+fn validate_account_name(user: &UserIdentity) -> Result<()> {
+    if user.username.chars().count() > 32 {
+        return Err(Error::new(
+            ERR_DEFINER_TOO_LONG,
+            format!(
+                "String '{}' is too long for user name (should be no longer than 32)",
+                user.username.chars().take(70).collect::<String>()
+            ),
+        ));
+    }
+    if user.hostname.chars().count() > 255 {
+        return Err(Error::new(
+            ERR_DEFINER_TOO_LONG,
+            format!(
+                "String '{}' is too long for host name (should be no longer than 255)",
+                user.hostname.chars().take(70).collect::<String>()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn user_key(user: &UserIdentity) -> (String, String) {

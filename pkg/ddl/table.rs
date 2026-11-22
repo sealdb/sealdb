@@ -213,6 +213,8 @@ pub fn truncate_table(
         })?;
     clear_table_keys(storage, &tbl.physical_ids())?;
     meta.reset_handle(tbl.id);
+    // MySQL `TRUNCATE` restarts `AUTO_INCREMENT` from 1 as well.
+    meta.reset_auto_id(tbl.id);
     meta.gen_schema_version()?;
     Ok(())
 }

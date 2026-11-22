@@ -236,6 +236,12 @@ pub const ERR_FIELD_NOT_DEFAULT: i32 = 1364;
 /// MySQL `ER_WRONG_KEY_COLUMN`: a key part has an invalid length, e.g. the
 /// prefix length 0 in `KEY (b(0))` (1391).
 pub const ERR_WRONG_KEY_COLUMN: i32 = 1391;
+/// TiDB `ErrWrongSubKey`: an index prefix on a column that cannot carry one
+/// (`KEY (i(3))` on an `INT`) or a prefix longer than the column (1089).
+pub const ERR_WRONG_SUB_KEY: i32 = 1089;
+/// TiDB `ErrTooLongKey`: an index key or prefix above the 3072-byte limit
+/// (1071).
+pub const ERR_TOO_LONG_KEY: i32 = 1071;
 /// TiDB `ErrFKIncompatibleColumns`: an `ALTER` would make a foreign key's
 /// referencing and referenced columns disagree on type (3780).
 pub const ERR_FK_INCOMPATIBLE_COLUMNS: i32 = 3780;

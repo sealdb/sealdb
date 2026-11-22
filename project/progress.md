@@ -4960,3 +4960,43 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     `infoschema/tables`、`statistics/handle`）与 R3
     `planner/core/indexmerge_path`（第 1 类 `stats:partial[…:missing]` 现在
     可以直接复用本轮的占位索引机制）。
+
+### 2026-11-22 — `session/session` 转绿（green 129）
+
+- **Phase**: R5 会话/权限/DDL 边界与索引前缀校验
+- **根因**（四处）:
+  1. `TRUNCATE TABLE` 只重置了 `_tidb_rowid` 句柄，没有把 `AUTO_INCREMENT`
+     分配器归零，`truncate_id` 里截断后自增从旧值继续。
+  2. `CREATE USER` 未校验账号名长度：TiDB 对 `user > 32` /
+     `host > 255` 报 1470 `ErrDefinerTooLong`。
+  3. 建索引/加索引缺少前缀校验：整数列加 `(N)` 报 1089
+     `ErrWrongSubKey`；`CHAR(n)` 前缀超长同样 1089；字节数超 3072 报 1071
+     `ErrTooLongKey`；`BLOB/TEXT` 不带前缀报 1170 `ErrBlobUsedAsKey`。
+  4. `REPLACE INTO` 的 `replace_rows` 分配了新的自增 id 却没有
+     `record_last_insert_id`，`LAST_INSERT_ID()` 返回 0。
+- **完成**:
+  - `pkg/ddl/table.rs`：`truncate_table` 增加 `meta.reset_auto_id(tbl.id)`。
+  - `pkg/privilege/privilege.rs`：`create_user` 增加 `validate_account_name`
+    （32/255 上限，1470）。
+  - `pkg/ddl/expr_index.rs`：新增 `check_index_part_length` / `charset_maxlen`，
+    由 `resolve_index_parts` 统一校验；`pkg/errno` 新增
+    `ERR_WRONG_SUB_KEY`（1089）/`ERR_TOO_LONG_KEY`（1071）及名称映射。
+  - `pkg/executor/insert.rs`：`replace_rows` 对新写入与冲突替换两条路径都
+    `record_last_insert_id`。
+- **回归修复**（全量 memory gate 发现）:
+  - `PRIMARY KEY (c(5)) CLUSTERED` 的 `CLUSTERED` 选项由
+    `rewrite_primary_key_nonclustered` 拼到首个 key part 前，形成
+    `__sealdb_clustered__c(5)`；`lower_primary_key` 的 `strip_marker` 用
+    `column_name()` + `IndexPart::column` 重建时丢掉了前缀长度，导致
+    `executor/index_lookup_join` 的 BLOB 前缀主键建表报 1170。
+  - 改为按 `Column` / `Prefix` 分别重建并保留 `length`，并在
+    `pkg/parser/parser.rs` 增加 `test_parse_blob_prefix_primary_key_option`
+    单测锁定。
+- **验证**:
+  - `… -t session/session`：memory → PASS；tikv → PASS。
+  - `… -t executor/index_lookup_join`：memory → PASS。
+  - 全量 memory gate：`PASS: memory=137 skipped=117`（129 green + 8 local）。
+  - manifest：`session/session` → `green`。
+- **下一步**: R5 剩余 pending（`session/privileges`、`session/vars`、
+  `session/common`、`session/nontransactional`、`session/temporary_table`、
+  `ddl/db_integration`、`privilege/privileges`）。

@@ -105,7 +105,12 @@ impl InsertExec {
         let mut affected = 0u64;
         let mut duplicates = 0u64;
         self.txn.with_txn(|txn| {
-            for PendingRow { values, rowid, .. } in pending {
+            for PendingRow {
+                values,
+                rowid,
+                generated_id,
+            } in pending
+            {
                 let conflicts: Vec<usize> = existing
                     .iter()
                     .enumerate()
@@ -114,6 +119,9 @@ impl InsertExec {
                     .collect();
                 if conflicts.is_empty() {
                     let (handle, physical_id) = write_row(txn, &self.domain, info, &values, rowid)?;
+                    if let Some(id) = generated_id {
+                        record_last_insert_id(id);
+                    }
                     existing.push(crate::table_reader::ScannedRow {
                         handle,
                         physical_id,
@@ -134,6 +142,9 @@ impl InsertExec {
                     affected += 1;
                 }
                 let (handle, physical_id) = write_row(txn, &self.domain, info, &values, rowid)?;
+                if let Some(id) = generated_id {
+                    record_last_insert_id(id);
+                }
                 existing.push(crate::table_reader::ScannedRow {
                     handle,
                     physical_id,

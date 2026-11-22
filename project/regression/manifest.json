@@ -2322,7 +2322,7 @@
     {
       "name": "session/session",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/session/session.test",
       "result": "r/session/session.result",
       "has_result": true,
