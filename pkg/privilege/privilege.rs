@@ -29,6 +29,19 @@ struct GrantEntry {
     columns: Vec<String>,
 }
 
+/// One materialized `mysql.tables_priv` row (TiDB keeps the same grant
+/// entries in memory and in the system table).
+#[derive(Clone, Debug)]
+pub struct TablePrivRow {
+    pub host: String,
+    pub db: String,
+    pub user: String,
+    pub table: String,
+    pub grantor: String,
+    pub table_priv: String,
+    pub column_priv: String,
+}
+
 struct Store {
     /// User/role → privilege entries.
     grants: HashMap<(String, String), Vec<GrantEntry>>,
@@ -522,6 +535,30 @@ impl Manager {
             .any(|role| has_priv(&inner, role, db, table, wanted))
     }
 
+    /// Column-granular check (TiDB `RequestVerification` with a `column`): a
+    /// global/db grant or a table-level grant covers every column, while a
+    /// column grant covers only the listed columns.
+    pub fn request_column_verification_with_roles(
+        &self,
+        user: &UserIdentity,
+        active_roles: &[UserIdentity],
+        db: &str,
+        table: &str,
+        column: &str,
+        wanted: PrivilegeType,
+    ) -> bool {
+        if self.skip_grant_table {
+            return true;
+        }
+        let inner = self.inner.lock().expect("privilege lock");
+        if has_column_priv(&inner, user, db, table, column, wanted) {
+            return true;
+        }
+        active_roles
+            .iter()
+            .any(|role| has_column_priv(&inner, role, db, table, column, wanted))
+    }
+
     /// Databases visible in `SHOW DATABASES`: `None` when the user holds a
     /// global privilege (sees every database), otherwise the set of databases
     /// where the user has a db- or table-level grant (TiDB
@@ -651,6 +688,51 @@ impl Manager {
         });
     }
 
+    /// Materialize `mysql.tables_priv` rows from the in-memory grants.
+    /// Only table-scope entries produce rows (TiDB writes one row per
+    /// `GRANT … ON db.table`, with column grants in `column_priv`).
+    pub fn table_priv_rows(&self) -> Vec<TablePrivRow> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let grantor = thread_user()
+            .map(|user| user.display())
+            .unwrap_or_else(|| "root@%".to_string());
+        let mut rows = Vec::new();
+        for ((user, host), entries) in &inner.grants {
+            for entry in entries {
+                if entry.db.is_empty() || entry.table.is_empty() {
+                    continue;
+                }
+                let (table_priv, column_priv) = if entry.columns.is_empty() {
+                    (entry.privs.table_priv_set_names().join(","), String::new())
+                } else {
+                    (
+                        String::new(),
+                        entry
+                            .privs
+                            .table_priv_set_names()
+                            .into_iter()
+                            .filter(|name| matches!(*name, "Select" | "Insert" | "Update"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                };
+                rows.push(TablePrivRow {
+                    host: host.clone(),
+                    db: entry.db.clone(),
+                    user: user.clone(),
+                    table: entry.table.clone(),
+                    grantor: grantor.clone(),
+                    table_priv,
+                    column_priv,
+                });
+            }
+        }
+        rows.sort_by(|a, b| {
+            (&a.host, &a.db, &a.user, &a.table).cmp(&(&b.host, &b.db, &b.user, &b.table))
+        });
+        rows
+    }
+
     /// Serialize grant tables for Storage (TiDB mysql.user / db / tables_priv).
     pub fn encode(&self) -> Result<Vec<u8>> {
         let inner = self.inner.lock().expect("privilege lock");
@@ -728,10 +810,12 @@ impl Manager {
                 user.entries
                     .into_iter()
                     .map(|e| {
-                        // Snapshots written before SHOW VIEW was tracked stored
-                        // the 6-bit ALL mask; treat it as today's ALL.
+                        // `ALL` is not a separate bit: snapshots from before
+                        // SHOW VIEW (0x3f) or CREATE VIEW (0x7f) was tracked
+                        // stored exactly those bits as root's global ALL. Treat
+                        // the old masks as today's ALL.
                         let privs = PrivilegeType::from_bits(e.privs);
-                        let privs = if privs.bits() == 0x3f {
+                        let privs = if matches!(privs.bits(), 0x3f | 0x7f) {
                             PrivilegeType::ALL
                         } else {
                             privs
@@ -843,9 +927,34 @@ fn has_priv(
     let Some(entries) = store.grants.get(&user_key(user)) else {
         return false;
     };
+    // A column-only grant does not satisfy a table-level request (TiDB keeps
+    // `mysql.tables_priv` and `mysql.columns_priv` apart).
     entries
         .iter()
-        .any(|e| matches_scope(e, db, table) && e.privs.contains(wanted))
+        .any(|e| matches_scope(e, db, table) && e.columns.is_empty() && e.privs.contains(wanted))
+}
+
+/// Column-level request: table grants cover every column, column grants only
+/// the columns they name (TiDB `MySQLPrivilege.RequestVerification`).
+fn has_column_priv(
+    store: &Store,
+    user: &UserIdentity,
+    db: &str,
+    table: &str,
+    column: &str,
+    wanted: PrivilegeType,
+) -> bool {
+    let Some(entries) = store.grants.get(&user_key(user)) else {
+        return false;
+    };
+    entries.iter().any(|e| {
+        matches_scope(e, db, table)
+            && e.privs.contains(wanted)
+            && (e.columns.is_empty()
+                || e.columns
+                    .iter()
+                    .any(|have| have.eq_ignore_ascii_case(column)))
+    })
 }
 
 /// TiDB `ErrWrongStringLength`: account names above MySQL's limits (32-char

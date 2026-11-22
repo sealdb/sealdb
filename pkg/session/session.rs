@@ -1080,6 +1080,8 @@ impl Session {
         // Executors that filter by caller (`SHOW DATABASES`) read the identity
         // from a thread-local; sessions are pinned to a thread per statement.
         sealdb_privilege::set_thread_user(Some(self.current_user()));
+        // `CURRENT_USER()` / `USER()` read the same identity.
+        sealdb_expression::set_current_user_identity(Some(self.current_user().display()));
         let mut owned = None;
         let stmt = if let Statement::Show(show) = stmt
             && show.kind == sealdb_parser::ast::ShowStmtKind::Grants
@@ -2803,31 +2805,70 @@ impl Session {
                 )?;
             }
             Statement::Update(update) => {
-                require(
-                    &mgr,
-                    &user,
-                    &roles,
-                    &update.table,
-                    &current_db,
-                    PrivilegeType::UPDATE,
-                )?;
+                // TiDB `buildUpdate`: the SET targets need UPDATE privilege on
+                // the assigned column only, while every column read by the
+                // join conditions / WHERE / SET expressions needs SELECT.
+                // Failures name the column (1143), not the table (1142), and
+                // the SELECT checks run first because the result set (with its
+                // join conditions) and WHERE are built before the SET list.
+                let tables = update_statement_tables(update);
+                let mut read_exprs: Vec<&ExprNode> = Vec::new();
                 if let Some(join) = &update.join {
-                    require(
-                        &mgr,
+                    read_exprs.push(&join.on);
+                }
+                for join in &update.additional_joins {
+                    read_exprs.push(&join.on);
+                }
+                if let Some(selection) = &update.selection {
+                    read_exprs.push(selection);
+                }
+                for assign in &update.list {
+                    read_exprs.push(&assign.expr);
+                }
+                let is = self.infoschema();
+                for expr in read_exprs {
+                    for (qualifier, column) in expr.referenced_columns() {
+                        let Some((db, table)) = resolve_update_column(
+                            &is,
+                            &tables,
+                            qualifier.as_deref(),
+                            &column,
+                            &current_db,
+                        ) else {
+                            continue;
+                        };
+                        if !mgr.request_column_verification_with_roles(
+                            &user,
+                            &roles,
+                            &db,
+                            &table,
+                            &column,
+                            PrivilegeType::SELECT,
+                        ) {
+                            return Err(column_access_denied("SELECT", &column, &table, &user));
+                        }
+                    }
+                }
+                for assign in &update.list {
+                    let Some((db, table)) = resolve_update_column(
+                        &is,
+                        &tables,
+                        assign.table.as_deref(),
+                        &assign.column,
+                        &current_db,
+                    ) else {
+                        continue;
+                    };
+                    if !mgr.request_column_verification_with_roles(
                         &user,
                         &roles,
-                        &join.left,
-                        &current_db,
+                        &db,
+                        &table,
+                        &assign.column,
                         PrivilegeType::UPDATE,
-                    )?;
-                    require(
-                        &mgr,
-                        &user,
-                        &roles,
-                        &join.right,
-                        &current_db,
-                        PrivilegeType::UPDATE,
-                    )?;
+                    ) {
+                        return Err(column_access_denied("UPDATE", &assign.column, &table, &user));
+                    }
                 }
             }
             Statement::Delete(delete) => {
@@ -2946,14 +2987,38 @@ impl Session {
                 }
             }
             Statement::CreateView(create) => {
-                require(
-                    &mgr,
+                // TiDB requires `CreateViewPriv` (or any view privilege) on the
+                // created view, plus `SelectPriv` on every referenced table.
+                let (view_db, view_name) = create.view_name.qualified(&current_db);
+                let allowed = mgr.request_verification_with_roles(
                     &user,
                     &roles,
-                    &create.view_name,
-                    &current_db,
+                    &view_db,
+                    &view_name,
+                    PrivilegeType::CREATE_VIEW,
+                ) || mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    &view_db,
+                    &view_name,
+                    PrivilegeType::SHOW_VIEW,
+                ) || mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    &view_db,
+                    &view_name,
                     PrivilegeType::CREATE,
-                )?;
+                );
+                if !allowed {
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        &create.view_name,
+                        &current_db,
+                        PrivilegeType::CREATE_VIEW,
+                    )?;
+                }
                 if let Some(from) = &create.select.from {
                     require(
                         &mgr,
@@ -3192,6 +3257,80 @@ fn require(
         return Err(access_denied(&db, &name, privs, user));
     }
     Ok(())
+}
+
+/// `UPDATE` / `DELETE` table list: the first table plus both sides of every
+/// join in the statement.
+fn update_statement_tables(
+    update: &sealdb_parser::ast::UpdateStmt,
+) -> Vec<&sealdb_parser::ast::TableName> {
+    let mut tables = vec![&update.table];
+    if let Some(join) = &update.join {
+        tables.push(&join.left);
+        tables.push(&join.right);
+    }
+    for join in &update.additional_joins {
+        tables.push(&join.left);
+        tables.push(&join.right);
+    }
+    tables
+}
+
+/// Owner of a column mentioned by an `UPDATE`: an explicit qualifier picks the
+/// table it names (alias or real name); an unqualified column belongs to the
+/// first table that defines it. `None` means the name could not be attributed
+/// to one of the statement's tables, so its privilege check is left to the
+/// planner (e.g. derived tables, subqueries).
+fn resolve_update_column(
+    is: &InfoSchema,
+    tables: &[&sealdb_parser::ast::TableName],
+    qualifier: Option<&str>,
+    column: &str,
+    current_db: &str,
+) -> Option<(String, String)> {
+    if let Some(qualifier) = qualifier {
+        return tables.iter().find_map(|table| {
+            let (db, name) = table.qualified(current_db);
+            let matches = table.name.eq_ignore_ascii_case(qualifier)
+                || name.eq_ignore_ascii_case(qualifier)
+                || table.resolve_name().eq_ignore_ascii_case(qualifier);
+            matches.then_some((db, name))
+        });
+    }
+    for table in tables {
+        let (db, name) = table.qualified(current_db);
+        if let Some(info) = is.table_by_name(&db, &name)
+            && info
+                .columns
+                .iter()
+                .any(|col| !col.hidden && col.name.o().eq_ignore_ascii_case(column))
+        {
+            return Some((db, name));
+        }
+    }
+    // A single-table statement whose table is not in the catalog would have
+    // failed earlier; still attribute the column so the check is not skipped.
+    (tables.len() == 1).then(|| tables[0].qualified(current_db))
+}
+
+fn column_access_denied(
+    command: &str,
+    column: &str,
+    table: &str,
+    user: &UserIdentity,
+) -> Error {
+    // TiDB formats this error from the lower-cased AST names.
+    Error::new(
+        sealdb_errno::ERR_COLUMNACCESS_DENIED_ERROR,
+        format!(
+            "{} command denied to user '{}'@'{}' for column '{}' in table '{}'",
+            command,
+            user.username,
+            user.hostname,
+            column.to_ascii_lowercase(),
+            table.to_ascii_lowercase()
+        ),
+    )
 }
 
 fn access_denied(

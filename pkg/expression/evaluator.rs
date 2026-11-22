@@ -311,6 +311,8 @@ fn current_time_zone() -> String {
 
 thread_local! {
     static CURRENT_DB: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Authenticated session identity (`user@host`), for `CURRENT_USER()`.
+    static CURRENT_USER: RefCell<Option<String>> = const { RefCell::new(None) };
     /// TiDB `tidb_window_concurrency` (default 5; suite sets 1 / 4).
     static WINDOW_CONCURRENCY: Cell<u64> = const { Cell::new(DEFAULT_WINDOW_CONCURRENCY) };
 }
@@ -338,6 +340,16 @@ pub fn with_current_db<T>(db: impl Into<String>, f: impl FnOnce() -> T) -> T {
 
 pub fn current_db_name() -> String {
     CURRENT_DB.with(|cell| cell.borrow().clone())
+}
+
+/// Set the authenticated session identity (`user@host`), returning the
+/// previous value. `CURRENT_USER()` / `USER()` evaluate to it.
+pub fn set_current_user_identity(user: Option<String>) -> Option<String> {
+    CURRENT_USER.with(|cell| cell.replace(user))
+}
+
+pub fn current_user_identity() -> Option<String> {
+    CURRENT_USER.with(|cell| cell.borrow().clone())
 }
 
 thread_local! {
@@ -1475,6 +1487,14 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             Ok(user_var_assign(&name, value))
         }
         "VALUES" => Ok(Datum::Null),
+        // `CURRENT_USER()` / `USER()` / `SESSION_USER()`: the authenticated
+        // identity as `user@host`.
+        "CURRENT_USER" | "USER" | "SESSION_USER" | "SYSTEM_USER" => Ok(
+            match current_user_identity() {
+                Some(identity) => Datum::Bytes(identity.into_bytes()),
+                None => Datum::Null,
+            },
+        ),
         // `DATABASE()` / `SCHEMA()`: the session's current database.
         "DATABASE" | "SCHEMA" => {
             let db = current_db_name();

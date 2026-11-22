@@ -5000,3 +5000,49 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**: R5 剩余 pending（`session/privileges`、`session/vars`、
   `session/common`、`session/nontransactional`、`session/temporary_table`、
   `ddl/db_integration`、`privilege/privileges`）。
+
+### 2026-11-23 — `session/privileges` 转绿（green 130）
+
+- **Phase**: R5 视图权限 / `mysql.tables_priv` 物化 / `CURRENT_USER()`
+- **根因**（五处）:
+  1. `CURRENT_USER()` / `USER()` 没有内置函数实现，落到 `FUNCTION … does
+     not exist`（1305）。
+  2. 没有 `CreateViewPriv` 位：`GRANT CREATE VIEW` / `SHOW VIEW` 之外的视图
+     权限无法表达，`CREATE VIEW` 复用了库级 `CREATE`。
+  3. `try_parse_table_priv_grant` 的私有解析器只接管含 `SHOW VIEW` 的列表，
+     `CREATE VIEW` 两词权限也不识别，退回 sqlparser 后丢失视图位。
+  4. `mysql.tables_priv` 在 `bootstrap()` 中建的是真实空表，权限管理器从未
+     写入行，`select table_priv from mysql.tables_priv …` 返回 0 行。
+  5. `GRANT … ON t`（未限定库）按会话当前库落库：TiDB 存 `db.t`，引擎原来
+     存空 db，`mysql.tables_priv` 的 `db=` 过滤永远不命中；TiKV 持久化快照
+     里旧 `ALL` 掩码（0x3f / 0x7f）解码后不含新增位，root 会丢掉
+     `GRANT` / `CREATE USER` 所需的全局 ALL。
+- **完成**:
+  - `pkg/expression/evaluator.rs`：新增线程本地 `current_user_identity`，
+    `CURRENT_USER` / `USER` / `SESSION_USER` / `SYSTEM_USER` 返回 `user@host`；
+    `pkg/session/session.rs` 每条语句发布当前身份。
+  - `pkg/parser/ast/misc.rs`：新增 `PrivilegeType::CREATE_VIEW`（1<<7）并纳入
+    `ALL`，新增 `table_priv_set_names()` 按 `mysql.tables_priv` 的 `SET`
+    声明顺序渲染（`Select,Show View`）。
+  - `pkg/parser/sqlparser_bridge/lower.rs`：`parse_table_priv_list` 接管所有
+    表级权限列表（含 `CREATE VIEW`），遇到列清单 `SELECT (c)` 时仍回退
+    sqlparser。
+  - `pkg/privilege/privilege.rs`：新增 `TablePrivRow` + `table_priv_rows()`；
+    `decode` 把 0x3f/0x7f 旧 `ALL` 掩码归一为当前 `ALL`。
+  - `pkg/planner/core/planbuilder.rs` / `pkg/infoschema/tables.rs` /
+    `pkg/executor/builder.rs`：`mysql.tables_priv` 走 `MemTableScan` 虚拟表，
+    行由权限管理器物化（`Host/DB/User/Table_name/Grantor/Timestamp/
+    Table_priv/Column_priv`）。
+  - `pkg/executor/grant.rs`：`GRANT`/`REVOKE` 的表级 level 若 db 为空，用会话
+    当前库补齐。
+  - `pkg/session/session.rs`：`CREATE VIEW` 校验 `CREATE VIEW`（回退
+    `SHOW VIEW`/`CREATE`），失败报 1142 `CREATE VIEW command denied …`。
+- **验证**:
+  - `… -t session/privileges`：memory → PASS；tikv → PASS。
+  - 全量 memory gate：`PASS: memory=138 skipped=116`（130 green + 8 local）。
+  - 全量 TiKV gate：`PASS: tikv=136 skipped=118`（2 套 skip_tikv）。
+  - manifest：`session/privileges` → `green`，`counts` 同步 130/106。
+- **下一步**: R5 剩余 pending（`session/vars`、`session/common`、
+  `session/nontransactional`、`session/temporary_table`、
+  `ddl/db_integration`、`privilege/privileges`）。
+

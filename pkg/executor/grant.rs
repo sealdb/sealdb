@@ -13,6 +13,8 @@ pub struct GrantExec {
     domain: Arc<Domain>,
     stmt: Statement,
     current_user: UserIdentity,
+    /// Session database, used to qualify `GRANT … ON t` table levels.
+    current_db: String,
     done: bool,
 }
 
@@ -21,11 +23,28 @@ impl GrantExec {
         Self::with_user(domain, stmt, UserIdentity::root())
     }
 
+    pub fn with_current_db(mut self, current_db: String) -> Self {
+        self.current_db = current_db;
+        self
+    }
+
+    /// TiDB resolves an unqualified table in `GRANT`/`REVOKE` against the
+    /// session database before recording the grant (`ON t` → `ON db.t`).
+    fn qualify_level(&self, level: &mut sealdb_parser::ast::GrantLevel) {
+        if level.level == sealdb_parser::ast::GrantLevelType::Table
+            && level.db_name.is_empty()
+            && !self.current_db.is_empty()
+        {
+            level.db_name = self.current_db.clone();
+        }
+    }
+
     pub fn with_user(domain: Arc<Domain>, stmt: Statement, current_user: UserIdentity) -> Self {
         Self {
             domain,
             stmt,
             current_user,
+            current_db: String::new(),
             done: false,
         }
     }
@@ -36,11 +55,15 @@ impl Executor for GrantExec {
         let mut persist_priv = false;
         match &self.stmt {
             Statement::Grant(grant) => {
-                self.domain.privilege().grant(grant)?;
+                let mut grant = grant.clone();
+                self.qualify_level(&mut grant.level);
+                self.domain.privilege().grant(&grant)?;
                 persist_priv = true;
             }
             Statement::Revoke(revoke) => {
-                self.domain.privilege().revoke(revoke)?;
+                let mut revoke = revoke.clone();
+                self.qualify_level(&mut revoke.level);
+                self.domain.privilege().revoke(&revoke)?;
                 persist_priv = true;
             }
             Statement::CreateRole(create) => {

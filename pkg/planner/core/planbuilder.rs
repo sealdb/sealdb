@@ -3511,10 +3511,10 @@ fn metrics_promql(table: &str) -> Option<String> {
     Some(format!("PromQL:{promql}"))
 }
 
-/// `mysql.stats_meta` / `stats_histograms` / `stats_buckets` / `stats_top_n`
-/// and `mysql.bind_info` are virtual: they read the statistics / binding
-/// handles rather than any stored rows.
-fn is_mysql_stats_table(from: &TableName, current_db: &str) -> bool {
+/// `mysql.stats_meta` / `stats_histograms` / `stats_buckets` / `stats_top_n`,
+/// `mysql.bind_info` and `mysql.tables_priv` are virtual: they read the
+/// statistics / binding / privilege handles rather than any stored rows.
+fn is_mysql_mem_table(from: &TableName, current_db: &str) -> bool {
     from.schema
         .as_deref()
         .or(Some(current_db))
@@ -3527,6 +3527,7 @@ fn is_mysql_stats_table(from: &TableName, current_db: &str) -> bool {
                 | "stats_top_n"
                 | "stats_table_locked"
                 | "bind_info"
+                | "tables_priv"
         )
 }
 
@@ -32867,7 +32868,7 @@ fn access_plan_inner(
 
     if is_information_schema(from, current_db)
         || is_metrics_schema(from, current_db)
-        || is_mysql_stats_table(from, current_db)
+        || is_mysql_mem_table(from, current_db)
     {
         // TiDB MemTableScan prints the physical infoschema table name even when
         // the FROM item is aliased (`… key_column_usage fk` → KEY_COLUMN_USAGE).

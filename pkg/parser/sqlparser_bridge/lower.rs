@@ -8137,27 +8137,29 @@ fn parse_table_priv_list(bytes: &[u8], mut i: usize) -> Result<Option<(Vec<PrivE
             ("INSERT", PrivilegeType::INSERT),
             ("UPDATE", PrivilegeType::UPDATE),
             ("DELETE", PrivilegeType::DELETE),
-            ("CREATE", PrivilegeType::CREATE),
+            ("CREATE", PrivilegeType::CREATE_VIEW),
             ("DROP", PrivilegeType::DROP),
         ] {
             if !keyword_at(bytes, i, prefix) {
                 continue;
             }
             let mut next = skip_ws(bytes, i + prefix.len());
-            if value == PrivilegeType::SHOW_VIEW {
-                // `SHOW VIEW` is two words.
+            if matches!(value, PrivilegeType::SHOW_VIEW | PrivilegeType::CREATE_VIEW) {
+                // `SHOW VIEW` / `CREATE VIEW` are two words.
                 if !keyword_at(bytes, next, "VIEW") {
                     continue;
                 }
                 next = skip_ws(bytes, next + "VIEW".len());
             }
+            // A following column list (`SELECT (c1)`) is not a table-level
+            // grant; fall back to sqlparser so TiDB's column semantics apply.
+            if next < bytes.len() && bytes[next] == b'(' {
+                return Ok(None);
+            }
             tp = Some((value, next));
             break;
         }
         let Some((tp, next)) = tp else {
-            if privs.is_empty() && !saw_show_view {
-                return Ok(None);
-            }
             // Unknown privilege after a parsed list: let sqlparser try.
             return Ok(None);
         };
@@ -8173,9 +8175,8 @@ fn parse_table_priv_list(bytes: &[u8], mut i: usize) -> Result<Option<(Vec<PrivE
         }
         break;
     }
-    if !saw_show_view {
-        return Ok(None);
-    }
+    // `GRANT SELECT ON db.t`: the table name follows directly.
+    let _ = saw_show_view;
     Ok(Some((privs, i)))
 }
 

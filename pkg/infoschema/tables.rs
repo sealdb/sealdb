@@ -102,6 +102,19 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
             ],
             Vec::new(),
         )),
+        // `mysql.tables_priv` rows come from the privilege manager; the
+        // executor materializes them, this exposes the column layout for
+        // EXPLAIN and predicate push-down.
+        "tables_priv" => Ok(empty(&[
+            "Host",
+            "DB",
+            "User",
+            "Table_name",
+            "Grantor",
+            "Timestamp",
+            "Table_priv",
+            "Column_priv",
+        ])),
         other => Err(Error::new(
             ERR_NO_SUCH_TABLE,
             format!("Table 'information_schema.{other}' doesn't exist"),

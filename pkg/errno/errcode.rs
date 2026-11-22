@@ -128,6 +128,9 @@ pub const ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET: i32 = 1748;
 pub const ERR_ACCESS_DENIED_ERROR: i32 = 1045;
 pub const ERR_DBACCESS_DENIED_ERROR: i32 = 1044;
 pub const ERR_TABLEACCESS_DENIED_ERROR: i32 = 1142;
+/// MySQL `ER_COLUMNACCESS_DENIED_ERROR`: the user may not use a specific
+/// column for the statement's command (1143).
+pub const ERR_COLUMNACCESS_DENIED_ERROR: i32 = 1143;
 /// TiDB `ErrViewNoExplain`: EXPLAIN/SHOW on a VIEW without the needed
 /// privileges on the view / underlying tables.
 pub const ERR_VIEW_NO_EXPLAIN: i32 = 1345;

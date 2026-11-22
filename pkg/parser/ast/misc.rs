@@ -16,6 +16,9 @@ impl PrivilegeType {
     /// `SHOW VIEW`: required by `EXPLAIN`/`SHOW` on a VIEW (TiDB
     /// `mysql.ShowViewPriv`, `ErrViewNoExplain` when missing).
     pub const SHOW_VIEW: Self = Self(1 << 6);
+    /// `CREATE VIEW`: required to create or replace a VIEW (TiDB
+    /// `mysql.CreateViewPriv`).
+    pub const CREATE_VIEW: Self = Self(1 << 7);
     pub const ALL: Self = Self(
         Self::SELECT.0
             | Self::INSERT.0
@@ -23,7 +26,8 @@ impl PrivilegeType {
             | Self::DELETE.0
             | Self::CREATE.0
             | Self::DROP.0
-            | Self::SHOW_VIEW.0,
+            | Self::SHOW_VIEW.0
+            | Self::CREATE_VIEW.0,
     );
 
     pub fn contains(self, other: Self) -> bool {
@@ -68,6 +72,29 @@ impl PrivilegeType {
             (Self::CREATE, "CREATE"),
             (Self::DROP, "DROP"),
             (Self::SHOW_VIEW, "SHOW VIEW"),
+            (Self::CREATE_VIEW, "CREATE VIEW"),
+        ] {
+            if self.contains(bit) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// `mysql.tables_priv.table_priv` rendering: TiDB stores the privileges in
+    /// the `SET` column declaration order and with title case
+    /// (`Select,Show View`).
+    pub fn table_priv_set_names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for (bit, name) in [
+            (Self::SELECT, "Select"),
+            (Self::INSERT, "Insert"),
+            (Self::UPDATE, "Update"),
+            (Self::DELETE, "Delete"),
+            (Self::CREATE, "Create"),
+            (Self::DROP, "Drop"),
+            (Self::CREATE_VIEW, "Create View"),
+            (Self::SHOW_VIEW, "Show View"),
         ] {
             if self.contains(bit) {
                 names.push(name);

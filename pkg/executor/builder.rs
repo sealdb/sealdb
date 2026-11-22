@@ -231,7 +231,9 @@ impl ExecutorBuilder {
                 current_db,
                 txn,
             ))),
-            PhysicalPlan::Simple { .. } => Ok(Box::new(GrantExec::new(domain, stmt.clone()))),
+            PhysicalPlan::Simple { .. } => Ok(Box::new(
+                GrantExec::new(domain, stmt.clone()).with_current_db(current_db.to_string()),
+            )),
             PhysicalPlan::Show { .. } => {
                 let show = match stmt {
                     Statement::Show(s) => s.clone(),
@@ -295,6 +297,8 @@ impl ExecutorBuilder {
             } => {
                 let (columns, rows) = if table.eq_ignore_ascii_case("bind_info") {
                     domain.bind_info_rows()
+                } else if table.eq_ignore_ascii_case("tables_priv") {
+                    tables_priv_rows(&domain)
                 } else {
                     sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?
                 };
@@ -3381,4 +3385,41 @@ fn agg_subquery_ctx(
         txn,
         select.from.as_ref().map(|table| table.name.clone()),
     ))
+}
+
+/// `mysql.tables_priv` rows from the privilege manager (TiDB persists one row
+/// per table-scope grant; the engine keeps the same data in memory).
+fn tables_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {
+    use sealdb_types::Datum;
+    let columns: Vec<String> = [
+        "Host",
+        "DB",
+        "User",
+        "Table_name",
+        "Grantor",
+        "Timestamp",
+        "Table_priv",
+        "Column_priv",
+    ]
+    .iter()
+    .map(|column| column.to_string())
+    .collect();
+    let rows = domain
+        .privilege()
+        .table_priv_rows()
+        .into_iter()
+        .map(|row| {
+            vec![
+                Datum::Bytes(row.host.into_bytes()),
+                Datum::Bytes(row.db.into_bytes()),
+                Datum::Bytes(row.user.into_bytes()),
+                Datum::Bytes(row.table.into_bytes()),
+                Datum::Bytes(row.grantor.into_bytes()),
+                Datum::Bytes(b"1970-01-01 00:00:00".to_vec()),
+                Datum::Bytes(row.table_priv.into_bytes()),
+                Datum::Bytes(row.column_priv.into_bytes()),
+            ]
+        })
+        .collect();
+    (columns, rows)
 }
