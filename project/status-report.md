@@ -323,6 +323,13 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
   5. 索引过滤条件（`splitIndexFilterConditions`）应挂到覆盖该列的 arm 上（`Selection(Build)`），而不是全部塞进探针 `Selection`；`mvi3/mvi4` 的 `not like` 分布差异即此。
 - 另外两处属计划形状差异（`IndexLookUp` vs `IndexMerge`、MV 合并之上的聚合/投影形态），需按金样逐条对齐。
 
+**进展与下一步（本轮）**
+
+- 已提交 `cab10da`：ANALYZE 之后新建索引不再按键列直方图收窄范围，arm 与探针 `TableRowIDScan` 输出 `stats:partial[idx:missing]`；`planner/core/indexmerge_path` 归一化差异维持 88 行，无新增回归（memory + tikv 均验证）。
+- 探针 `Selection` 的启发式收缩已验证是「一对一换」：仅当残余为单个等值条件时收缩可修正 `0.03`，但会破坏 `0.20`（两条条件被 arm 覆盖时 TiDB 保留子节点基数），净收益为零，已回滚。
+- 下一刀应落在 `cardinality.Selectivity` 本体：补索引节点（`GetRowCountByIndexRanges`）、MV 索引节点（`BuildPartialPaths4MVIndex` + `CalcTotalSelectivityForMVIdxPath`），并让 `handleRootTaskConds` 的基准取 IndexMerge 自身统计——这三项同时解释 `0.01/0.32`、`8.00/9.60`、`6.41/26.99`、`0.00/0.88` 四簇差异。
+- 环境的 PD/TiKV 已恢复（PD up，1 store `127.0.0.1:20160` Up），`-s tikv` 可正常跑通。
+
 ---
 
 ## 10. 附：代码规模
