@@ -15279,6 +15279,7 @@ fn mv_index_arms(
     condition: &MvCondition,
     conds: &[ExprNode],
     table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
 ) -> Option<(Vec<IndexMergePath>, Vec<ExprNode>)> {
     let mut prefix = Vec::new();
     let mut consumed = Vec::new();
@@ -15327,18 +15328,28 @@ fn mv_index_arms(
     }
     let key_len = super::access_range::index_key_part_count(info, index).unwrap_or(1);
     let index_columns = index_key_column_names(info, index);
+    // TiDB `stats:partial[idx:missing]`: an index created after the last
+    // ANALYZE has no statistics of its own, so its element ranges cannot be
+    // narrowed — each arm keeps the table row count and EXPLAIN names the
+    // index as the missing statistics.
+    let missing_stats = table_stats
+        .is_some_and(|stats| stats.index(index.name.o()).is_none() && stats.count > 0);
     let mut paths = Vec::with_capacity(condition.values.len());
     for value in &condition.values {
         let mut key = prefix.clone();
         key.push(value.clone());
         key.extend(suffix.iter().cloned());
         let range = sealdb_statistics::pseudo::KeyRange::point(key.clone());
-        let rows = sealdb_statistics::pseudo::index_key_ranges_rows(
-            table_rows,
-            std::slice::from_ref(&range),
-            key_len,
-            index.unique,
-        );
+        let rows = if missing_stats {
+            table_rows
+        } else {
+            sealdb_statistics::pseudo::index_key_ranges_rows(
+                table_rows,
+                std::slice::from_ref(&range),
+                key_len,
+                index.unique,
+            )
+        };
         // `ranges` keeps the single-datum form for cardinality/other consumers;
         // `seek` carries the full composite point key to the executor.
         let seek = key
@@ -15352,8 +15363,8 @@ fn mv_index_arms(
                 text: sealdb_statistics::pseudo::key_range_text(&range),
                 rows,
                 filter_rows: rows,
-                pseudo: true,
-                partial: None,
+                pseudo: !missing_stats,
+                partial: missing_stats.then(|| index.name.o().to_ascii_lowercase()),
                 keep_order: false,
             }),
             table_range: false,
@@ -15366,6 +15377,7 @@ fn mv_index_arms(
             residual_selection: ExprNode::compose_cnf(suffix_filters.clone()),
             ranges: vec![(Some((seek, true)), Some((seek_high, true)))],
             seek: Some(key.clone()),
+            table_scan_pseudo: false,
         });
     }
     Some((paths, consumed))
@@ -15545,6 +15557,7 @@ fn mv_union_item_arm(
     part: &MvIndexPart,
     conds: &[ExprNode],
     table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
 ) -> Option<(Vec<IndexMergePath>, Vec<ExprNode>)> {
     let conditions = mv_conditions(part, conds);
     let condition = conditions
@@ -15558,7 +15571,7 @@ fn mv_union_item_arm(
                 .iter()
                 .find(|condition| condition.kind == MvCondKind::Contains && condition.values.len() == 1)
         })?;
-    mv_index_arms(info, index, part, condition, conds, table_rows)
+    mv_index_arms(info, index, part, condition, conds, table_rows, table_stats)
 }
 
 /// TiDB rewrites a `JSON_CONTAINS` / `JSON_OVERLAPS` string candidate to a
@@ -15639,6 +15652,7 @@ fn mv_index_merge_plan(
     info: &sealdb_meta::TableInfo,
     index: &sealdb_meta::IndexInfo,
     table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
     shrink_equalities: bool,
     allow_fallback: bool,
 ) -> Option<PhysicalPlan> {
@@ -15692,7 +15706,7 @@ fn mv_index_merge_plan(
             let conds = item.split_cnf();
             let mut all_conds = conds.clone();
             all_conds.extend(outer.iter().cloned());
-            let mut built = mv_union_item_arm(info, index, &part, &all_conds, table_rows);
+            let mut built = mv_union_item_arm(info, index, &part, &all_conds, table_rows, table_stats);
             if built.is_none() && allow_fallback {
                 let all_indexes = IndexMergeHint {
                     indexes: Vec::new(),
@@ -15725,6 +15739,7 @@ fn mv_index_merge_plan(
                         residual_selection: None,
                         ranges: Vec::new(),
                         seek: None,
+                        table_scan_pseudo: table_stats.is_none(),
                     };
                     Some((vec![path], consumed))
                 });
@@ -15781,7 +15796,7 @@ fn mv_index_merge_plan(
         // One MVIndex predicate: `JSON_CONTAINS` intersects its element arms,
         // `MEMBER OF` / `JSON_OVERLAPS` union them.
         let condition = conditions.first()?;
-        let (paths, consumed) = mv_index_arms(info, index, &part, condition, &cnf, table_rows)?;
+        let (paths, consumed) = mv_index_arms(info, index, &part, condition, &cnf, table_rows, table_stats)?;
         let intersection = condition.kind == MvCondKind::Contains;
         for conjunct in &cnf {
             if consumed
@@ -16059,6 +16074,7 @@ fn mv_cnf_intersection_plan(
     candidates: &[&sealdb_meta::IndexInfo],
     cnf: &[ExprNode],
     table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
 ) -> Option<PhysicalPlan> {
     let mut paths = Vec::new();
     let mut consumed: Vec<ExprNode> = Vec::new();
@@ -16071,7 +16087,7 @@ fn mv_cnf_intersection_plan(
             for part in mv_index_parts(info, index) {
                 for condition in mv_conditions(&part, cnf) {
                     if let Some((mut arms, mut used)) =
-                        mv_index_arms(info, index, &part, &condition, cnf, table_rows)
+                        mv_index_arms(info, index, &part, &condition, cnf, table_rows, table_stats)
                     {
                         paths.append(&mut arms);
                         consumed.append(&mut used);
@@ -16125,6 +16141,7 @@ fn mv_multi_index_merge_plan(
     info: &sealdb_meta::TableInfo,
     candidates: &[&sealdb_meta::IndexInfo],
     table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
 ) -> Option<PhysicalPlan> {
     if std::env::var("SEALDB_DEBUG_MV").is_ok() {
         eprintln!("MV multi called sel={:?}", select.selection.is_some());
@@ -16135,7 +16152,7 @@ fn mv_multi_index_merge_plan(
         .iter()
         .position(|conjunct| conjunct.split_dnf().len() > 1)
     else {
-        return mv_cnf_intersection_plan(select, from, info, candidates, &cnf, table_rows);
+        return mv_cnf_intersection_plan(select, from, info, candidates, &cnf, table_rows, table_stats);
     };
     if std::env::var("SEALDB_DEBUG_MV").is_ok() {
         eprintln!("MV multi enter or_pos={or_pos} cnf={:?}", cnf.iter().map(|c| c.restore_string()).collect::<Vec<_>>());
@@ -16162,7 +16179,7 @@ fn mv_multi_index_merge_plan(
                     .into_iter()
                     .next()
                     .and_then(|part| {
-                        mv_union_item_arm(info, index, &part, &all_conds, table_rows)
+                        mv_union_item_arm(info, index, &part, &all_conds, table_rows, table_stats)
                     })
             } else if index.primary && info.pk_is_clustered() {
                 index_merge_handle_arm(info, &all_conds, table_rows)
@@ -16219,6 +16236,7 @@ fn mv_multi_index_merge_plan(
                     residual_selection: None,
                     ranges: Vec::new(),
                     seek: None,
+                    table_scan_pseudo: table_stats.is_none(),
                 };
                 Some((vec![path], consumed))
             });
@@ -16287,6 +16305,7 @@ fn find_mv_index_merge_plan(
     from: &TableName,
     info: &sealdb_meta::TableInfo,
     table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
     hint: Option<&IndexMergeHint>,
     shrink_equalities: bool,
 ) -> Option<PhysicalPlan> {
@@ -16302,7 +16321,7 @@ fn find_mv_index_merge_plan(
             .filter_map(|name| hint_index(info, name))
             .collect();
         if hinted.iter().any(|idx| index_is_multi_valued(info, idx))
-            && let Some(plan) = mv_multi_index_merge_plan(select, from, info, &hinted, table_rows)
+            && let Some(plan) = mv_multi_index_merge_plan(select, from, info, &hinted, table_rows, table_stats)
         {
             return Some(plan);
         }
@@ -16348,6 +16367,7 @@ fn find_mv_index_merge_plan(
                 info,
                 index,
                 table_rows,
+                table_stats,
                 shrink_equalities,
                 allow_fallback,
             ) {
@@ -16412,6 +16432,7 @@ fn index_merge_index_arm(
                 residual_selection: None,
                 ranges,
                 seek: None,
+                table_scan_pseudo: false,
             },
             vec![cond.clone()],
         ));
@@ -16432,23 +16453,28 @@ fn index_merge_index_arm(
             residual_selection: None,
             ranges: access.ranges,
             seek: None,
+            table_scan_pseudo: false,
         },
         access.consumed,
     ))
 }
 
-/// Column of a bare `col IS NULL` conjunct (positive form only).
+/// Column of a bare `col IS NULL` conjunct (positive form only). `isnull(col)`
+/// is the same memo expression to TiDB's ranger, so both spellings match.
 fn is_null_column(expr: &ExprNode) -> Option<&str> {
-    let ExprNode::IsNull(is_null) = expr else {
-        return None;
-    };
-    if is_null.not {
-        return None;
+    match expr {
+        ExprNode::IsNull(is_null) if !is_null.not => match is_null.expr.as_ref() {
+            ExprNode::Column(column) => Some(column.name.as_str()),
+            _ => None,
+        },
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("isnull") => {
+            match func.args.first()? {
+                ExprNode::Column(column) => Some(column.name.as_str()),
+                _ => None,
+            }
+        }
+        _ => None,
     }
-    let ExprNode::Column(column) = is_null.expr.as_ref() else {
-        return None;
-    };
-    Some(column.name.as_str())
 }
 
 /// One clustered-handle arm (`TableRangeScan` in EXPLAIN).
@@ -16525,6 +16551,7 @@ fn index_merge_handle_arm(
             residual_selection: None,
             ranges,
             seek: None,
+            table_scan_pseudo: false,
         },
         consumed,
     ))
@@ -17338,6 +17365,21 @@ fn conjunct_selectivity(
 /// TiDB index-merge access path: a union of DNF arms (OR) or an intersection of
 /// hinted indexes (AND), followed by a probe-side table lookup. The limit is
 /// embedded into the merge root when the order is not provided by the arms.
+/// The real statistics of `from`, or `None` when the table has never been
+/// analyzed (pseudo statistics).
+fn real_table_stats(
+    stats: Option<&Handle>,
+    from: &TableName,
+    current_db: &str,
+) -> Option<super::access_range::TableStats> {
+    stats
+        .and_then(|handle| {
+            let (db, table) = from.qualified(current_db);
+            handle.table(&db, &table)
+        })
+        .filter(super::plan_cost::has_real_stats)
+}
+
 fn index_merge_plan(
     select: &SelectStmt,
     from: &TableName,
@@ -17364,12 +17406,7 @@ fn index_merge_plan(
     }
     let selection = select.selection.as_ref()?;
     let table_rows = table_row_count(stats, from, current_db).max(1.0);
-    let table_stats = stats
-        .and_then(|handle| {
-            let (db, table) = from.qualified(current_db);
-            handle.table(&db, &table)
-        })
-        .filter(super::plan_cost::has_real_stats);
+    let table_stats = real_table_stats(stats, from, current_db);
     let cnf = selection.split_cnf();
     // Multi-index hinted merge with at least one MVIndex: a DNF item may seek
     // an ordinary index (`pk = 2`, `b = '2' and c = 20`) while another seeks a
@@ -17384,7 +17421,14 @@ fn index_merge_plan(
             .collect();
         if candidates.iter().any(|idx| index_is_multi_valued(info, idx))
             && let Some(plan) =
-                mv_multi_index_merge_plan(select, from, info, &candidates, table_rows)
+                mv_multi_index_merge_plan(
+                    select,
+                    from,
+                    info,
+                    &candidates,
+                    table_rows,
+                    table_stats.as_ref(),
+                )
         {
             return Some(plan);
         }
@@ -17394,7 +17438,15 @@ fn index_merge_plan(
     // IndexMerge (`planner/core/indexmerge_path`). Try them before the ordinary
     // union / intersection shapes.
     if let Some(plan) =
-        find_mv_index_merge_plan(select, from, info, table_rows, hinted.as_ref(), false)
+        find_mv_index_merge_plan(
+        select,
+        from,
+        info,
+        table_rows,
+        table_stats.as_ref(),
+        hinted.as_ref(),
+        false,
+    )
     {
         return Some(plan);
     }
@@ -32647,6 +32699,17 @@ fn access_plan_inner(
         let (db, table) = from.qualified(current_db);
         schema.table_by_name(&db, &table)
     }) {
+        if std::env::var("SEALDB_DEBUG_MV").is_ok() {
+            eprintln!(
+                "ACCESS table={} indices={:?} hcol={:?}",
+                info.name.o(),
+                info.indices
+                    .iter()
+                    .map(|i| (i.name.o().to_string(), i.primary))
+                    .collect::<Vec<_>>(),
+                info.handle_column().map(|c| c.name.o().to_string())
+            );
+        }
         // Estimates keep reading the invisible index's statistics (TiDB sizes
         // `c1 = 10` from the unique key even when `c1` is INVISIBLE); only the
         // access-path search is narrowed to the visible indexes.
@@ -32658,11 +32721,16 @@ fn access_plan_inner(
         let info = if info.indices.iter().all(|idx| index_visible(from, idx)) {
             info
         } else {
+            // The integer row handle of a `pk_is_handle` table is not an
+            // index path, so `FORCE INDEX` never hides it: `TableRangeScan`
+            // and the handle column stay available (`isnull(pk)` still names
+            // the row handle).
+            let keep_handle = |idx: &sealdb_meta::IndexInfo| idx.primary && info.pk_is_handle;
             visible_info = sealdb_meta::TableInfo {
                 indices: info
                     .indices
                     .iter()
-                    .filter(|idx| index_visible(from, idx))
+                    .filter(|idx| keep_handle(idx) || index_visible(from, idx))
                     .cloned()
                     .collect(),
                 ..info.clone()
@@ -32732,6 +32800,7 @@ fn access_plan_inner(
                             from,
                             info,
                             table_row_count(stats, from, current_db).max(1.0),
+                            real_table_stats(stats, from, current_db).as_ref(),
                             Some(&IndexMergeHint {
                                 indexes: vec![hint.clone()],
                                 disabled: false,
@@ -32779,6 +32848,7 @@ fn access_plan_inner(
                         info,
                         &candidates,
                         table_row_count(stats, from, current_db).max(1.0),
+                        real_table_stats(stats, from, current_db).as_ref(),
                     )
                 {
                     return plan;
@@ -32790,6 +32860,7 @@ fn access_plan_inner(
                     from,
                     info,
                     table_row_count(stats, from, current_db).max(1.0),
+                    real_table_stats(stats, from, current_db).as_ref(),
                     hinted.as_ref(),
                     false,
                 )

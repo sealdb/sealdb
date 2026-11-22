@@ -313,6 +313,16 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 3. 回到 R2 剩余 `cte` / `explain_cte` / `join_reorder*`。
 4. 按波次推进 R4–R7；TiFlash/MPP 维持 deferred。
 
+**备注（`planner/core/indexmerge_path` 归因，已用本地 TiDB v8.5.8 只读对拍确认）**
+
+- 归一化后剩余 88 行差异，集中在 5 类根因：
+  1. IndexMerge 之上的 root `Selection`（`handleRootTaskConds`）基数：基准取 `IndexMergeReader.StatsInfo()`（= 探针侧 `tablePlan` 统计），再乘 `cardinality.Selectivity(rootTaskConds)`；空探针过滤时基准就是 `TableRowIDScan` 基数（TiDB 实测 `json_overlaps` 单独出现 → `29.97 × 0.8 = 23.98`）。简单改成「表行数 × 全条件选择率」会破坏上述用例，已回滚。
+  2. `Selectivity` 需要**索引节点**能力：`b='2' and c>20` 在 `idx(b,c)` 上按 `getPseudoRowCountByIndexRanges` 计（`3333.33/100 = 33.33` → `0.003233`），而非两列范围相乘（`0.000333`）；这是 `6.41` 与 `6.40` 的分水岭。
+  3. `Selectivity` 需要**MV 索引节点**能力：`getMaskAndSelectivityForMVIndex` + `BuildPartialPaths4MVIndex` 给出 `CountAfterAccess/RealtimeCount`（例如 `2 member of (j->'$.d')` 在 `mvi3` 首个键是虚拟列时 → `0.001`，否则回退 `0.8`）；否则 DNF 独立性公式把 `0.8002` 算成 `0.96`（`8.00` vs `9.60`）。
+  4. 探针 `Selection` 基数：TiDB 用 `ScaleByExpectCnt(selectivity × totalRowCount)`（`33.73 × 1/1000 = 0.0337`），我们目前 `mv_probe_residual_rows` 在部分场景未收缩（`0.00` / `33.73`）。
+  5. 索引过滤条件（`splitIndexFilterConditions`）应挂到覆盖该列的 arm 上（`Selection(Build)`），而不是全部塞进探针 `Selection`；`mvi3/mvi4` 的 `not like` 分布差异即此。
+- 另外两处属计划形状差异（`IndexLookUp` vs `IndexMerge`、MV 合并之上的聚合/投影形态），需按金样逐条对齐。
+
 ---
 
 ## 10. 附：代码规模

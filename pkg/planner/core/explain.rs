@@ -6084,6 +6084,35 @@ fn emit_cop_children(
                 );
                 return true;
             }
+            // TiDB `stats:partial[idx:missing]`: an arm whose index (or key
+            // column) postdates the last ANALYZE has no statistics, so both the
+            // arm and the table probe that reads its row IDs say so.
+            let mut missing_stats: Vec<&str> = Vec::new();
+            for path in paths.iter() {
+                let Some(names) = path
+                    .range
+                    .as_ref()
+                    .and_then(|range| range.partial.as_deref())
+                else {
+                    continue;
+                };
+                for name in names.split(',') {
+                    let name = name.trim();
+                    if !name.is_empty()
+                        && !missing_stats
+                            .iter()
+                            .any(|have| have.eq_ignore_ascii_case(name))
+                    {
+                        missing_stats.push(name);
+                    }
+                }
+            }
+            let partial_info = (!missing_stats.is_empty()).then(|| {
+                format!(
+                    ", stats:partial[{}:missing]",
+                    missing_stats.join(":missing, ")
+                )
+            });
             for path in paths {
                 let arm_est = path.range.as_ref().map_or_else(
                     || {
@@ -6118,8 +6147,10 @@ fn emit_cop_children(
                         if path.keep_order { "true" } else { "false" }
                     ),
                 };
-                if path.range.as_ref().is_some_and(|range| range.pseudo) {
+                if path.range.as_ref().is_some_and(|range| range.pseudo) || path.table_scan_pseudo {
                     info.push_str(", stats:pseudo");
+                } else if let Some(partial) = &partial_info {
+                    info.push_str(partial);
                 }
                 let scan = if path.table_range {
                     if path.range.is_none() && path.index.is_empty() && path.ranges.is_empty() {
@@ -6285,6 +6316,8 @@ fn emit_cop_children(
                 .any(|path| path.range.as_ref().is_some_and(|range| range.pseudo))
             {
                 "keep order:false, stats:pseudo".to_string()
+            } else if let Some(partial) = &partial_info {
+                format!("keep order:false{partial}")
             } else {
                 "keep order:false".to_string()
             };

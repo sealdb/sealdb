@@ -518,23 +518,31 @@ pub fn index_access_range(
             high: high.clone(),
         })
         .collect();
-    let (rows, pseudo_scan) = match table_stats.and_then(|stats| {
-        stats
-            .index_range_estimate(index.name.o(), &column_info.field_type, &stat_ranges)
-            .map(|rows| rows.max(0.0))
-    }) {
-        Some(rows) => (rows, false),
-        // ANALYZE fills column histograms only, so a plain index range falls
-        // back to its key column's histogram (TiDB's index stats mirror it).
-        None => match table_stats.and_then(|stats| {
-            stats.column_range_estimate(
-                &stats_column,
-                sealdb_statistics::kind_of(&column_info.field_type),
-                &stat_ranges,
-            )
+    let (rows, pseudo_scan) = match table_stats {
+        // An index created after the last ANALYZE has no statistics of its own,
+        // so TiDB cannot narrow the range: the arm keeps the table row count and
+        // the scan is marked `stats:partial[idx:missing]`.
+        Some(stats) if stats.index(index.name.o()).is_none() && stats.count > 0 => {
+            (table_rows, false)
+        }
+        _ => match table_stats.and_then(|stats| {
+            stats
+                .index_range_estimate(index.name.o(), &column_info.field_type, &stat_ranges)
+                .map(|rows| rows.max(0.0))
         }) {
             Some(rows) => (rows, false),
-            None => (rows, true),
+            // ANALYZE fills column histograms only, so a plain index range falls
+            // back to its key column's histogram (TiDB's index stats mirror it).
+            None => match table_stats.and_then(|stats| {
+                stats.column_range_estimate(
+                    &stats_column,
+                    sealdb_statistics::kind_of(&column_info.field_type),
+                    &stat_ranges,
+                )
+            }) {
+                Some(rows) => (rows, false),
+                None => (rows, true),
+            },
         },
     };
     // TiDB `stats:partial[…]`: the index histogram is present but the column
@@ -542,6 +550,10 @@ pub fn index_access_range(
     // generated column behind an expression key part is reported through the
     // index statistics instead, never as a missing column.
     let partial_columns = table_stats.and_then(|stats| {
+        // A missing index entry names the index (`stats:partial[ibb:missing]`).
+        if stats.index(index.name.o()).is_none() && stats.count > 0 {
+            return Some(index.name.o().to_ascii_lowercase());
+        }
         if hidden.is_some() || stats.column(&stats_column).is_some() {
             return None;
         }

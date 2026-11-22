@@ -119,6 +119,11 @@ pub struct IndexMergePath {
     /// `[c = 1, element = 4, b = "x"]`). `None` falls back to `ranges`.
     #[serde(skip)]
     pub seek: Option<Vec<sealdb_types::Datum>>,
+    /// A full-table-scan arm of an unanalyzed table: EXPLAIN marks its
+    /// `TableFullScan` with `stats:pseudo` (TiDB `PhysicalTableScan` with
+    /// pseudo statistics and no table ranges).
+    #[serde(skip)]
+    pub table_scan_pseudo: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
