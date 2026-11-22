@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 127,
-      "pending": 109,
+      "green": 128,
+      "pending": 108,
       "in_progress": 8,
       "deferred": 2,
       "local": 8
@@ -2432,7 +2432,7 @@
     {
       "name": "statistics/overflow_calc",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/statistics/overflow_calc.test",
       "result": "r/statistics/overflow_calc.result",
       "has_result": true,

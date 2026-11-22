@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-22（green 127 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-23（green 128 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -27,7 +27,7 @@
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` / `executor/point_get` / `executor/batch_point_get` / `explain_shard_index` / `explain_easy_stats` green；9 套件 `in_progress` |
-| R4–R7 | plan_cache / session / ddl / CBO | `pending` | R6 `ddl/affinity` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/fail_db` / `infoschema/v2` green；R7 `planner/cardinality/trace` / `util/admin` / globalindex 若干 green；其余依赖前波 |
+| R4–R7 | plan_cache / session / ddl / CBO | `pending` | R6 `ddl/affinity` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/fail_db` / `infoschema/v2` / `statistics/overflow_calc` green；R7 `planner/cardinality/trace` / `util/admin` / globalindex 若干 green；其余依赖前波 |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
 实现纪律：[parity-discipline.md](./parity-discipline.md) — 失败用例 → TiDB 同名包/文件 → SealDB 同路径一比一；生产级清单勾满才升 `green`；禁止改权威 `r/*.result`。
@@ -4923,3 +4923,40 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   第 5 类牵动臂 residual 下沉规则；按第 1→2→3 顺序拆分提交。
 - **下一步**: 先做 `stats:partial[…:missing]`（`ALTER ADD INDEX` 后的新索引 + 合并
   估 1.00），它同时惠及 `explain_complex*` 的 partial 渲染。
+
+### 2026-11-23 — `statistics/overflow_calc` 转绿（green 128）
+
+- **Phase**: R6 统计默认值对齐 + 聚簇句柄有序右连接
+- **根因**（三处，顺序即调试顺序）:
+  1. `Table::DEFAULT_HIST_BUCKETS = 8`（TiDB v2 `analyzeOptionDefaultV2` 为
+     `256`、`DEFAULT_TOPN = 100`）：`ANALYZE` 后直方图桶数太少，
+     `EXPLAIN` 的 `estRows` 与金样差一个数量级。
+  2. TiDB v2 `ANALYZE` 会分析全部索引，SealDB 普通索引只靠列直方图，
+     `EXPLAIN` 因此对「已分析过」的普通索引误报 `stats:partial[idx:missing]`；
+     实际金样只有「从未 ANALYZE 的索引」才出现该标记。
+  3. `SELECT t1.col1, t2.col1 FROM lrr_test t1 RIGHT JOIN lrr_test t2 ON
+     t1.col1 = t2.col1 WHERE t1.col1 >= 0`：`t1.col1 >= 0` 对 `t1` 为
+     null-reject，右外连接退化为内连接，两侧都在聚簇主键 `col1` 上以同一区间
+     `[0, +inf]` seek，TiDB 选 `MergeJoin` + 两个有序 `TableRangeScan`。
+- **完成**:
+  - `pkg/statistics/table.rs`：`DEFAULT_HIST_BUCKETS` → `256`、
+    `DEFAULT_TOPN` → `100`；`IndexStats` 新增 `placeholder: bool`。
+  - `pkg/executor/analyze.rs`：`collect_index_stats` 为「被分析但无独立索引
+    统计」的普通索引登记 `placeholder`；`pkg/statistics/handle/mod.rs` 的
+    `PersistIndex` 持久化该位，`pkg/statistics/json.rs` 反序列化置 `false`。
+  - `pkg/infoschema/tables.rs`：`stats_histograms` / `stats_buckets` /
+    `stats_top_n` 过滤 `placeholder` 行，金样里不多出索引行。
+  - `pkg/planner/core/planbuilder.rs`：新增 `single_clustered_key` +
+    `build_ordered_handle_right_join`，识别「单列聚簇键 join + WHERE 对两侧
+    同一聚簇键 null-reject」→ `MergeJoin` over 两个
+    `TableRangeScan(range:[c,+inf], keep order:true)`。
+- **验证**:
+  - `… -t statistics/overflow_calc`：memory → PASS；tikv → PASS。
+  - 全量 memory gate：`PASS: memory=135 skipped=119`（128 green + 8 local）。
+  - 全量 TiKV gate：`PASS: tikv=133 skipped=121`（无回归）。
+  - manifest：`statistics/overflow_calc` → `green`。
+- **下一步**:
+  - R6 剩余 pending（`ddl/db`、`ddl/constraint`、`ddl/integration`、
+    `infoschema/tables`、`statistics/handle`）与 R3
+    `planner/core/indexmerge_path`（第 1 类 `stats:partial[…:missing]` 现在
+    可以直接复用本轮的占位索引机制）。

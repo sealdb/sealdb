@@ -207,6 +207,14 @@ pub struct IndexStats {
     /// from the sum so the same rows are not counted twice).
     #[serde(default)]
     pub stats_ver: u64,
+    /// The index existed when the table was last ANALYZE'd, but SealDB keeps
+    /// plain-key estimates on the key column's histogram instead of collecting
+    /// index statistics (TiDB's version 2 `AnalyzeIndex` would have filled
+    /// them). The entry only records that the index is not *missing* from the
+    /// statistics: EXPLAIN must not mark its scans `stats:partial[idx:missing]`,
+    /// and it must stay invisible to `mysql.stats_histograms`.
+    #[serde(default)]
+    pub placeholder: bool,
 }
 
 impl IndexStats {
@@ -412,8 +420,10 @@ pub struct Table {
 
 impl Table {
     pub const PSEUDO_ROW_COUNT: u64 = 10_000;
-    pub const DEFAULT_HIST_BUCKETS: usize = 8;
-    pub const DEFAULT_TOPN: usize = 10;
+    /// TiDB `analyzeOptionDefaultV2`: 256 buckets and TopN 100. Both values
+    /// feed range estimation (`lessRowCount`) and the `mysql.stats_*` tables.
+    pub const DEFAULT_HIST_BUCKETS: usize = 256;
+    pub const DEFAULT_TOPN: usize = 100;
     /// Exact per-value counts are retained up to this many distinct values.
     pub const MAX_VALUE_COUNTS: usize = 10_000;
     /// TiDB `AutoAnalyzeMinCnt` default is 1000; SealDB keeps no floor so

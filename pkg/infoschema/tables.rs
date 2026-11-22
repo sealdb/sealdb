@@ -1467,7 +1467,16 @@ fn stats_histograms(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                 Datum::I64(0),
             ]);
         }
-        for (pos, (_, index)) in stats.indices.iter().enumerate() {
+        // A plain index analyzed by SealDB has no index histogram of its own
+        // (`IndexStats::placeholder`): TiDB's `mysql.stats_histograms` row
+        // mirrors the key column, which SealDB already reports as that column.
+        // Placeholders are skipped without consuming a `hist_id` slot.
+        for (pos, (_, index)) in stats
+            .indices
+            .iter()
+            .filter(|(_, index)| !index.placeholder)
+            .enumerate()
+        {
             rows.push(vec![
                 Datum::I64(id),
                 Datum::I64(1),
@@ -1521,7 +1530,12 @@ fn stats_buckets(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                 ]);
             }
         }
-        for (pos, (_, index)) in stats.indices.iter().enumerate() {
+        for (pos, (_, index)) in stats
+            .indices
+            .iter()
+            .filter(|(_, index)| !index.placeholder)
+            .enumerate()
+        {
             let Some(histogram) = index.histogram.as_ref() else {
                 continue;
             };
@@ -1567,7 +1581,12 @@ fn stats_top_n(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                 ]);
             }
         }
-        for (pos, (_, index)) in stats.indices.iter().enumerate() {
+        for (pos, (_, index)) in stats
+            .indices
+            .iter()
+            .filter(|(_, index)| !index.placeholder)
+            .enumerate()
+        {
             for (value, count) in &index.topn {
                 rows.push(vec![
                     Datum::I64(id),

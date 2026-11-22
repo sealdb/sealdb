@@ -202,6 +202,7 @@ impl Handle {
                         topn: idx.topn.clone(),
                         cm_sketch: idx.cm_sketch.clone(),
                         stats_ver: idx.stats_ver,
+                        placeholder: idx.placeholder,
                     })
                     .collect(),
                 columns: stats
@@ -303,6 +304,7 @@ impl Handle {
                             topn: i.topn,
                             cm_sketch: i.cm_sketch,
                             stats_ver: i.stats_ver,
+                            placeholder: i.placeholder,
                         },
                     )
                 })
@@ -368,6 +370,9 @@ struct PersistIndex {
     cm_sketch: Option<crate::cmsketch::CmSketch>,
     #[serde(default)]
     stats_ver: u64,
+    /// The index existed at ANALYZE time (see `IndexStats::placeholder`).
+    #[serde(default)]
+    placeholder: bool,
 }
 
 #[derive(Serialize, Deserialize)]

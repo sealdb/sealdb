@@ -2071,6 +2071,11 @@ impl PlanBuilder {
         {
             return Ok(plan);
         }
+        if let Some(plan) =
+            self.build_ordered_handle_right_join(select, is, current_db, stats, prune_mode)?
+        {
+            return Ok(plan);
+        }
         if let Some(plan) = self.build_ordered_right_join(select, is, current_db, stats)? {
             return Ok(plan);
         }
@@ -2609,6 +2614,179 @@ impl PlanBuilder {
         Ok(Some(wrap_star_join_projection(
             plan, select, is, current_db,
         )))
+    }
+
+    /// `A RIGHT JOIN B ON A.k = B.k WHERE A.k >= c` where `k` is the
+    /// single-column clustered key of *both* tables. The WHERE null-rejects the
+    /// inner side, so the join is an inner join; the range then bounds both key
+    /// columns through the equijoin, which lets each table read an ordered
+    /// handle range. TiDB prices that as a `MergeJoin` over two
+    /// `TableRangeScan`s (`range:[c,+inf], keep order:true`) instead of building
+    /// a hash table.
+    fn build_ordered_handle_right_join(
+        &self,
+        select: &SelectStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<Option<PhysicalPlan>> {
+        // A `MergeJoin` executes as a hash join, so its inputs' key order only
+        // exists in EXPLAIN: a real `ORDER BY` still needs its `Sort`.
+        if select.joins.len() != 1 || !select.order_by.is_empty() {
+            return Ok(None);
+        }
+        let join = &select.joins[0];
+        if !matches!(join.tp, AstJoinType::RightOuter) || !join.using_cols.is_empty() {
+            return Ok(None);
+        }
+        let Some(from) = select.from.as_ref() else {
+            return Ok(None);
+        };
+        if !from.use_indexes.is_empty() || !from.partition_names.is_empty() {
+            return Ok(None);
+        }
+        let (Some(is), Some(selection)) = (is, select.selection.as_ref()) else {
+            return Ok(None);
+        };
+        let (left_db, left_name) = join.left.qualified(current_db);
+        let (right_db, right_name) = join.right.qualified(current_db);
+        let (Some(left_info), Some(right_info)) = (
+            is.table_by_name(&left_db, &left_name),
+            is.table_by_name(&right_db, &right_name),
+        ) else {
+            return Ok(None);
+        };
+        // Multi-partition reads do not return one globally ordered stream.
+        if left_info.partition.is_some() || right_info.partition.is_some() {
+            return Ok(None);
+        }
+        let Some((left_col, right_col)) = join_key_columns(left_info, right_info, &join.on) else {
+            return Ok(None);
+        };
+        let (Some(left_key), Some(right_key)) =
+            (single_clustered_key(left_info), single_clustered_key(right_info))
+        else {
+            return Ok(None);
+        };
+        if !left_col.eq_ignore_ascii_case(&left_key) || !right_col.eq_ignore_ascii_case(&right_key)
+        {
+            return Ok(None);
+        }
+        // A secondary index led by the key is an alternative access path TiDB
+        // would price first; leave the choice to the generic planner.
+        for (info, table, column) in [
+            (left_info, &join.left, &left_key),
+            (right_info, &join.right, &right_key),
+        ] {
+            if info.find_index_covering(column).is_some_and(|index| {
+                !index.primary
+                    && index_allowed(table, index.name.o(), None)
+                    && !index_is_multi_valued(info, index)
+            }) {
+                return Ok(None);
+            }
+        }
+        let Some(left_key_col) = left_info
+            .columns
+            .iter()
+            .find(|column| column.name.o().eq_ignore_ascii_case(&left_key))
+        else {
+            return Ok(None);
+        };
+        let Some(right_key_col) = right_info
+            .columns
+            .iter()
+            .find(|column| column.name.o().eq_ignore_ascii_case(&right_key))
+        else {
+            return Ok(None);
+        };
+        // Every WHERE conjunct must bound the inner key, and the mirrored copy
+        // must bound the preserved key, so both sides read one handle range.
+        if handle_scan_range(selection, left_key_col).is_none() {
+            return Ok(None);
+        }
+        let Some(mirrored) = selection
+            .split_cnf()
+            .into_iter()
+            .map(|conjunct| {
+                mirror_filter_through_keys(
+                    &conjunct,
+                    &[(left_key.clone(), right_key.clone())],
+                    &join.left,
+                    &join.right,
+                    true,
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some(mirrored_selection) = ExprNode::compose_cnf(mirrored) else {
+            return Ok(None);
+        };
+        if handle_scan_range(&mirrored_selection, right_key_col).is_none() {
+            return Ok(None);
+        }
+        let left = self.join_side(select, &join.left, Some(is), current_db, stats, prune_mode)?;
+        let mut right_select = select.clone();
+        right_select.selection = Some(mirrored_selection.clone());
+        let right = self.join_side(
+            &right_select,
+            &join.right,
+            Some(is),
+            current_db,
+            stats,
+            prune_mode,
+        )?;
+        // Another access path (point get, index range) won for a side: this
+        // ordered shape does not apply.
+        if !matches!(
+            left,
+            PhysicalPlan::TableReader {
+                range_scan: Some(_),
+                ..
+            }
+        ) || !matches!(
+            right,
+            PhysicalPlan::TableReader {
+                range_scan: Some(_),
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
+        let (Some(left_rows), Some(right_rows)) = (
+            clustered_range_rows(&join.left, left_info, stats, current_db, selection),
+            clustered_range_rows(&join.right, right_info, stats, current_db, &mirrored_selection),
+        ) else {
+            return Ok(None);
+        };
+        // Each join key is the side's clustered key (unique, NOT NULL), so an
+        // equality keeps at most one row per input: the join reads the smaller
+        // input's row count.
+        let est = left_rows.min(right_rows);
+        let (left_key_label, right_key_label) = merge_join_key_labels_for(
+            select,
+            current_db,
+            &join.left,
+            &join.right,
+            &join.on,
+            &[],
+            Some(is),
+        );
+        Ok(Some(PhysicalPlan::MergeJoin {
+            est_rows: Some(est),
+            left: Box::new(left),
+            right: Box::new(right),
+            left_table: join.left.name.clone(),
+            right_table: join.right.name.clone(),
+            left_key: left_key_label,
+            right_key: right_key_label,
+            tp: JoinType::Inner,
+            info: None,
+            on: join.on.clone(),
+        }))
     }
 
     /// `A RIGHT JOIN B ON A.k = B.k` where both sides can read their join key in
@@ -4368,6 +4546,20 @@ fn merge_join_key_pairs(
 /// The single cross-side equality of a two-table `ON`, resolved by column
 /// membership. The `ON` reaches the planner before binding qualifies columns,
 /// so `merge_join_key_pairs` (which matches on `col.table`) sees nothing here.
+/// The name of a table's single-column clustered key (integer handle or common
+/// handle); a composite key has no single column that orders the whole scan.
+fn single_clustered_key(info: &sealdb_meta::model::table::TableInfo) -> Option<String> {
+    if !(info.pk_is_handle || info.common_handle) {
+        return None;
+    }
+    let pk = info.indices.iter().find(|index| index.primary)?;
+    if pk.columns.len() != 1 || pk.columns[0].length >= 0 {
+        return None;
+    }
+    info.clustered_prefix_column()
+        .map(|column| column.name.o().to_string())
+}
+
 fn join_key_columns(
     left: &sealdb_meta::model::table::TableInfo,
     right: &sealdb_meta::model::table::TableInfo,

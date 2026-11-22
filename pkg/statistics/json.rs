@@ -168,6 +168,7 @@ fn index_from_json(idx: &Value) -> Result<IndexStats> {
         topn,
         cm_sketch,
         stats_ver,
+        placeholder: false,
     })
 }
 

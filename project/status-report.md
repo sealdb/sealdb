@@ -1,6 +1,6 @@
 # 整体进展报告（Status Report）
 
-> 生成时间：2026-11-22 21:20 (+08:00)
+> 生成时间：2026-11-23 01:30 (+08:00)
 > 事实来源：`project/regression/manifest.json`（suite 状态）、`project/parity/status.json`（包级对齐）、`git log`
 > 规范：[testing.md](./testing.md) · [parity-discipline.md](./parity-discipline.md) · [progress.md](./progress.md)
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **127 个** 登记为 `green`（R1 4 / R2 16 / R3 32 / R5 4 / R6 19 / R7 52）。本轮新增 `explain_indexmerge_stats` 转绿：`utf8mb4_0900_ai_ci` 索引键的 UCA 排序键（ranger 区间按权重字节渲染）、IndexMerge 下 cop `TopN` 只在索引键覆盖排序列时下沉到臂、否则落在 merge 的 probe 侧，以及 merge 估算归零时根 `TopN` 保留 limit 上界。此前一轮新增 `ddl/db_partition`：LIST/LIST COLUMNS 字面量与日期归一、RANGE COLUMNS 尾列类型强制、1526/1654 错误码分流、RANGE REORGANIZE PARTITION 行迁移与 `_tidb_rowid` 冲突重分配，以及 PREPARE 中 `\n` 转义与 INTERVAL RANGE 语句。R1 已收口，R2 完成 16/22，R3 完成 32/48，R7 完成 52/110；架构侧仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **128 个** 登记为 `green`（R1 4 / R2 16 / R3 32 / R5 4 / R6 20 / R7 52）。本轮新增 `statistics/overflow_calc` 转绿：统计默认值对齐 TiDB v2 analyze（256 桶 / TopN 100），ANALYZE 为普通索引登记占位统计（不再误报 `stats:partial[idx:missing]`），并新增「RIGHT JOIN 两侧聚簇键区间 → 有序 `TableRangeScan` + `MergeJoin`」的计划选择。上一轮新增 `explain_indexmerge_stats` 转绿：`utf8mb4_0900_ai_ci` 索引键的 UCA 排序键（ranger 区间按权重字节渲染）、IndexMerge 下 cop `TopN` 只在索引键覆盖排序列时下沉到臂、否则落在 merge 的 probe 侧，以及 merge 估算归零时根 `TopN` 保留 limit 上界。此前一轮新增 `ddl/db_partition`：LIST/LIST COLUMNS 字面量与日期归一、RANGE COLUMNS 尾列类型强制、1526/1654 错误码分流、RANGE REORGANIZE PARTITION 行迁移与 `_tidb_rowid` 冲突重分配，以及 PREPARE 中 `\n` 转义与 INTERVAL RANGE 语句。R1 已收口，R2 完成 16/22，R3 完成 32/48，R7 完成 52/110；架构侧仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -22,9 +22,9 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **127 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 127 | 50.0% |
+| `green` | 128 | 50.4% |
 | `in_progress` | 8 | 3.1% |
-| `pending` | 109 | 42.9% |
+| `pending` | 108 | 42.5% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
 
@@ -39,14 +39,14 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **127 个** �
 | R3（point_get / index / partition / explain*） | 32 | 3 | 13 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 4 | 0 | 8 | `session/txn` / `db_integration` / `session/variable` 已绿 |
-| R6 | 19 | 0 | 16 | DDL / infoschema 起步 |
+| R6 | 20 | 0 | 15 | DDL / infoschema 起步 |
 | R7 | 52 | 0 | 58 | 零散长尾 |
 | D（TiFlash/MPP） | 0 | 0 | 2 | deferred |
 | local | — | — | — | 9 套冒烟 |
 
 ---
 
-## 3. 已绿 suite 清单（127）
+## 3. 已绿 suite 清单（128）
 
 | Wave | Suite |
 |---|---|
@@ -54,7 +54,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **127 个** �
 | R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_push_down`, `topn_pushdown`, `window_function` |
 | R3 | `access_path_selection`, `clustered_index`, `ddl/db_partition`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/explain`, `executor/explainfor`, `executor/index_lookup_pushdown_partition`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy`, `explain_easy_stats`, `explain_foreign_key`, `explain_generate_column_substitute`, `explain_indexmerge_stats`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `expression/explain`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `globalindex/point_get`, `partition`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
 | R5 | `session/txn`, `session/variable`, `db_integration`, `session/bootstrap_upgrade` |
-| R6 | `ddl/affinity`, `ddl/attributes_sql`, `ddl/column`, `ddl/column_change`, `ddl/column_modify`, `ddl/column_type_change`, `ddl/db_cache`, `ddl/db_change`, `ddl/db_foreign_key`, `ddl/db_rename`, `ddl/ddl_error`, `ddl/fail_db`, `ddl/index_modify`, `ddl/resource_group`, `ddl/table_modify`, `infoschema/cluster_tables`, `infoschema/v2`, `statistics/integration`, `statistics/lock_table_stats` |
+| R6 | `ddl/affinity`, `ddl/attributes_sql`, `ddl/column`, `ddl/column_change`, `ddl/column_modify`, `ddl/column_type_change`, `ddl/db_cache`, `ddl/db_change`, `ddl/db_foreign_key`, `ddl/db_rename`, `ddl/ddl_error`, `ddl/fail_db`, `ddl/index_modify`, `ddl/resource_group`, `ddl/table_modify`, `infoschema/cluster_tables`, `infoschema/v2`, `statistics/integration`, `statistics/lock_table_stats`, `statistics/overflow_calc` |
 | R7 | `black_list`, `bindinfo/bind`, `bindinfo/session_handle`, `bindinfo/temptable`, `executor/adapter`, `executor/charset`, `executor/ddl`, `executor/distsql`, `executor/executor_txn`, `executor/index_advise`, `executor/index_lookup_join`, `executor/index_lookup_merge_join`, `executor/index_lookup_pushdown`, `executor/stale_txn`, `expression/enum_set`, `expression/format`, `expression/time`, `expression/vitess_hash`, `globalindex/expression_index`, `globalindex/information_schema`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `planner/core/casetest/index/partialindex`, `planner/core/memtable_predicate_extractor`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `sessiontxn/externals`, `table/cache`, `table/tables`, `table/temptable`, `util/admin`, `sessionctx/setvar`, `planner/core/indexjoin`, `planner/core/indexmerge_intersection`, `executor/compact_table`, `expression/constant_fold`, `executor/kv`, `planner/core/rule_result_reorder`, `table/index`, `executor/rowid`, `executor/analyze`, `executor/delete`, `executor/update`, `executor/insert`, `expression/cast`, `expression/noop_functions`, `planner/core/casetest/expression_rewriter`, `expression/misc` |
 
 **复验证据**
@@ -84,8 +84,12 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **127 个** �
 → PASS: tikv=1
 ./tests/integrationtest/run-tests.sh -s memory -t explain_indexmerge_stats
 → PASS: memory=1
+./tests/integrationtest/run-tests.sh -s memory --status green,pending -t statistics/overflow_calc
+→ PASS: memory=1
+./tests/integrationtest/run-tests.sh -s tikv -k -t statistics/overflow_calc
+→ PASS: tikv=1
 ./tests/integrationtest/run-tests.sh -s memory
-→ PASS: memory=135 skipped=119（127 green + 8 local）
+→ PASS: memory=135 skipped=119（128 green + 8 local）
 ./tests/integrationtest/run-tests.sh -s tikv -k
 → PASS: tikv=133 skipped=121
 ```
@@ -472,7 +476,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 11 | `session/variable` | green | 100% | ✓ | — |
 | 12 | `session/vars` | pending | 0% | ✓ | — |
 
-### R6（35 套，green 19）
+### R6（35 套，green 20）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
@@ -510,7 +514,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 32 | `statistics/handle` | pending | 0% | ✓ | — |
 | 33 | `statistics/integration` | green | 100% | ✓ | ✓ |
 | 34 | `statistics/lock_table_stats` | green | 100% | ✓ | ✓ |
-| 35 | `statistics/overflow_calc` | pending | 0% | ✓ | — |
+| 35 | `statistics/overflow_calc` | green | 100% | ✓ | ✓ |
 
 ### R7（110 套，green 48）
 

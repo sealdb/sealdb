@@ -422,6 +422,26 @@ fn collect_index_stats(
             parts.push(pos);
         }
         if !expression || parts.len() != index.columns.len() || rows.is_empty() {
+            // TiDB's version 2 analyze collects statistics for every index, so
+            // an index that existed at ANALYZE time is never missing, even when
+            // the table (or an expression key) holds no row. SealDB keeps plain
+            // index estimates on the key column's histogram; the placeholder
+            // entry only records the index is not missing (see
+            // `IndexStats::placeholder`).
+            if !skip_multi_valued && (rows.is_empty() || parts.len() == index.columns.len()) {
+                out.push((
+                    index.name.o().to_string(),
+                    IndexStats {
+                        ndv: 0,
+                        null_count: 0,
+                        histogram: None,
+                        topn: Vec::new(),
+                        cm_sketch: None,
+                        stats_ver: 2,
+                        placeholder: true,
+                    },
+                ));
+            }
             continue;
         }
         let mut freq: HashMap<Vec<u8>, u64> = HashMap::new();
@@ -486,6 +506,7 @@ fn collect_index_stats(
                 // Version 2 keeps the TopN rows out of the histogram, matching
                 // `IndexStats::total_row_count`.
                 stats_ver: 2,
+                placeholder: false,
             },
         ));
     }
