@@ -6661,12 +6661,71 @@ fn extract_user_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
 /// `SHUTDOWN`, `ALTER DATABASE … CHARSET`, leftover allowlist ops (OPTIMIZE /
 /// REPAIR / RENAME USER / BINLOG / CHANGE / ALTER INSTANCE / LOCK TABLES with
 /// schema-qualified names / ADMIN CLEANUP).
+/// End of the comment or quoted literal starting at `i`, or `None` when `i` is
+/// ordinary SQL text.
+///
+/// The misc-statement scanner below looks for keywords anywhere in the text, so
+/// it must not read them out of comments or literals: an
+/// `explain select …; -- can't optimize, projection has column function`
+/// comment used to dispatch to `parse_optimize_table` and fail with
+/// `OPTIMIZE without TABLE`.
+fn skip_comment_or_literal(bytes: &[u8], i: usize) -> Option<usize> {
+    let end_of_line = |mut j: usize| {
+        while j < bytes.len() && bytes[j] != b'\n' {
+            j += 1;
+        }
+        j
+    };
+    match bytes[i] {
+        b'#' => return Some(end_of_line(i + 1)),
+        b'-' if bytes.get(i + 1) == Some(&b'-')
+            && bytes
+                .get(i + 2)
+                .is_none_or(|b| b.is_ascii_whitespace() || b.is_ascii_control()) =>
+        {
+            return Some(end_of_line(i + 2));
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            let mut j = i + 2;
+            while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                j += 1;
+            }
+            return Some((j + 2).min(bytes.len()));
+        }
+        b'\'' | b'"' | b'`' => {
+            let quote = bytes[i];
+            let mut j = i + 1;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'\\' if quote != b'`' => j += 2,
+                    b if b == quote => {
+                        // `''` inside a string is an escaped quote.
+                        if quote != b'`' && bytes.get(j + 1) == Some(&quote) {
+                            j += 2;
+                            continue;
+                        }
+                        return Some(j + 1);
+                    }
+                    _ => j += 1,
+                }
+            }
+            return Some(bytes.len());
+        }
+        _ => None,
+    }
+}
+
 fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut ops = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        if let Some(next) = skip_comment_or_literal(bytes, i) {
+            out.push_str(&sql[i..next]);
+            i = next;
+            continue;
+        }
         if keyword_at(bytes, i, "DO") {
             let (stmt, end) = parse_do_stmt(bytes, i + "DO".len())?;
             out.push_str("SET NAMES '__sealdb_misc__'");
