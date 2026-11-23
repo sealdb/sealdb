@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 130,
-      "pending": 106,
+      "green": 131,
+      "pending": 105,
       "in_progress": 8,
       "deferred": 2,
       "local": 8
@@ -2252,7 +2252,7 @@
     {
       "name": "privilege/privileges",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/privilege/privileges.test",
       "result": "r/privilege/privileges.result",
       "has_result": true,

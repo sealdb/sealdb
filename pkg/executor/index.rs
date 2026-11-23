@@ -54,7 +54,8 @@ fn mv_element_type(info: &TableInfo, index: &IndexInfo, pos: usize) -> Option<Mv
         MvElementType::Datetime
     } else if base.starts_with("time") {
         MvElementType::Time
-    } else if base.starts_with("char") || base.starts_with("varchar") || base.starts_with("binary") {
+    } else if base.starts_with("char") || base.starts_with("varchar") || base.starts_with("binary")
+    {
         MvElementType::Char
     } else {
         return None;
@@ -85,9 +86,7 @@ fn mv_element_datum(ty: MvElementType, text: &str) -> Option<Datum> {
         MvElementType::Decimal => Datum::Decimal(sealdb_types::MyDecimal::parse(text).ok()?),
         MvElementType::Char => Datum::Bytes(text.as_bytes().to_vec()),
         MvElementType::Date => Datum::Time(sealdb_types::parse_date_literal(text).ok()?),
-        MvElementType::Datetime => {
-            Datum::Time(sealdb_types::parse_datetime_literal(text).ok()?)
-        }
+        MvElementType::Datetime => Datum::Time(sealdb_types::parse_datetime_literal(text).ok()?),
         MvElementType::Time => {
             let mut time = sealdb_types::parse_datetime_literal(text).ok()?;
             time.tp = sealdb_types::TimeType::Time;

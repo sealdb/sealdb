@@ -19,19 +19,83 @@ impl PrivilegeType {
     /// `CREATE VIEW`: required to create or replace a VIEW (TiDB
     /// `mysql.CreateViewPriv`).
     pub const CREATE_VIEW: Self = Self(1 << 7);
-    pub const ALL: Self = Self(
-        Self::SELECT.0
-            | Self::INSERT.0
-            | Self::UPDATE.0
-            | Self::DELETE.0
-            | Self::CREATE.0
-            | Self::DROP.0
-            | Self::SHOW_VIEW.0
-            | Self::CREATE_VIEW.0,
-    );
+    pub const RELOAD: Self = Self(1 << 8);
+    pub const SHUTDOWN: Self = Self(1 << 9);
+    pub const PROCESS: Self = Self(1 << 10);
+    pub const FILE: Self = Self(1 << 11);
+    pub const REFERENCES: Self = Self(1 << 12);
+    pub const INDEX: Self = Self(1 << 13);
+    pub const ALTER: Self = Self(1 << 14);
+    pub const SUPER: Self = Self(1 << 15);
+    pub const CREATE_TEMP_TABLES: Self = Self(1 << 16);
+    pub const LOCK_TABLES: Self = Self(1 << 17);
+    pub const EXECUTE: Self = Self(1 << 18);
+    pub const CREATE_ROUTINE: Self = Self(1 << 19);
+    pub const ALTER_ROUTINE: Self = Self(1 << 20);
+    pub const CREATE_USER: Self = Self(1 << 21);
+    pub const EVENT: Self = Self(1 << 22);
+    pub const TRIGGER: Self = Self(1 << 23);
+    pub const CREATE_TABLESPACE: Self = Self(1 << 24);
+    pub const CREATE_ROLE: Self = Self(1 << 25);
+    pub const DROP_ROLE: Self = Self(1 << 26);
+    pub const REPLICATION_SLAVE: Self = Self(1 << 27);
+    pub const REPLICATION_CLIENT: Self = Self(1 << 28);
+    pub const SYSTEM_USER: Self = Self(1 << 29);
+    pub const CONFIG: Self = Self(1 << 30);
+
+    /// Every static privilege in MySQL/TiDB (`GRANT ALL`).
+    pub const ALL: Self = Self((1 << 31) - 1);
+
+    /// Display order (TiDB `mysql.PrivilegeType.String()` bit order):
+    /// SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, PROCESS, REFERENCES,
+    /// INDEX, ALTER, SUPER, CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE,
+    /// CREATE ROUTINE, ALTER ROUTINE, CREATE USER, EVENT, TRIGGER,
+    /// CREATE TABLESPACE, CREATE ROLE, DROP ROLE, REPLICATION SLAVE,
+    /// REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, RELOAD, SHUTDOWN, FILE,
+    /// CONFIG, SYSTEM_USER.
+    pub const DISPLAY_ORDER: [(&'static str, Self); 31] = [
+        ("SELECT", Self::SELECT),
+        ("INSERT", Self::INSERT),
+        ("UPDATE", Self::UPDATE),
+        ("DELETE", Self::DELETE),
+        ("CREATE", Self::CREATE),
+        ("DROP", Self::DROP),
+        ("PROCESS", Self::PROCESS),
+        ("REFERENCES", Self::REFERENCES),
+        ("INDEX", Self::INDEX),
+        ("ALTER", Self::ALTER),
+        ("SUPER", Self::SUPER),
+        ("CREATE TEMPORARY TABLES", Self::CREATE_TEMP_TABLES),
+        ("LOCK TABLES", Self::LOCK_TABLES),
+        ("EXECUTE", Self::EXECUTE),
+        ("CREATE ROUTINE", Self::CREATE_ROUTINE),
+        ("ALTER ROUTINE", Self::ALTER_ROUTINE),
+        ("CREATE USER", Self::CREATE_USER),
+        ("EVENT", Self::EVENT),
+        ("TRIGGER", Self::TRIGGER),
+        ("CREATE TABLESPACE", Self::CREATE_TABLESPACE),
+        ("CREATE ROLE", Self::CREATE_ROLE),
+        ("DROP ROLE", Self::DROP_ROLE),
+        ("REPLICATION SLAVE", Self::REPLICATION_SLAVE),
+        ("REPLICATION CLIENT", Self::REPLICATION_CLIENT),
+        ("CREATE VIEW", Self::CREATE_VIEW),
+        ("SHOW VIEW", Self::SHOW_VIEW),
+        ("RELOAD", Self::RELOAD),
+        ("SHUTDOWN", Self::SHUTDOWN),
+        ("FILE", Self::FILE),
+        ("CONFIG", Self::CONFIG),
+        ("SYSTEM_USER", Self::SYSTEM_USER),
+    ];
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    /// True when the masks share at least one privilege bit (TiDB
+    /// `RequestVerification` accepts any bit of the requested mask:
+    /// `priv & requested != 0`).
+    pub fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
     }
 
     pub fn union(self, other: Self) -> Self {
@@ -64,16 +128,7 @@ impl PrivilegeType {
             return vec!["ALL"];
         }
         let mut names = Vec::new();
-        for (bit, name) in [
-            (Self::SELECT, "SELECT"),
-            (Self::INSERT, "INSERT"),
-            (Self::UPDATE, "UPDATE"),
-            (Self::DELETE, "DELETE"),
-            (Self::CREATE, "CREATE"),
-            (Self::DROP, "DROP"),
-            (Self::SHOW_VIEW, "SHOW VIEW"),
-            (Self::CREATE_VIEW, "CREATE VIEW"),
-        ] {
+        for (name, bit) in Self::DISPLAY_ORDER {
             if self.contains(bit) {
                 names.push(name);
             }
@@ -93,8 +148,12 @@ impl PrivilegeType {
             (Self::DELETE, "Delete"),
             (Self::CREATE, "Create"),
             (Self::DROP, "Drop"),
+            (Self::REFERENCES, "References"),
+            (Self::INDEX, "Index"),
+            (Self::ALTER, "Alter"),
             (Self::CREATE_VIEW, "Create View"),
             (Self::SHOW_VIEW, "Show View"),
+            (Self::TRIGGER, "Trigger"),
         ] {
             if self.contains(bit) {
                 names.push(name);
@@ -307,6 +366,10 @@ impl DropUserStmt {
 pub struct UserSpec {
     pub user: UserIdentity,
     pub auth: Option<String>,
+    /// `RESOURCE GROUP name` user attribute.
+    pub resource_group: Option<String>,
+    /// `COMMENT '…'` user attribute.
+    pub comment: Option<String>,
 }
 
 impl UserSpec {
@@ -315,6 +378,42 @@ impl UserSpec {
         if let Some(auth) = &self.auth {
             ctx.write_str(" IDENTIFIED BY ");
             ctx.write_str(&format!("'{auth}'"));
+        }
+        if let Some(group) = &self.resource_group {
+            ctx.write_str(" RESOURCE GROUP ");
+            ctx.write_str(group);
+        }
+        if let Some(comment) = &self.comment {
+            ctx.write_str(" COMMENT ");
+            ctx.write_str(&format!("'{comment}'"));
+        }
+        Ok(())
+    }
+
+    pub fn new(user: UserIdentity, auth: Option<String>) -> Self {
+        Self {
+            user,
+            auth,
+            resource_group: None,
+            comment: None,
+        }
+    }
+}
+
+/// `ALTER USER 'u'@'%' IDENTIFIED BY 'pwd' | COMMENT '…' | RESOURCE GROUP g`.
+#[derive(Clone, Debug)]
+pub struct AlterUserStmt {
+    pub users: Vec<UserSpec>,
+}
+
+impl AlterUserStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ALTER USER ");
+        for (i, spec) in self.users.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            spec.restore(ctx)?;
         }
         Ok(())
     }
@@ -406,6 +505,33 @@ impl SetRoleStmt {
             SetRoleKind::None => ctx.write_str("NONE"),
             SetRoleKind::All => ctx.write_str("ALL"),
             SetRoleKind::Roles(roles) => restore_role_names(roles, ctx)?,
+        }
+        Ok(())
+    }
+}
+
+/// `SET DEFAULT ROLE {NONE | ALL | role [, role] …} TO user [, user] …`
+/// (TiDB `SetDefaultRoleStmt`).
+#[derive(Clone, Debug)]
+pub struct SetDefaultRoleStmt {
+    pub kind: SetRoleKind,
+    pub users: Vec<UserIdentity>,
+}
+
+impl SetDefaultRoleStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("SET DEFAULT ROLE ");
+        match &self.kind {
+            SetRoleKind::None => ctx.write_str("NONE"),
+            SetRoleKind::All => ctx.write_str("ALL"),
+            SetRoleKind::Roles(roles) => restore_role_names(roles, ctx)?,
+        }
+        ctx.write_str(" TO ");
+        for (i, user) in self.users.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            user.restore(ctx)?;
         }
         Ok(())
     }
@@ -571,6 +697,9 @@ pub struct ShowStmt {
     pub db_name: Option<String>,
     pub table: Option<TableName>,
     pub user: Option<UserIdentity>,
+    /// `SHOW GRANTS … USING role[, role]` role list. When set, grants are
+    /// displayed for exactly these roles (TiDB `ShowStmt.Roles`).
+    pub using_roles: Vec<UserIdentity>,
     pub full: bool,
     /// `SHOW … LIKE 'pat'` pattern (TiDB appends ` (pat)` to the column header).
     pub pattern: Option<String>,
@@ -614,6 +743,15 @@ impl ShowStmt {
                 if let Some(user) = &self.user {
                     ctx.write_str(" FOR ");
                     user.restore(ctx)?;
+                }
+                if !self.using_roles.is_empty() {
+                    ctx.write_str(" USING ");
+                    for (i, role) in self.using_roles.iter().enumerate() {
+                        if i > 0 {
+                            ctx.write_str(", ");
+                        }
+                        role.restore(ctx)?;
+                    }
                 }
             }
             ShowStmtKind::CreateTable => {

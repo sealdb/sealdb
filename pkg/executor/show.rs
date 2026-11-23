@@ -2,7 +2,7 @@ use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_BAD_DB, ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_meta::{ColumnInfo, TableInfo};
-use sealdb_parser::ast::{ShowStmt, ShowStmtKind, TableName};
+use sealdb_parser::ast::{PrivilegeType, ShowStmt, ShowStmtKind, TableName};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
@@ -138,16 +138,55 @@ impl Executor for ShowExec {
                 self.apply_where_filter()?;
             }
             ShowStmtKind::Grants => {
-                let user = self
-                    .stmt
-                    .user
-                    .clone()
-                    .unwrap_or_else(sealdb_parser::ast::UserIdentity::root);
-                self.schema = vec![format!("Grants for {}", user.display())];
+                // `SHOW GRANTS` / `FOR CURRENT_USER()` display the caller plus
+                // their active roles; an explicit `FOR 'u'@'h'` ignores roles
+                // (TiDB `ShowGrants` semantics).
+                let (user, roles) = match self.stmt.user.clone() {
+                    Some(u) if !u.username.is_empty() => (u, Vec::new()),
+                    _ => (
+                        sealdb_privilege::thread_user()
+                            .unwrap_or_else(sealdb_parser::ast::UserIdentity::root),
+                        sealdb_privilege::thread_active_roles(),
+                    ),
+                };
+                // `USING role_list` overrides the active roles, but each role
+                // must be granted to the displayed account (error 3530).
+                let roles = if self.stmt.using_roles.is_empty() {
+                    roles
+                } else {
+                    let mut using = Vec::with_capacity(self.stmt.using_roles.len());
+                    for role in &self.stmt.using_roles {
+                        let role = sealdb_parser::ast::UserIdentity::new(
+                            role.username.clone(),
+                            if role.hostname.is_empty() {
+                                "%".to_string()
+                            } else {
+                                role.hostname.clone()
+                            },
+                        );
+                        if !self.domain.privilege().role_granted_to(&user, &role) {
+                            return Err(Error::new(
+                                sealdb_errno::ERR_ROLE_NOT_GRANTED,
+                                format!(
+                                    "`{}`@`{}` is not granted to {}@{}",
+                                    role.username, role.hostname, user.username, user.hostname
+                                ),
+                            ));
+                        }
+                        using.push(role);
+                    }
+                    using
+                };
+                // TiDB names the column `Grants for User` when no account is
+                // given (it does not know the caller yet at plan time).
+                self.schema = vec![match self.stmt.user.as_ref() {
+                    None => "Grants for User".to_string(),
+                    Some(_) => format!("Grants for {}", user.display()),
+                }];
                 self.rows = self
                     .domain
                     .privilege()
-                    .show_grants(&user)
+                    .show_grants(&user, &roles)
                     .into_iter()
                     .map(|g| vec![Datum::Bytes(g.into_bytes())])
                     .collect();
@@ -281,13 +320,57 @@ impl Executor for ShowExec {
                 };
                 let column = self.stmt.column.as_deref();
                 let pattern = self.stmt.pattern.as_deref();
-                self.rows = info
-                    .columns
-                    .iter()
-                    .filter(|col| !col.hidden)
-                    .filter(|col| show_column_visible(col.name.o(), column, pattern))
-                    .map(|col| column_row(info, col, full))
-                    .collect();
+                // TiDB `fetchShowColumns`: a table-level
+                // INSERT/SELECT/UPDATE/REFERENCES grant shows every column;
+                // otherwise only columns covered by a column grant are listed,
+                // and with none visible the statement fails with 1142 SELECT.
+                let mgr = self.domain.privilege();
+                let user = sealdb_privilege::thread_user();
+                let roles = sealdb_privilege::thread_active_roles();
+                let privs = PrivilegeType::INSERT
+                    .union(PrivilegeType::SELECT)
+                    .union(PrivilegeType::UPDATE)
+                    .union(PrivilegeType::REFERENCES);
+                let pass_tbl = match &user {
+                    Some(user) => mgr.request_verification_with_roles(
+                        user, &roles, &schema, &name, privs,
+                    ),
+                    None => true,
+                };
+                let mut pass_col = false;
+                let mut rows = Vec::new();
+                for col in info.columns.iter().filter(|col| !col.hidden) {
+                    if !show_column_visible(col.name.o(), column, pattern) {
+                        continue;
+                    }
+                    if !pass_tbl {
+                        let allowed = match &user {
+                            Some(user) => mgr.request_column_verification_with_roles(
+                                user,
+                                &roles,
+                                &schema,
+                                &name,
+                                col.name.o(),
+                                privs,
+                            ),
+                            None => true,
+                        };
+                        if !allowed {
+                            continue;
+                        }
+                        pass_col = true;
+                    }
+                    rows.push(column_row(info, col, full));
+                }
+                if !pass_tbl && !pass_col {
+                    return Err(sealdb_privilege::Manager::access_denied(
+                        &schema,
+                        &name,
+                        PrivilegeType::SELECT,
+                        user.as_ref().expect("checked above"),
+                    ));
+                }
+                self.rows = rows;
                 self.apply_where_filter()?;
             }
             ShowStmtKind::Index => {

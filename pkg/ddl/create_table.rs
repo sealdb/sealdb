@@ -1599,7 +1599,10 @@ fn lookup_select_column(col: &ColumnNameExpr, sources: &[SelectSource]) -> Resul
 
 fn type_name_from_datum(datum: &Datum) -> &'static str {
     match datum {
-        Datum::I64(_) | Datum::Year(_) | Datum::U64(_) | Datum::Bit(_) => "int",
+        // TiDB types integer literals as `bigint` (constant fold keeps the
+        // longlong type in CTAS / view column metadata).
+        Datum::I64(_) | Datum::Year(_) | Datum::U64(_) => "bigint",
+        Datum::Bit(_) => "int",
         Datum::F64(_) => "double",
         Datum::Decimal(_) => "decimal",
         Datum::Time(_) => "datetime",

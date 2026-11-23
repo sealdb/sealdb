@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-23（green 128 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-23（green 131 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -5045,4 +5045,66 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**: R5 剩余 pending（`session/vars`、`session/common`、
   `session/nontransactional`、`session/temporary_table`、
   `ddl/db_integration`、`privilege/privileges`）。
+
+### 2026-11-23 — `privilege/privileges` 转绿（green 131）
+
+- **Phase**: R5 权限体系（静态/动态权限位、账号与角色、SHOW GRANTS、权限视图、语句级鉴权）
+- **根因**（按层次）:
+  1. `PrivilegeType` 只有少量位，TiDB 的 31 个静态权限位与
+     `PrivilegeType.String()` 展示顺序缺失，`GRANT ALL`、`SHOW GRANTS`、
+     `information_schema` 权限视图都无法表达。
+  2. 授权模型把列级授权压成单一 `columns: Vec<String>`，无法区分「同一列上
+     不同权限」与 `REVOKE` 的精确回退；动态权限也没有记录 `WITH GRANT
+     OPTION`。
+  3. `SHOW GRANTS` 不识别 `CURRENT_USER()`、`USING role`、默认/激活角色；
+     无参时列名应为 `Grants for User`；`USING` 未授予的角色未报 3530。
+  4. `mysql.user` / `mysql.tables_priv` 仍是真实空表，
+     `information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES` 未物化；
+     `information_schema.columns` 缺 TiDB 的 20+ 列与 `PRIVILEGES` 单元格。
+  5. 账号/角色 DDL 只有 `CREATE/DROP USER`：缺 `ALTER USER`（密码 /
+     `COMMENT` / `RESOURCE GROUP`）、`CREATE/DROP ROLE`、`RENAME USER`、
+     `SET PASSWORD`、`SET DEFAULT ROLE`、`ADMIN SET/UNSET BDR ROLE` 等。
+  6. 语句级鉴权只覆盖读路径：缺 DML 的表级/列级检查、`SELECT … INTO
+     OUTFILE`、`IMPORT INTO`、视图 definer/调用者双路径、`SHOW CREATE
+     VIEW`、`SHOW COLUMNS` 列过滤、`CLUSTER_*` 的 `CONFIG`/`PROCESS` 门控。
+  7. 动态权限与 1227：`PLACEMENT_ADMIN`、`RESOURCE_GROUP_ADMIN/USER`、
+     `SYSTEM_VARIABLES_ADMIN`、`RESTRICTED_USER_ADMIN` 等未参与鉴权；
+     `SET GLOBAL` 未先校验 `SYSTEM_VARIABLES_ADMIN`。
+- **完成**:
+  - `pkg/parser/ast/misc.rs` / `lower.rs` / `parser.rs`：`PrivilegeType` 对齐
+    TiDB 31 位静态权限（`SELECT` … `CONFIG`），新增 `ALL`、`intersects`、
+    `DISPLAY_ORDER`；补 `ALTER USER … COMMENT/RESOURCE GROUP`、
+    `SET DEFAULT ROLE`、`SHOW GRANTS … USING`、`ADMIN SET/UNSET BDR ROLE` 的
+    AST 与解析。
+  - `pkg/privilege/privilege.rs`：`GrantEntry` 拆出 `table_privs` 与
+    `(privilege, column)` 列授权；`GRANT` 拒绝不存在的账号（1410，角色也算
+    账号）；动态权限记录 grant option；新增 `alter_user` / `create_role` /
+    `drop_role` / `rename_user` / `set_default_role` / `set_password` /
+    `resolve_active_roles`；`show_grants` 按角色展开并渲染 `WITH GRANT
+    OPTION`；物化 `mysql.user`、`mysql.tables_priv` 与
+    `information_schema` 三张权限表行；`encode/decode` 兼容旧 `ALL` 掩码。
+  - `pkg/session/session.rs`：每条语句发布 `(user, active_roles,
+    login_host)`；补逐语句鉴权矩阵（GRANT/REVOKE 的 GRANT OPTION、
+    `IMPORT INTO`、账号/角色 DDL、`SET GLOBAL`、`SET RESOURCE GROUP`、
+    placement policy、`LOCK/UNLOCK STATS`、`SHOW …`），并实现视图 definer
+    权限回退、`SELECT … INTO OUTFILE`、`REPLACE` /
+    `INSERT … ON DUPLICATE KEY UPDATE` 追加的 DELETE/UPDATE 检查。
+  - `pkg/executor/show.rs` / `pkg/planner/core/planbuilder.rs` /
+    `pkg/infoschema/tables.rs`：`SHOW GRANTS` 的角色/`CURRENT_USER()`/
+    `USING` 语义、`SHOW COLUMNS` 的列级可见性（无可见列报 1142）、
+    `information_schema.columns` 补全 TiDB 列与 `PRIVILEGES`、`CLUSTER_*`
+    虚拟表与 `CONFIG` 门控。
+  - `pkg/domain/domain.rs`：`ADMIN SET/UNSET BDR ROLE` 集群状态。
+  - `tests/integrationtest/src/lib.rs`：mysql-tester 支持 `--echo`（含尾随
+    分号）、`//` 注释、符号错误名（`--error ErrTableaccessDenied` 等）、
+    `localhost` 映射为 `127.0.0.1`；TiKV 重置时同步清空权限快照，避免上一条
+    文件的 `GRANT ALL` 泄漏到下一文件。
+- **验证**:
+  - `… -t privilege/privileges`：memory → PASS；tikv → PASS。
+  - 全量 memory gate：`PASS: memory=139 skipped=115`（131 green + 8 local）。
+  - 全量 TiKV gate：`PASS: tikv=137 skipped=117`。
+  - manifest：`privilege/privileges` → `green`，`counts` 同步 131/105。
+- **下一步**: R5 剩余 pending（`session/vars`、`session/common`、
+  `session/nontransactional`、`session/temporary_table`、
+  `ddl/db_integration`）。
 

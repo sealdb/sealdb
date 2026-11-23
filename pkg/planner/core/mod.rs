@@ -46,9 +46,8 @@ pub use planbuilder::{
     insubq_to_join_and_agg, mark_json_temporal_cast_fields, merged_star_columns,
     merged_star_visible_columns, normalize_bit_constants, normalize_comparison_literals,
     normalize_enum_constants, set_opt_fix_control_52869, take_index_lookup_pushdown_warnings,
-    using_dropped_columns,
-    with_agg_push_down, with_cost_model_version, with_dirty_tables, with_explicit_txn,
-    with_hashagg_concurrency, with_index_lookup_pushdown_policy, with_inl_join_inner_multi_pattern,
-    with_insubq_to_join_and_agg, with_stable_result_mode,
+    using_dropped_columns, with_agg_push_down, with_cost_model_version, with_dirty_tables,
+    with_explicit_txn, with_hashagg_concurrency, with_index_lookup_pushdown_policy,
+    with_inl_join_inner_multi_pattern, with_insubq_to_join_and_agg, with_stable_result_mode,
 };
 pub use rule_partition_processor::{PartitionPruneMode, prune_partitions};

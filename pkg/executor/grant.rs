@@ -39,6 +39,19 @@ impl GrantExec {
         }
     }
 
+    /// `CURRENT_USER()` lowers to an empty identity; resolve it against the
+    /// connection executing the statement (`REVOKE ALL … FROM
+    /// CURRENT_USER()`). The session publishes its identity as the privilege
+    /// thread-local before every statement; `current_user` is only a fallback.
+    fn resolve_current_user(&self, users: &mut [UserIdentity]) {
+        let caller = sealdb_privilege::thread_user().unwrap_or_else(|| self.current_user.clone());
+        for user in users.iter_mut() {
+            if user.username.is_empty() {
+                *user = caller.clone();
+            }
+        }
+    }
+
     pub fn with_user(domain: Arc<Domain>, stmt: Statement, current_user: UserIdentity) -> Self {
         Self {
             domain,
@@ -57,12 +70,14 @@ impl Executor for GrantExec {
             Statement::Grant(grant) => {
                 let mut grant = grant.clone();
                 self.qualify_level(&mut grant.level);
+                self.resolve_current_user(&mut grant.users);
                 self.domain.privilege().grant(&grant)?;
                 persist_priv = true;
             }
             Statement::Revoke(revoke) => {
                 let mut revoke = revoke.clone();
                 self.qualify_level(&mut revoke.level);
+                self.resolve_current_user(&mut revoke.users);
                 self.domain.privilege().revoke(&revoke)?;
                 persist_priv = true;
             }
@@ -76,6 +91,10 @@ impl Executor for GrantExec {
             }
             Statement::CreateUser(create) => {
                 self.domain.privilege().create_user(create)?;
+                persist_priv = true;
+            }
+            Statement::AlterUser(alter) => {
+                self.domain.privilege().alter_user(alter)?;
                 persist_priv = true;
             }
             Statement::DropUser(drop) => {

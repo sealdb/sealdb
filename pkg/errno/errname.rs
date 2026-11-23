@@ -80,6 +80,10 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_DBACCESS_DENIED_ERROR => "ErrDBaccessDenied",
         errcode::ERR_TABLEACCESS_DENIED_ERROR => "ErrTableaccessDenied",
         errcode::ERR_COLUMNACCESS_DENIED_ERROR => "ErrColumnaccessDenied",
+        errcode::ERR_SPECIFIC_ACCESS_DENIED_ERROR => "ErrSpecificAccessDenied",
+        errcode::ERR_CANT_CREATE_USER_WITH_GRANT => "ErrCantCreateUserWithGrant",
+        errcode::ERR_CANNOT_USER => "ErrCannotUser",
+        errcode::ERR_ROLE_NOT_GRANTED => "ErrRoleNotGranted",
         errcode::ERR_INFO_SCHEMA_EXPIRED => "ErrInfoSchemaExpired",
         errcode::ERR_INFO_SCHEMA_CHANGED => "ErrInfoSchemaChanged",
         errcode::ERR_UNKNOWN_STMT_HANDLER => "ErrUnknownStmtHandler",
@@ -145,6 +149,9 @@ pub fn name_of(code: i32) -> &'static str {
 pub fn sqlstate_of(code: i32) -> &'static str {
     match code {
         errcode::ERR_ACCESS_DENIED_ERROR => "28000",
+        errcode::ERR_SPECIFIC_ACCESS_DENIED_ERROR | errcode::ERR_CANT_CREATE_USER_WITH_GRANT => {
+            "42000"
+        },
         errcode::ERR_DBACCESS_DENIED_ERROR => "42000",
         errcode::ERR_TABLEACCESS_DENIED_ERROR => "42000",
         errcode::ERR_COLUMNACCESS_DENIED_ERROR => "42000",

@@ -17,7 +17,63 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "partitions" => Ok(partitions(is)),
         "processlist" => Ok(processlist()),
         "ddl_jobs" => Ok(ddl_jobs()),
-        "attributes" => Ok(attributes(is)),
+                "attributes" => Ok(attributes(is)),
+                // TiDB `CLUSTER_*` information_schema tables: the privilege
+                // check happens in the planner (CONFIG / PROCESS), the tables
+                // themselves yield no rows here.
+                "cluster_config" => Ok(empty(&["TYPE", "INSTANCE", "KEY", "VALUE"])),
+                "cluster_hardware" | "cluster_load" => Ok(empty(&[
+                    "TYPE",
+                    "INSTANCE",
+                    "DEVICE_TYPE",
+                    "DEVICE_NAME",
+                    "NAME",
+                    "VALUE",
+                ])),
+                "cluster_info" => Ok(empty(&[
+                    "TYPE",
+                    "INSTANCE",
+                    "STATUS_ADDRESS",
+                    "VERSION",
+                    "GIT_HASH",
+                    "START_TIME",
+                    "UPTIME",
+                    "SERVER_ID",
+                ])),
+                "cluster_systeminfo" => Ok(empty(&[
+                    "TYPE",
+                    "INSTANCE",
+                    "SYSTEM_TYPE",
+                    "SYSTEM_NAME",
+                    "NAME",
+                    "VALUE",
+                ])),
+                "cluster_log" => Ok(empty(&["TIME", "TYPE", "INSTANCE", "LEVEL", "MESSAGE"])),
+        // Rows are produced by the executor (session-filtered grants).
+        "schema_privileges" => Ok(empty(&[
+            "GRANTEE",
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "PRIVILEGE_TYPE",
+            "IS_GRANTABLE",
+        ])),
+        "table_privileges" => Ok(empty(&[
+            "GRANTEE",
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "PRIVILEGE_TYPE",
+            "IS_GRANTABLE",
+        ])),
+        "column_privileges" => Ok(empty(&[
+            "GRANTEE",
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "COLUMN_NAME",
+            "PRIVILEGE_TYPE",
+            "IS_GRANTABLE",
+        ])),
         "inspection_rules" => Ok(inspection_rules()),
         "character_sets" => Ok(character_sets()),
         "collations" => Ok(collations()),
@@ -508,11 +564,22 @@ fn columns(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
         "TABLE_NAME".to_string(),
         "COLUMN_NAME".to_string(),
         "ORDINAL_POSITION".to_string(),
-        "DATA_TYPE".to_string(),
-        "COLUMN_TYPE".to_string(),
+        "COLUMN_DEFAULT".to_string(),
         "IS_NULLABLE".to_string(),
+        "DATA_TYPE".to_string(),
+        "CHARACTER_MAXIMUM_LENGTH".to_string(),
+        "CHARACTER_OCTET_LENGTH".to_string(),
+        "NUMERIC_PRECISION".to_string(),
+        "NUMERIC_SCALE".to_string(),
+        "DATETIME_PRECISION".to_string(),
+        "CHARACTER_SET_NAME".to_string(),
+        "COLLATION_NAME".to_string(),
+        "COLUMN_TYPE".to_string(),
         "COLUMN_KEY".to_string(),
+        "EXTRA".to_string(),
+        "PRIVILEGES".to_string(),
         "COLUMN_COMMENT".to_string(),
+        "GENERATION_EXPRESSION".to_string(),
     ];
     let mut rows = Vec::new();
     for_each_table(is, |db, table| {
@@ -521,22 +588,228 @@ fn columns(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
             if col.hidden {
                 continue;
             }
-            let type_name = col.field_type.type_name();
+            let ft = &col.field_type;
+            let type_name = ft.type_name();
+            let (char_max, char_oct) = column_char_lengths(ft);
+            let (numeric_precision, numeric_scale) = column_numeric(ft);
+            let datetime_precision = if matches!(
+                ft.tp,
+                sealdb_types::TYPE_DATETIME
+                    | sealdb_types::TYPE_TIMESTAMP
+                    | sealdb_types::TYPE_DURATION
+            ) {
+                Datum::I64(ft.decimal.max(0) as i64)
+            } else {
+                Datum::Null
+            };
+            let (charset, collation) = if ft.is_character_type() && ft.charset != "binary" {
+                (bytes(&ft.charset), bytes(&ft.collate))
+            } else {
+                (Datum::Null, Datum::Null)
+            };
+            let nullable = if ft.flag & sealdb_types::NOT_NULL_FLAG == 0 {
+                "YES"
+            } else {
+                "NO"
+            };
+            let default = match &col.default_expr {
+                Some(expr) => bytes(expr),
+                None => Datum::Null,
+            };
+            let mut extra = String::new();
+            if col.auto_increment {
+                extra.push_str("auto_increment");
+            }
+            if col.generated_expr.is_some() {
+                if !extra.is_empty() {
+                    extra.push(' ');
+                }
+                extra.push_str(if col.generated_stored {
+                    "STORED GENERATED"
+                } else {
+                    "VIRTUAL GENERATED"
+                });
+            }
             rows.push(vec![
                 bytes("def"),
                 bytes(db),
                 bytes(table.name.o()),
                 bytes(col.name.o()),
                 Datum::I64((i + 1) as i64),
+                default,
+                bytes(nullable),
+                bytes(column_data_type(ft)),
+                char_max,
+                char_oct,
+                numeric_precision,
+                numeric_scale,
+                datetime_precision,
+                charset,
+                collation,
                 bytes(&type_name),
-                bytes(&type_name),
-                bytes("YES"),
                 bytes(column_key(table, col.name.o())),
+                bytes(&extra),
+                // `PRIVILEGES` is per-session state: the executor fills it in
+                // (and hides rows when the session holds no column privilege).
                 bytes(""),
+                bytes(col.comment.as_deref().unwrap_or("")),
+                bytes(col.generated_expr.as_deref().unwrap_or("")),
             ]);
         }
     });
     (schema, rows)
+}
+
+/// TiDB `TypeToStr`: the base type name `information_schema.columns.DATA_TYPE`
+/// reports (no length/charset decorations).
+fn column_data_type(ft: &sealdb_types::FieldType) -> &'static str {
+    use sealdb_types::*;
+    match ft.tp {
+        TYPE_TINY => "tinyint",
+        TYPE_SHORT => "smallint",
+        TYPE_INT24 => "mediumint",
+        TYPE_LONG => "int",
+        TYPE_LONG_LONG => "bigint",
+        TYPE_FLOAT => "float",
+        TYPE_DOUBLE => "double",
+        TYPE_NEW_DECIMAL | TYPE_DECIMAL => "decimal",
+        TYPE_BIT => "bit",
+        TYPE_YEAR => "year",
+        TYPE_DATE => "date",
+        TYPE_DATETIME => "datetime",
+        TYPE_TIMESTAMP => "timestamp",
+        TYPE_DURATION => "time",
+        TYPE_JSON => "json",
+        TYPE_ENUM => "enum",
+        TYPE_SET => "set",
+        TYPE_STRING => {
+            if ft.charset == "binary" {
+                "binary"
+            } else {
+                "char"
+            }
+        }
+        TYPE_VARCHAR | TYPE_VAR_STRING => {
+            if ft.charset == "binary" {
+                "varbinary"
+            } else {
+                "varchar"
+            }
+        }
+        TYPE_BLOB => {
+            if ft.charset == "binary" {
+                "blob"
+            } else {
+                "text"
+            }
+        }
+        TYPE_TINY_BLOB => {
+            if ft.charset == "binary" {
+                "tinyblob"
+            } else {
+                "tinytext"
+            }
+        }
+        TYPE_MEDIUM_BLOB => {
+            if ft.charset == "binary" {
+                "mediumblob"
+            } else {
+                "mediumtext"
+            }
+        }
+        TYPE_LONG_BLOB => {
+            if ft.charset == "binary" {
+                "longblob"
+            } else {
+                "longtext"
+            }
+        }
+        _ => "varchar",
+    }
+}
+
+/// TiDB `CHARACTER_MAXIMUM_LENGTH` / `CHARACTER_OCTET_LENGTH` (NULL for
+/// non-character columns; `ENUM`/`SET` use the declared members).
+fn column_char_lengths(ft: &sealdb_types::FieldType) -> (Datum, Datum) {
+    use sealdb_types::*;
+    if !ft.is_character_type() {
+        return (Datum::Null, Datum::Null);
+    }
+    let chars = match ft.tp {
+        TYPE_ENUM => ft
+            .elems
+            .as_deref()
+            .map(|elems| elems.iter().map(|e| e.chars().count()).max().unwrap_or(0))
+            .unwrap_or(0),
+        TYPE_SET => {
+            let elems = ft.elems.as_deref().unwrap_or(&[]);
+            let total: usize = elems.iter().map(|e| e.chars().count()).sum();
+            total + elems.len().saturating_sub(1)
+        }
+        _ => {
+            if ft.flen >= 0 {
+                ft.flen as usize
+            } else {
+                // TEXT/BLOB sizes TiDB derives from the storage class.
+                match ft.tp {
+                    TYPE_TINY_BLOB => 255,
+                    TYPE_MEDIUM_BLOB => 16_777_215,
+                    TYPE_LONG_BLOB => 4_294_967_295,
+                    _ => 65_535,
+                }
+            }
+        }
+    };
+    let maxlen = match ft.charset.as_str() {
+        "utf8mb4" => 4,
+        "utf8" | "utf8mb3" => 3,
+        _ => 1,
+    };
+    (
+        Datum::I64(chars as i64),
+        Datum::I64((chars * maxlen) as i64),
+    )
+}
+
+/// TiDB `NUMERIC_PRECISION` / `NUMERIC_SCALE` (NULL for non-numeric columns).
+fn column_numeric(ft: &sealdb_types::FieldType) -> (Datum, Datum) {
+    use sealdb_types::*;
+    if !matches!(
+        ft.tp,
+        TYPE_TINY
+            | TYPE_SHORT
+            | TYPE_INT24
+            | TYPE_LONG
+            | TYPE_LONG_LONG
+            | TYPE_FLOAT
+            | TYPE_DOUBLE
+            | TYPE_NEW_DECIMAL
+            | TYPE_DECIMAL
+            | TYPE_BIT
+            | TYPE_YEAR
+    ) {
+        return (Datum::Null, Datum::Null);
+    }
+    let default_flen = match ft.tp {
+        TYPE_TINY => 3,
+        TYPE_SHORT => 5,
+        TYPE_INT24 => 8,
+        TYPE_LONG => 10,
+        TYPE_LONG_LONG => 20,
+        TYPE_FLOAT => 12,
+        TYPE_DOUBLE => 22,
+        TYPE_NEW_DECIMAL | TYPE_DECIMAL => 10,
+        TYPE_BIT => 1,
+        TYPE_YEAR => 4,
+        _ => -1,
+    };
+    let flen = if ft.flen >= 0 { ft.flen } else { default_flen };
+    let scale = if matches!(ft.tp, TYPE_NEW_DECIMAL | TYPE_DECIMAL) {
+        ft.decimal.max(0)
+    } else {
+        0
+    };
+    (Datum::I64(flen as i64), Datum::I64(scale as i64))
 }
 
 fn statistics(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {

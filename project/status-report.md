@@ -1,6 +1,6 @@
 # 整体进展报告（Status Report）
 
-> 生成时间：2026-11-23 01:30 (+08:00)
+> 生成时间：2026-11-23 19:40 (+08:00)
 > 事实来源：`project/regression/manifest.json`（suite 状态）、`project/parity/status.json`（包级对齐）、`git log`
 > 规范：[testing.md](./testing.md) · [parity-discipline.md](./parity-discipline.md) · [progress.md](./progress.md)
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **130 个** 登记为 `green`（R1 4 / R2 16 / R3 32 / R5 6 / R6 20 / R7 52）。本轮新增 `session/privileges` 转绿：`CURRENT_USER()`/`USER()` 内置函数、视图级 `CREATE VIEW`/`SHOW VIEW` 权限位与 `GRANT … ON view` 解析、`mysql.tables_priv` 由权限管理器虚拟物化（`Select,Show View` / `Create View` 渲染），以及 `GRANT … ON t` 未限定库名时按会话当前库落库；同时修正旧快照中 `ALL` 位掩码（0x3f/0x7f）的兼容解码，避免 TiKV 持久化快照让 root 丢失新权限位。上一轮新增 `statistics/overflow_calc` 转绿：统计默认值对齐 TiDB v2 analyze（256 桶 / TopN 100），ANALYZE 为普通索引登记占位统计（不再误报 `stats:partial[idx:missing]`），并新增「RIGHT JOIN 两侧聚簇键区间 → 有序 `TableRangeScan` + `MergeJoin`」的计划选择。此前一轮新增 `explain_indexmerge_stats` 转绿：`utf8mb4_0900_ai_ci` 索引键的 UCA 排序键（ranger 区间按权重字节渲染）、IndexMerge 下 cop `TopN` 只在索引键覆盖排序列时下沉到臂、否则落在 merge 的 probe 侧，以及 merge 估算归零时根 `TopN` 保留 limit 上界。再此前一轮新增 `ddl/db_partition`：LIST/LIST COLUMNS 字面量与日期归一、RANGE COLUMNS 尾列类型强制、1526/1654 错误码分流、RANGE REORGANIZE PARTITION 行迁移与 `_tidb_rowid` 冲突重分配，以及 PREPARE 中 `\n` 转义与 INTERVAL RANGE 语句。R1 已收口，R2 完成 16/22，R3 完成 32/48，R5 完成 6/12，R7 完成 52/110；架构侧仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **131 个** 登记为 `green`（R1 4 / R2 16 / R3 32 / R5 7 / R6 20 / R7 52）。本轮新增 `privilege/privileges` 转绿：对齐 TiDB 的 31 位静态权限位与展示顺序、动态权限记录 `WITH GRANT OPTION`、补齐 `ALTER USER` / `CREATE ROLE` / `SET DEFAULT ROLE` / `RENAME USER` / `SET PASSWORD` 等账号角色 DDL、`SHOW GRANTS` 的 `CURRENT_USER()`/`USING` 角色展开与 3530、`information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES` 与 `mysql.user` 物化，并落地逐语句鉴权矩阵（DML 列级/表级、`IMPORT INTO`、`SET GLOBAL`、视图 definer 双路径、`CLUSTER_*` 的 `CONFIG` 门控）；TiKV 重置时同步清空权限快照，避免上一文件的 `GRANT ALL` 泄漏到下一文件。上一轮新增 `session/privileges` 转绿：`CURRENT_USER()`/`USER()` 内置函数、视图级 `CREATE VIEW`/`SHOW VIEW` 权限位与 `GRANT … ON view` 解析、`mysql.tables_priv` 由权限管理器虚拟物化（`Select,Show View` / `Create View` 渲染），以及 `GRANT … ON t` 未限定库名时按会话当前库落库；同时修正旧快照中 `ALL` 位掩码（0x3f/0x7f）的兼容解码，避免 TiKV 持久化快照让 root 丢失新权限位。再上一轮新增 `statistics/overflow_calc` 转绿：统计默认值对齐 TiDB v2 analyze（256 桶 / TopN 100），ANALYZE 为普通索引登记占位统计（不再误报 `stats:partial[idx:missing]`），并新增「RIGHT JOIN 两侧聚簇键区间 → 有序 `TableRangeScan` + `MergeJoin`」的计划选择。此前一轮新增 `explain_indexmerge_stats` 转绿：`utf8mb4_0900_ai_ci` 索引键的 UCA 排序键（ranger 区间按权重字节渲染）、IndexMerge 下 cop `TopN` 只在索引键覆盖排序列时下沉到臂、否则落在 merge 的 probe 侧，以及 merge 估算归零时根 `TopN` 保留 limit 上界。再此前一轮新增 `ddl/db_partition`：LIST/LIST COLUMNS 字面量与日期归一、RANGE COLUMNS 尾列类型强制、1526/1654 错误码分流、RANGE REORGANIZE PARTITION 行迁移与 `_tidb_rowid` 冲突重分配，以及 PREPARE 中 `\n` 转义与 INTERVAL RANGE 语句。R1 已收口，R2 完成 16/22，R3 完成 32/48，R5 完成 7/12，R7 完成 52/110；架构侧仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -22,9 +22,9 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **130 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 130 | 51.2% |
+| `green` | 131 | 51.6% |
 | `in_progress` | 8 | 3.1% |
-| `pending` | 106 | 41.7% |
+| `pending` | 105 | 41.3% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
 
@@ -38,7 +38,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **130 个** �
 | R2（join / subquery / agg / window / cte） | 16 | 5 | 1 | 主波完成 ~73% |
 | R3（point_get / index / partition / explain*） | 32 | 3 | 13 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
-| R5 | 6 | 0 | 6 | `session/txn` / `db_integration` / `session/variable` / `session/bootstrap_upgrade` / `session/session` / `session/privileges` 已绿 |
+| R5 | 7 | 0 | 5 | `session/txn` / `db_integration` / `session/variable` / `session/bootstrap_upgrade` / `session/session` / `session/privileges` / `privilege/privileges` 已绿 |
 | R6 | 20 | 0 | 15 | DDL / infoschema 起步 |
 | R7 | 52 | 0 | 58 | 零散长尾 |
 | D（TiFlash/MPP） | 0 | 0 | 2 | deferred |
@@ -46,14 +46,14 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **130 个** �
 
 ---
 
-## 3. 已绿 suite 清单（130）
+## 3. 已绿 suite 清单（131）
 
 | Wave | Suite |
 |---|---|
 | R1 | `select`, `show`, `types/const`, `types/time` |
 | R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_push_down`, `topn_pushdown`, `window_function` |
 | R3 | `access_path_selection`, `clustered_index`, `ddl/db_partition`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/explain`, `executor/explainfor`, `executor/index_lookup_pushdown_partition`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy`, `explain_easy_stats`, `explain_foreign_key`, `explain_generate_column_substitute`, `explain_indexmerge_stats`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `expression/explain`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `globalindex/point_get`, `partition`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
-| R5 | `session/txn`, `session/variable`, `session/session`, `session/privileges`, `db_integration`, `session/bootstrap_upgrade` |
+| R5 | `session/txn`, `session/variable`, `session/session`, `session/privileges`, `privilege/privileges`, `db_integration`, `session/bootstrap_upgrade` |
 | R6 | `ddl/affinity`, `ddl/attributes_sql`, `ddl/column`, `ddl/column_change`, `ddl/column_modify`, `ddl/column_type_change`, `ddl/db_cache`, `ddl/db_change`, `ddl/db_foreign_key`, `ddl/db_rename`, `ddl/ddl_error`, `ddl/fail_db`, `ddl/index_modify`, `ddl/resource_group`, `ddl/table_modify`, `infoschema/cluster_tables`, `infoschema/v2`, `statistics/integration`, `statistics/lock_table_stats`, `statistics/overflow_calc` |
 | R7 | `black_list`, `bindinfo/bind`, `bindinfo/session_handle`, `bindinfo/temptable`, `executor/adapter`, `executor/charset`, `executor/ddl`, `executor/distsql`, `executor/executor_txn`, `executor/index_advise`, `executor/index_lookup_join`, `executor/index_lookup_merge_join`, `executor/index_lookup_pushdown`, `executor/stale_txn`, `expression/enum_set`, `expression/format`, `expression/time`, `expression/vitess_hash`, `globalindex/expression_index`, `globalindex/information_schema`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `planner/core/casetest/index/partialindex`, `planner/core/memtable_predicate_extractor`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `sessiontxn/externals`, `table/cache`, `table/tables`, `table/temptable`, `util/admin`, `sessionctx/setvar`, `planner/core/indexjoin`, `planner/core/indexmerge_intersection`, `executor/compact_table`, `expression/constant_fold`, `executor/kv`, `planner/core/rule_result_reorder`, `table/index`, `executor/rowid`, `executor/analyze`, `executor/delete`, `executor/update`, `executor/insert`, `expression/cast`, `expression/noop_functions`, `planner/core/casetest/expression_rewriter`, `expression/misc` |
 
@@ -251,6 +251,34 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 
 ---
 
+### 4.6 2026-11-23 波次（`privilege/privileges` 转绿 + 权限体系补齐）
+
+| 方向 | 能力 |
+|---|---|
+| 权限位 | `PrivilegeType` 扩展为 TiDB 的 31 位静态权限（`SELECT` … `CONFIG`）与 `DISPLAY_ORDER`；`GRANT ALL` / `SHOW GRANTS` / `information_schema` 按 TiDB 顺序渲染；`intersects` 对齐 `priv & requested != 0` 的判权 |
+| 授权模型 | `GrantEntry` 分离 table-level 与 `(privilege, column)` 列级；`REVOKE` 精确回退并重建并集；动态权限保存 `WITH GRANT OPTION`；`GRANT` 对不存在账号报 1410（角色视为账号） |
+| 账号/角色 | `ALTER USER`（密码 / `COMMENT` / `RESOURCE GROUP`，缺失账号 1396）、`CREATE/DROP ROLE`、`RENAME USER`、`SET PASSWORD`、`SET DEFAULT ROLE`、`ADMIN SET/UNSET BDR ROLE`；登录时解析默认/激活角色 |
+| SHOW GRANTS | 无参列名 `Grants for User`；`CURRENT_USER()` 与激活角色展开；`USING r` 覆盖角色且未授予报 3530；`WITH GRANT OPTION` 与动态权限行渲染 |
+| 权限视图 | `mysql.user` 按权限位物化成行（含 `User_attributes` JSON）；`information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES` 按调用者可见性过滤；`information_schema.columns` 补全 TiDB 列集与 `PRIVILEGES` 单元格（`SHOW COLUMNS` 列级可见性，无列权限报 1142） |
+| 语句鉴权 | DML 表级/列级（1142/1143）、`REPLACE` 追加 DELETE、`INSERT … ON DUPLICATE KEY UPDATE` 追加 UPDATE、`SELECT … INTO OUTFILE`、`IMPORT INTO`（SELECT/UPDATE/INSERT/DELETE/ALTER + FILE）、视图 definer/调用者双路径、`SHOW CREATE VIEW`、`CLUSTER_*` 的 `CONFIG`/`PROCESS`；`SET GLOBAL` 先校验 `SYSTEM_VARIABLES_ADMIN`（1227） |
+| 动态权限 | `PLACEMENT_ADMIN`、`RESOURCE_GROUP_ADMIN/USER`、`SYSTEM_VARIABLES_ADMIN`、`RESTRICTED_USER_ADMIN` 等参与鉴权，失败按 1227 报所需权限名 |
+| 测试驱动 | mysql-tester 支持 `--echo`（尾随 `;` 保真）、`//` 注释、符号错误名；`localhost` 映射 `127.0.0.1` 用于 1142 报错主机；TiKV 重置同时清空权限快照 |
+
+**验证**
+
+```text
+./tests/integrationtest/run-tests.sh -s memory -t privilege/privileges
+→ PASS: memory=1 tikv=0 skipped=253
+./tests/integrationtest/run-tests.sh -s tikv -k -t privilege/privileges
+→ PASS: memory=0 tikv=1 skipped=253
+./tests/integrationtest/run-tests.sh -s memory
+→ PASS: memory=139 skipped=115（131 green + 8 local）
+./tests/integrationtest/run-tests.sh -s tikv -k
+→ PASS: tikv=137 skipped=117
+```
+
+---
+
 ## 5. 刚收口的 R3 套件
 
 | Suite | 收口要点 |
@@ -319,7 +347,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 1. `index_merge`：IN 子查询去关联成 semi/anti + `use_index_merge` 提示（`globalindex/mem_index_merge*` 已转绿，IndexMerge 侧骨架可直接复用）。
 2. `indexmerge_path` / `range_scan_for_like`：把 `utf8mb4_0900_ai_ci` 权重表补齐到非 ASCII 脚本（平假名/谚文），复用本轮落地的 `charset::collate_0900`。
 3. 回到 R2 剩余 `cte` / `explain_cte` / `join_reorder*`。
-4. 按波次推进 R4–R7；TiFlash/MPP 维持 deferred。
+4. R5 剩余 5 套（`session/vars`、`session/common`、`session/nontransactional`、`session/temporary_table`、`ddl/db_integration`），随后按波次推进 R4/R6/R7；TiFlash/MPP 维持 deferred。
 
 **备注（`planner/core/indexmerge_path` 归因，已用本地 TiDB v8.5.8 只读对拍确认）**
 
@@ -344,8 +372,8 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 
 | 项 | 数值 |
 |---|---:|
-| Rust 源文件（pkg/cmd/tests/tools） | 271 |
-| Rust 代码行 | ~110,820 |
+| Rust 源文件（pkg/cmd/tests/tools） | 276 |
+| Rust 代码行 | ~154,657 |
 | 集成测试输入 `t/**/*.test` | 254 |
 | 权威金样 `r/**/*.result` | 258 |
 | 包级对齐登记文件 | 178 |
@@ -392,7 +420,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 21 | `topn_pushdown` | green | 100% | ✓ | ✓ |
 | 22 | `window_function` | green | 100% | ✓ | ✓ |
 
-### R3 — point_get / index / partition / explain*（48 套，green 28）
+### R3 — point_get / index / partition / explain*（48 套，green 32）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
@@ -463,13 +491,13 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 12 | `planner/core/tests/prepare/issue` | pending | 0% | ✓ | — |
 | 13 | `planner/core/tests/prepare/prepare` | pending | 0% | ✓ | — |
 
-### R5（12 套，green 6）
+### R5（12 套，green 7）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
 | 1 | `db_integration` | green | 100% | ✓ | ✓ |
 | 2 | `ddl/db_integration` | pending | 0% | ✓ | — |
-| 3 | `privilege/privileges` | pending | 0% | ✓ | — |
+| 3 | `privilege/privileges` | green | 100% | ✓ | ✓ |
 | 4 | `session/bootstrap_upgrade` | green | 100% | ✓ | ✓ |
 | 5 | `session/common` | pending | 0% | ✓ | — |
 | 6 | `session/nontransactional` | pending | 0% | ✓ | — |
@@ -520,7 +548,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 34 | `statistics/lock_table_stats` | green | 100% | ✓ | ✓ |
 | 35 | `statistics/overflow_calc` | green | 100% | ✓ | ✓ |
 
-### R7（110 套，green 48）
+### R7（110 套，green 52）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|

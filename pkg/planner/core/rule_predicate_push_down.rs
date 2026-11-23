@@ -87,13 +87,11 @@ fn push_into(
             child,
             filter,
             est_rows,
-        } if matches!(child.as_ref(), PhysicalPlan::IndexMerge { .. }) => {
-            PhysicalPlan::Selection {
-                child,
-                filter,
-                est_rows,
-            }
-        }
+        } if matches!(child.as_ref(), PhysicalPlan::IndexMerge { .. }) => PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        },
         PhysicalPlan::TableReader {
             table,
             partitions,

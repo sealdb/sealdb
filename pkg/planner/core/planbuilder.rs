@@ -897,6 +897,9 @@ impl PlanBuilder {
             Statement::CreateUser(_) => Ok(PhysicalPlan::Simple {
                 kind: "CreateUser".to_string(),
             }),
+            Statement::AlterUser(_) => Ok(PhysicalPlan::Simple {
+                kind: "AlterUser".to_string(),
+            }),
             Statement::DropUser(_) => Ok(PhysicalPlan::Simple {
                 kind: "DropUser".to_string(),
             }),
@@ -908,6 +911,9 @@ impl PlanBuilder {
             }),
             Statement::SetRole(_) => Ok(PhysicalPlan::Simple {
                 kind: "SetRole".to_string(),
+            }),
+            Statement::SetDefaultRole(_) => Ok(PhysicalPlan::Simple {
+                kind: "SetDefaultRole".to_string(),
             }),
             Statement::SetPwd(_) => Ok(PhysicalPlan::Simple {
                 kind: "SetPwd".to_string(),
@@ -2664,9 +2670,10 @@ impl PlanBuilder {
         let Some((left_col, right_col)) = join_key_columns(left_info, right_info, &join.on) else {
             return Ok(None);
         };
-        let (Some(left_key), Some(right_key)) =
-            (single_clustered_key(left_info), single_clustered_key(right_info))
-        else {
+        let (Some(left_key), Some(right_key)) = (
+            single_clustered_key(left_info),
+            single_clustered_key(right_info),
+        ) else {
             return Ok(None);
         };
         if !left_col.eq_ignore_ascii_case(&left_key) || !right_col.eq_ignore_ascii_case(&right_key)
@@ -2758,7 +2765,13 @@ impl PlanBuilder {
         }
         let (Some(left_rows), Some(right_rows)) = (
             clustered_range_rows(&join.left, left_info, stats, current_db, selection),
-            clustered_range_rows(&join.right, right_info, stats, current_db, &mirrored_selection),
+            clustered_range_rows(
+                &join.right,
+                right_info,
+                stats,
+                current_db,
+                &mirrored_selection,
+            ),
         ) else {
             return Ok(None);
         };
@@ -12152,12 +12165,9 @@ fn in_list_plan(
         }
     }
     for (column, values, total) in lists {
-        if let Some(index) = info
-            .find_unique_index_on(&column)
-            .filter(|idx| {
-                !index_is_multi_valued(info, idx) && index_allowed(from, idx.name.o(), only_index)
-            })
-        {
+        if let Some(index) = info.find_unique_index_on(&column).filter(|idx| {
+            !index_is_multi_valued(info, idx) && index_allowed(from, idx.name.o(), only_index)
+        }) {
             if !local_index_point_allowed(select, from, info, index, prune_mode) {
                 continue;
             }
@@ -15074,7 +15084,10 @@ enum MvCondKind {
 }
 
 /// The parts of an index that describe a multi-valued key.
-fn mv_index_parts(info: &sealdb_meta::TableInfo, index: &sealdb_meta::IndexInfo) -> Vec<MvIndexPart> {
+fn mv_index_parts(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+) -> Vec<MvIndexPart> {
     let mut parts = Vec::new();
     for (pos, part) in index.columns.iter().enumerate() {
         let Some(hidden) = super::expr_index::hidden_column(info, part) else {
@@ -15350,7 +15363,9 @@ fn mv_key_point(
             return None;
         };
         match (low, high) {
-            (Some((low, true)), Some((high, true))) if low.compare(high).is_eq() => Some(low.clone()),
+            (Some((low, true)), Some((high, true))) if low.compare(high).is_eq() => {
+                Some(low.clone())
+            }
             _ => None,
         }
     })
@@ -15422,11 +15437,9 @@ fn mv_suffix_filters(
         }
         let mut all_suffix = true;
         for (_, column) in &columns {
-            let Some(pos) = index
-                .columns
-                .iter()
-                .position(|part| super::expr_index::part_key(info, part).eq_ignore_ascii_case(column))
-            else {
+            let Some(pos) = index.columns.iter().position(|part| {
+                super::expr_index::part_key(info, part).eq_ignore_ascii_case(column)
+            }) else {
                 all_suffix = false;
                 break;
             };
@@ -15480,9 +15493,8 @@ fn mv_index_arms(
         let datum = mv_key_point(info, index, conds, pos)?;
         // Ranger stores literals in the key part's type (`c = 1` on a FLOAT
         // prefix encodes `3.0`, not the integer `3`).
-        prefix.push(
-            super::access_range::coerce_key_datum(info, index, pos, &datum).unwrap_or(datum),
-        );
+        prefix
+            .push(super::access_range::coerce_key_datum(info, index, pos, &datum).unwrap_or(datum));
         let key = super::expr_index::part_key(info, &index.columns[pos]);
         if let Some(cond) = conds.iter().find(|cond| {
             sealdb_statistics::pseudo::conjunct_bound_sets(cond)
@@ -15499,8 +15511,7 @@ fn mv_index_arms(
             );
         }
     }
-    let suffix_filters =
-        mv_suffix_filters(info, index, part.pos, conds, &condition.expr);
+    let suffix_filters = mv_suffix_filters(info, index, part.pos, conds, &condition.expr);
     let dropped_suffix_filters =
         mv_dropped_suffix_filters(info, index, part.pos, conds, &condition.expr);
     if condition.kind != MvCondKind::Overlaps {
@@ -15525,8 +15536,8 @@ fn mv_index_arms(
     // ANALYZE has no statistics of its own, so its element ranges cannot be
     // narrowed — each arm keeps the table row count and EXPLAIN names the
     // index as the missing statistics.
-    let missing_stats = table_stats
-        .is_some_and(|stats| stats.index(index.name.o()).is_none() && stats.count > 0);
+    let missing_stats =
+        table_stats.is_some_and(|stats| stats.index(index.name.o()).is_none() && stats.count > 0);
     let mut paths = Vec::with_capacity(condition.values.len());
     for value in &condition.values {
         let mut key = prefix.clone();
@@ -15545,10 +15556,7 @@ fn mv_index_arms(
         };
         // `ranges` keeps the single-datum form for cardinality/other consumers;
         // `seek` carries the full composite point key to the executor.
-        let seek = key
-            .first()
-            .cloned()
-            .unwrap_or_else(|| value.clone());
+        let seek = key.first().cloned().unwrap_or_else(|| value.clone());
         let seek_high = seek.clone();
         paths.push(IndexMergePath {
             index: index.name.o().to_string(),
@@ -15588,9 +15596,9 @@ fn mv_outer_overlaps(
         for part in mv_index_parts(info, index) {
             for condition in mv_conditions(&part, outer) {
                 if condition.kind == MvCondKind::Overlaps
-                    && !overlaps
-                        .iter()
-                        .any(|have: &ExprNode| have.restore_string() == condition.expr.restore_string())
+                    && !overlaps.iter().any(|have: &ExprNode| {
+                        have.restore_string() == condition.expr.restore_string()
+                    })
                 {
                     overlaps.push(condition.expr);
                 }
@@ -15601,10 +15609,7 @@ fn mv_outer_overlaps(
 }
 
 /// Multi-valued key columns of the indexes a merge has already ranged over.
-fn mv_columns_for_indexes(
-    info: &sealdb_meta::TableInfo,
-    indexes: &[String],
-) -> Vec<String> {
+fn mv_columns_for_indexes(info: &sealdb_meta::TableInfo, indexes: &[String]) -> Vec<String> {
     info.indices
         .iter()
         .filter(|index| {
@@ -15682,11 +15687,10 @@ fn mv_probe_residual_rows(
             // ranges; TiDB re-checks it above the merge (root Selection) rather
             // than shrinking the probe row IDs a second time. A JSON predicate
             // on a *different* column still filters the probe rows.
-            !func.args.iter().any(|arg| {
-                mv_bases
-                    .iter()
-                    .any(|base| mv_expr_matches(arg, base))
-            })
+            !func
+                .args
+                .iter()
+                .any(|arg| mv_bases.iter().any(|base| mv_expr_matches(arg, base)))
         })
         .cloned()
         .collect();
@@ -15760,9 +15764,9 @@ fn mv_union_item_arm(
         // a union arm (`json_contains(j, '[3]')`); a multi-element contains
         // needs an intersection and TiDB leaves the whole OR to the table scan.
         .or_else(|| {
-            conditions
-                .iter()
-                .find(|condition| condition.kind == MvCondKind::Contains && condition.values.len() == 1)
+            conditions.iter().find(|condition| {
+                condition.kind == MvCondKind::Contains && condition.values.len() == 1
+            })
         })?;
     mv_index_arms(info, index, part, condition, conds, table_rows, table_stats)
 }
@@ -15776,9 +15780,7 @@ fn mv_cast_root_json_literals(expr: &ExprNode, base: &ExprNode) -> ExprNode {
 
 fn mv_cast_root_json_literals_multi(expr: &ExprNode, bases: &[ExprNode]) -> ExprNode {
     match expr {
-        ExprNode::Binary(binary)
-            if matches!(binary.op, Op::LogicOr | Op::LogicAnd) =>
-        {
+        ExprNode::Binary(binary) if matches!(binary.op, Op::LogicOr | Op::LogicAnd) => {
             let mut out = binary.clone();
             out.left = Box::new(mv_cast_root_json_literals_multi(&binary.left, bases));
             out.right = Box::new(mv_cast_root_json_literals_multi(&binary.right, bases));
@@ -15899,43 +15901,38 @@ fn mv_index_merge_plan(
             let conds = item.split_cnf();
             let mut all_conds = conds.clone();
             all_conds.extend(outer.iter().cloned());
-            let mut built = mv_union_item_arm(info, index, &part, &all_conds, table_rows, table_stats);
+            let mut built =
+                mv_union_item_arm(info, index, &part, &all_conds, table_rows, table_stats);
             if built.is_none() && allow_fallback {
                 let all_indexes = IndexMergeHint {
                     indexes: Vec::new(),
                     disabled: false,
                 };
-                built = index_merge_union_arm(
-                    info,
-                    &all_indexes,
-                    &conds,
-                    &all_conds,
-                    table_rows,
-                    None,
-                )
-                .map(|(path, consumed)| (vec![path], consumed))
-                .or_else(|| {
-                    if !mv_item_allows_table_scan_fallback(info, &conds) {
-                        return None;
-                    }
-                    let consumed = all_conds.clone();
-                    let path = IndexMergePath {
-                        index: String::new(),
-                        range: None,
-                        table_range: true,
-                        index_columns: Vec::new(),
-                        keep_order: false,
-                        desc: false,
-                        limit: None,
-                        topn: None,
-                        tid_selection: None,
-                        residual_selection: None,
-                        ranges: Vec::new(),
-                        seek: None,
-                        table_scan_pseudo: table_stats.is_none(),
-                    };
-                    Some((vec![path], consumed))
-                });
+                built =
+                    index_merge_union_arm(info, &all_indexes, &conds, &all_conds, table_rows, None)
+                        .map(|(path, consumed)| (vec![path], consumed))
+                        .or_else(|| {
+                            if !mv_item_allows_table_scan_fallback(info, &conds) {
+                                return None;
+                            }
+                            let consumed = all_conds.clone();
+                            let path = IndexMergePath {
+                                index: String::new(),
+                                range: None,
+                                table_range: true,
+                                index_columns: Vec::new(),
+                                keep_order: false,
+                                desc: false,
+                                limit: None,
+                                topn: None,
+                                tid_selection: None,
+                                residual_selection: None,
+                                ranges: Vec::new(),
+                                seek: None,
+                                table_scan_pseudo: table_stats.is_none(),
+                            };
+                            Some((vec![path], consumed))
+                        });
             }
             if std::env::var("SEALDB_DEBUG_MV").is_ok() {
                 eprintln!(
@@ -15989,7 +15986,8 @@ fn mv_index_merge_plan(
         // One MVIndex predicate: `JSON_CONTAINS` intersects its element arms,
         // `MEMBER OF` / `JSON_OVERLAPS` union them.
         let condition = conditions.first()?;
-        let (paths, consumed) = mv_index_arms(info, index, &part, condition, &cnf, table_rows, table_stats)?;
+        let (paths, consumed) =
+            mv_index_arms(info, index, &part, condition, &cnf, table_rows, table_stats)?;
         let intersection = condition.kind == MvCondKind::Contains;
         for conjunct in &cnf {
             if consumed
@@ -16074,7 +16072,10 @@ fn mv_index_merge_plan(
     if std::env::var("SEALDB_DEBUG_MV").is_ok() {
         eprintln!(
             "MV finish rowid={rowid_est} probe={probe_est} residual={:?}",
-            residual.iter().map(|c| c.restore_string()).collect::<Vec<_>>()
+            residual
+                .iter()
+                .map(|c| c.restore_string())
+                .collect::<Vec<_>>()
         );
     }
     let merge_est = probe_est;
@@ -16199,7 +16200,10 @@ fn finish_mv_merge_plan(
     if std::env::var("SEALDB_DEBUG_MV").is_ok() {
         eprintln!(
             "MV finish rowid={rowid_est} probe={probe_est} residual={:?}",
-            residual.iter().map(|c| c.restore_string()).collect::<Vec<_>>()
+            residual
+                .iter()
+                .map(|c| c.restore_string())
+                .collect::<Vec<_>>()
         );
     }
     let merge_est = probe_est;
@@ -16345,10 +16349,21 @@ fn mv_multi_index_merge_plan(
         .iter()
         .position(|conjunct| conjunct.split_dnf().len() > 1)
     else {
-        return mv_cnf_intersection_plan(select, from, info, candidates, &cnf, table_rows, table_stats);
+        return mv_cnf_intersection_plan(
+            select,
+            from,
+            info,
+            candidates,
+            &cnf,
+            table_rows,
+            table_stats,
+        );
     };
     if std::env::var("SEALDB_DEBUG_MV").is_ok() {
-        eprintln!("MV multi enter or_pos={or_pos} cnf={:?}", cnf.iter().map(|c| c.restore_string()).collect::<Vec<_>>());
+        eprintln!(
+            "MV multi enter or_pos={or_pos} cnf={:?}",
+            cnf.iter().map(|c| c.restore_string()).collect::<Vec<_>>()
+        );
     }
     let items = cnf[or_pos].split_dnf();
     let outer: Vec<ExprNode> = cnf
@@ -16402,37 +16417,30 @@ fn mv_multi_index_merge_plan(
                 indexes: Vec::new(),
                 disabled: false,
             };
-            built = index_merge_union_arm(
-                info,
-                &all_indexes,
-                &conds,
-                &all_conds,
-                table_rows,
-                None,
-            )
-            .map(|(path, consumed)| (vec![path], consumed))
-            .or_else(|| {
-                if !mv_item_allows_table_scan_fallback(info, &conds) {
-                    return None;
-                }
-                let consumed = all_conds.clone();
-                let path = IndexMergePath {
-                    index: String::new(),
-                    range: None,
-                    table_range: true,
-                    index_columns: Vec::new(),
-                    keep_order: false,
-                    desc: false,
-                    limit: None,
-                    topn: None,
-                    tid_selection: None,
-                    residual_selection: None,
-                    ranges: Vec::new(),
-                    seek: None,
-                    table_scan_pseudo: table_stats.is_none(),
-                };
-                Some((vec![path], consumed))
-            });
+            built = index_merge_union_arm(info, &all_indexes, &conds, &all_conds, table_rows, None)
+                .map(|(path, consumed)| (vec![path], consumed))
+                .or_else(|| {
+                    if !mv_item_allows_table_scan_fallback(info, &conds) {
+                        return None;
+                    }
+                    let consumed = all_conds.clone();
+                    let path = IndexMergePath {
+                        index: String::new(),
+                        range: None,
+                        table_range: true,
+                        index_columns: Vec::new(),
+                        keep_order: false,
+                        desc: false,
+                        limit: None,
+                        topn: None,
+                        tid_selection: None,
+                        residual_selection: None,
+                        ranges: Vec::new(),
+                        seek: None,
+                        table_scan_pseudo: table_stats.is_none(),
+                    };
+                    Some((vec![path], consumed))
+                });
         }
         let (mut arms, consumed) = built?;
         let consumed: Vec<ExprNode> = consumed
@@ -16514,7 +16522,8 @@ fn find_mv_index_merge_plan(
             .filter_map(|name| hint_index(info, name))
             .collect();
         if hinted.iter().any(|idx| index_is_multi_valued(info, idx))
-            && let Some(plan) = mv_multi_index_merge_plan(select, from, info, &hinted, table_rows, table_stats)
+            && let Some(plan) =
+                mv_multi_index_merge_plan(select, from, info, &hinted, table_rows, table_stats)
         {
             return Some(plan);
         }
@@ -16620,7 +16629,7 @@ fn index_merge_index_arm(
                 keep_order: false,
                 desc: false,
                 limit: None,
-            topn: None,
+                topn: None,
                 tid_selection: None,
                 residual_selection: None,
                 ranges,
@@ -17471,7 +17480,10 @@ fn index_merge_residual_rows(
     if debug {
         eprintln!(
             "IM residual rows={rows} sel={selectivity} conds={:?}",
-            residual.iter().map(|c| c.restore_string()).collect::<Vec<_>>()
+            residual
+                .iter()
+                .map(|c| c.restore_string())
+                .collect::<Vec<_>>()
         );
     }
     (rows * selectivity).clamp(0.0, rows)
@@ -17612,16 +17624,17 @@ fn index_merge_plan(
             .iter()
             .filter_map(|name| hint_index(info, name))
             .collect();
-        if candidates.iter().any(|idx| index_is_multi_valued(info, idx))
-            && let Some(plan) =
-                mv_multi_index_merge_plan(
-                    select,
-                    from,
-                    info,
-                    &candidates,
-                    table_rows,
-                    table_stats.as_ref(),
-                )
+        if candidates
+            .iter()
+            .any(|idx| index_is_multi_valued(info, idx))
+            && let Some(plan) = mv_multi_index_merge_plan(
+                select,
+                from,
+                info,
+                &candidates,
+                table_rows,
+                table_stats.as_ref(),
+            )
         {
             return Some(plan);
         }
@@ -17630,8 +17643,7 @@ fn index_merge_plan(
     // hidden generated column can only be seeked element by element through an
     // IndexMerge (`planner/core/indexmerge_path`). Try them before the ordinary
     // union / intersection shapes.
-    if let Some(plan) =
-        find_mv_index_merge_plan(
+    if let Some(plan) = find_mv_index_merge_plan(
         select,
         from,
         info,
@@ -17639,8 +17651,7 @@ fn index_merge_plan(
         table_stats.as_ref(),
         hinted.as_ref(),
         false,
-    )
-    {
+    ) {
         return Some(plan);
     }
     let or_pos = cnf
@@ -17797,9 +17808,7 @@ fn index_merge_plan(
     let mut keep_order = false;
     let mut order_column = None;
     let mut order_desc = false;
-    if !intersection
-        && let Some((column, desc)) = &order
-    {
+    if !intersection && let Some((column, desc)) = &order {
         order_column = Some(column.clone());
         order_desc = *desc;
         // An arm keeps key order only when every key part before the sort
@@ -17870,7 +17879,9 @@ fn index_merge_plan(
     // its probe side. The root `TopN` is added by `apply_order_limit`.
     if ordered
         && !keep_order
-        && let Some((offset, count_limit)) = select.limit.map(|count| (select.offset.unwrap_or(0), count))
+        && let Some((offset, count_limit)) = select
+            .limit
+            .map(|count| (select.offset.unwrap_or(0), count))
     {
         for path in &mut paths {
             if path.keep_order {
@@ -33034,7 +33045,9 @@ fn access_plan_inner(
                     .iter()
                     .filter_map(|name| hint_index(info, name))
                     .collect();
-                if candidates.iter().any(|idx| index_is_multi_valued(info, idx))
+                if candidates
+                    .iter()
+                    .any(|idx| index_is_multi_valued(info, idx))
                     && let Some(plan) = mv_multi_index_merge_plan(
                         select,
                         from,
@@ -33277,9 +33290,7 @@ fn access_plan_inner(
                 .and_then(|name| index_merge_hint(&select.text, name))
         });
         if from.use_indexes.is_empty()
-            && (merge_hint
-                .as_ref()
-                .is_some_and(|hint| !hint.disabled)
+            && (merge_hint.as_ref().is_some_and(|hint| !hint.disabled)
                 || opt_fix_control_52869(select))
             && select.selection.as_ref().is_some_and(|selection| {
                 selection
@@ -33287,19 +33298,16 @@ fn access_plan_inner(
                     .iter()
                     .any(|conjunct| conjunct.split_dnf().len() > 1)
             })
-            && let Some(plan) =
-                index_merge_plan(select, from, info, prune_mode, stats, current_db)
+            && let Some(plan) = index_merge_plan(select, from, info, prune_mode, stats, current_db)
         {
             return plan;
         }
         for (column, value) in &eqs {
             // TiDB prefers the unique index on the column for a point get over
             // a composite index that merely shares its leading column.
-            let covering = info
-                .find_index_covering(column)
-                .filter(|idx| {
-                    !index_ignored(from, idx.name.o()) && !index_is_multi_valued(info, idx)
-                });
+            let covering = info.find_index_covering(column).filter(|idx| {
+                !index_ignored(from, idx.name.o()) && !index_is_multi_valued(info, idx)
+            });
             let preferred = info
                 .find_unique_index_on(column)
                 .filter(|idx| {

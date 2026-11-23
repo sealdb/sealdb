@@ -1489,12 +1489,12 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "VALUES" => Ok(Datum::Null),
         // `CURRENT_USER()` / `USER()` / `SESSION_USER()`: the authenticated
         // identity as `user@host`.
-        "CURRENT_USER" | "USER" | "SESSION_USER" | "SYSTEM_USER" => Ok(
-            match current_user_identity() {
+        "CURRENT_USER" | "USER" | "SESSION_USER" | "SYSTEM_USER" => {
+            Ok(match current_user_identity() {
                 Some(identity) => Datum::Bytes(identity.into_bytes()),
                 None => Datum::Null,
-            },
-        ),
+            })
+        }
         // `DATABASE()` / `SCHEMA()`: the session's current database.
         "DATABASE" | "SCHEMA" => {
             let db = current_db_name();
@@ -2969,16 +2969,14 @@ fn eval_json_memberof(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> 
     // Parsing it as a JSON document would turn it into the number 1 and match
     // a numeric array element.
     let needle = match (&func.args[0], &needle) {
-        (
-            ExprNode::Cast(cast),
-            Datum::Bytes(bytes),
-        ) if cast.target.eq_ignore_ascii_case("json")
-            && matches!(
-                cast.expr.as_ref(),
-                ExprNode::Value(ValueExpr {
-                    datum: Datum::Bytes(_)
-                })
-            ) =>
+        (ExprNode::Cast(cast), Datum::Bytes(bytes))
+            if cast.target.eq_ignore_ascii_case("json")
+                && matches!(
+                    cast.expr.as_ref(),
+                    ExprNode::Value(ValueExpr {
+                        datum: Datum::Bytes(_)
+                    })
+                ) =>
         {
             serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
         }
@@ -3051,13 +3049,15 @@ fn json_contains_value(target: &serde_json::Value, candidate: &serde_json::Value
 
 fn json_overlaps_value(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     match (left, right) {
-        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
-            a.iter().any(|item| b.iter().any(|other| json_value_eq(item, other)))
+        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => a
+            .iter()
+            .any(|item| b.iter().any(|other| json_value_eq(item, other))),
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            a.iter().any(|(key, value)| {
+                b.get(key)
+                    .is_some_and(|other| json_contains_value(value, other))
+            })
         }
-        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => a.iter().any(|(key, value)| {
-            b.get(key)
-                .is_some_and(|other| json_contains_value(value, other))
-        }),
         _ => json_value_eq(left, right),
     }
 }

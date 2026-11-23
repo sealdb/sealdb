@@ -299,6 +299,16 @@ impl ExecutorBuilder {
                     domain.bind_info_rows()
                 } else if table.eq_ignore_ascii_case("tables_priv") {
                     tables_priv_rows(&domain)
+                } else if matches!(
+                    table.to_ascii_lowercase().as_str(),
+                    "schema_privileges" | "table_privileges" | "column_privileges"
+                ) {
+                    privilege_information_rows(&domain, &table)
+                } else if table.eq_ignore_ascii_case("columns") {
+                    let (columns, rows) =
+                        sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?;
+                    let rows = columns_for_session(&domain, &columns, rows);
+                    (columns, rows)
                 } else {
                     sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?
                 };
@@ -350,18 +360,21 @@ impl ExecutorBuilder {
                 push_down,
                 ..
             } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("index lookup without select"))?;
+                let from = index_reader_table(select, table)
+                    .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
+                if let Some(exec) = mysql_user_exec(&from, current_db, stmt, &domain) {
+                    return Ok(exec);
+                }
                 // TiDB's probe-side `TableRowIDScan` batches the build handles
                 // into one `BatchGet` (key order) unless the read must keep the
                 // index-key order (`keep order:true`) for an ORDER BY.
                 let keep_order = range_scan.as_ref().is_some_and(|range| range.keep_order)
                     || keep_order_pushed(pushed.as_ref());
-                let select = stmt
-                    .as_select()
-                    .ok_or_else(|| Error::unsupported("index lookup without select"))?;
                 // The reader may belong to any table of a joined SELECT (index
                 // join / applied subquery), not only the leading FROM factor.
-                let from = index_reader_table(select, table)
-                    .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
                 let access =
                     index_access(&domain, current_db, &from, index, select.selection.as_ref())
                         .ok_or_else(|| Error::unsupported("index lookup without access path"))?;
@@ -625,6 +638,9 @@ impl ExecutorBuilder {
                 ..
             } => {
                 let from = resolve_reader_table(stmt, table)?;
+                if let Some(exec) = mysql_user_exec(&from, current_db, stmt, &domain) {
+                    return Ok(exec);
+                }
                 let with_rowid = stmt
                     .as_select()
                     .is_some_and(Self::select_references_tidb_rowid);
@@ -2851,6 +2867,15 @@ fn select_from_column_names(
                     .filter(|c| !c.hidden)
                     .map(|c| c.name.o().to_string())
                     .collect(),
+                // Synthetic `INFORMATION_SCHEMA` tables (CLUSTER_*,
+                // INSPECTION_RULES, …) have no `TableInfo`; their layout is
+                // produced by the virtual-row provider. Needed when the plan
+                // folds to a `TableDual` (`LIMIT 0`) but the header must stay.
+                None if schema.eq_ignore_ascii_case("information_schema") => {
+                    sealdb_infoschema::tables::virtual_rows(&name, &is)
+                        .map(|(columns, _)| columns)
+                        .unwrap_or_default()
+                }
                 None => Vec::new(),
             },
         };
@@ -3387,10 +3412,129 @@ fn agg_subquery_ctx(
     ))
 }
 
+/// `mysql.user` is backed by the privilege manager rather than stored rows:
+/// the executor substitutes an in-memory row source while EXPLAIN keeps the
+/// regular table-scan shape.
+fn mysql_user_table(from: &TableName, current_db: &str) -> bool {
+    let schema = from
+        .schema
+        .as_deref()
+        .filter(|schema| !schema.is_empty())
+        .unwrap_or(current_db);
+    schema.eq_ignore_ascii_case("mysql") && from.resolve_name().eq_ignore_ascii_case("user")
+}
+
+fn mysql_user_exec(
+    from: &TableName,
+    current_db: &str,
+    stmt: &Statement,
+    domain: &Arc<Domain>,
+) -> Option<Box<dyn Executor>> {
+    if !mysql_user_table(from, current_db) {
+        return None;
+    }
+    let is = domain.infoschema();
+    let info = is.table_by_name("mysql", "user")?;
+    let columns: Vec<String> = info
+        .columns
+        .iter()
+        .map(|column| column.name.o().to_string())
+        .collect();
+    let rows = mysql_user_rows(domain, &columns);
+    let mut exec: Box<dyn Executor> = Box::new(MemTableExec::new(columns, rows));
+    if let Some(selection) = stmt.as_select().and_then(|select| select.selection.clone()) {
+        exec = Box::new(SelectionExec::new(selection, exec));
+    }
+    Some(exec)
+}
+
+fn mysql_user_rows(domain: &Domain, columns: &[String]) -> Vec<Vec<sealdb_types::Datum>> {
+    use sealdb_parser::ast::PrivilegeType;
+    use sealdb_types::Datum;
+    fn bytes(value: impl Into<String>) -> Datum {
+        Datum::Bytes(value.into().into_bytes())
+    }
+    fn yn(value: bool) -> Datum {
+        bytes(if value { "Y" } else { "N" })
+    }
+    domain
+        .privilege()
+        .user_rows()
+        .into_iter()
+        .map(|row| {
+            columns
+                .iter()
+                .map(|column| match column.to_ascii_lowercase().as_str() {
+                    "host" => bytes(row.host.clone()),
+                    "user" => bytes(row.user.clone()),
+                    "authentication_string" => row
+                        .auth
+                        .clone()
+                        .map(bytes)
+                        .unwrap_or(Datum::Null),
+                    "plugin" => bytes(row.plugin.clone()),
+                    "select_priv" => yn(row.global_privs.contains(PrivilegeType::SELECT)),
+                    "insert_priv" => yn(row.global_privs.contains(PrivilegeType::INSERT)),
+                    "update_priv" => yn(row.global_privs.contains(PrivilegeType::UPDATE)),
+                    "delete_priv" => yn(row.global_privs.contains(PrivilegeType::DELETE)),
+                    "create_priv" => yn(row.global_privs.contains(PrivilegeType::CREATE)),
+                    "drop_priv" => yn(row.global_privs.contains(PrivilegeType::DROP)),
+                    "process_priv" => yn(row.global_privs.contains(PrivilegeType::PROCESS)),
+                    "grant_priv" => yn(row.with_grant),
+                    "references_priv" => yn(row.global_privs.contains(PrivilegeType::REFERENCES)),
+                    "index_priv" => yn(row.global_privs.contains(PrivilegeType::INDEX)),
+                    "alter_priv" => yn(row.global_privs.contains(PrivilegeType::ALTER)),
+                    "show_db_priv" => yn(false),
+                    "super_priv" => yn(row.global_privs.contains(PrivilegeType::SUPER)),
+                    "create_tmp_table_priv" => {
+                        yn(row.global_privs.contains(PrivilegeType::CREATE_TEMP_TABLES))
+                    }
+                    "lock_tables_priv" => {
+                        yn(row.global_privs.contains(PrivilegeType::LOCK_TABLES))
+                    }
+                    "execute_priv" => yn(row.global_privs.contains(PrivilegeType::EXECUTE)),
+                    "create_view_priv" => {
+                        yn(row.global_privs.contains(PrivilegeType::CREATE_VIEW))
+                    }
+                    "show_view_priv" => yn(row.global_privs.contains(PrivilegeType::SHOW_VIEW)),
+                    "create_routine_priv" => {
+                        yn(row.global_privs.contains(PrivilegeType::CREATE_ROUTINE))
+                    }
+                    "alter_routine_priv" => {
+                        yn(row.global_privs.contains(PrivilegeType::ALTER_ROUTINE))
+                    }
+                    "create_user_priv" => {
+                        yn(row.global_privs.contains(PrivilegeType::CREATE_USER))
+                    }
+                    "event_priv" => yn(row.global_privs.contains(PrivilegeType::EVENT)),
+                    "trigger_priv" => yn(row.global_privs.contains(PrivilegeType::TRIGGER)),
+                    "create_tablespace_priv" => {
+                        yn(row.global_privs.contains(PrivilegeType::CREATE_TABLESPACE))
+                    }
+                    "create_role_priv" => {
+                        yn(row.global_privs.contains(PrivilegeType::CREATE_ROLE))
+                    }
+                    "drop_role_priv" => yn(row.global_privs.contains(PrivilegeType::DROP_ROLE)),
+                    "ssl_type" | "ssl_cipher" | "x509_issuer" | "x509_subject" => bytes(""),
+                    "max_questions" | "max_updates" | "max_connections"
+                    | "max_user_connections" => Datum::I64(0),
+                    "password_expired" | "account_locked" => bytes("N"),
+                    "password_last_changed" => bytes("2020-01-01 00:00:00"),
+                    "password_lifetime"
+                    | "password_reuse_history"
+                    | "password_reuse_time"
+                    | "password_require_current" => Datum::Null,
+                    "user_attributes" => bytes(row.attributes.clone()),
+                    _ => Datum::Null,
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// `mysql.tables_priv` rows from the privilege manager (TiDB persists one row
 /// per table-scope grant; the engine keeps the same data in memory).
-fn tables_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {
-    use sealdb_types::Datum;
+fn tables_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {    use sealdb_types::Datum;
     let columns: Vec<String> = [
         "Host",
         "DB",
@@ -3422,4 +3566,147 @@ fn tables_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datu
         })
         .collect();
     (columns, rows)
+}
+
+/// `information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES`: every row for a
+/// globally privileged account, otherwise only the caller's own grants (TiDB
+/// hides rows at scopes the caller does not administer).
+fn privilege_information_rows(
+    domain: &Domain,
+    table: &str,
+) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {
+    use sealdb_types::Datum;
+    let lower = table.to_ascii_lowercase();
+    let columns: Vec<String> = match lower.as_str() {
+        "schema_privileges" => vec![
+            "GRANTEE",
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "PRIVILEGE_TYPE",
+            "IS_GRANTABLE",
+        ],
+        "table_privileges" => vec![
+            "GRANTEE",
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "PRIVILEGE_TYPE",
+            "IS_GRANTABLE",
+        ],
+        _ => vec![
+            "GRANTEE",
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "COLUMN_NAME",
+            "PRIVILEGE_TYPE",
+            "IS_GRANTABLE",
+        ],
+    }
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let mgr = domain.privilege();
+    let caller = sealdb_privilege::thread_user();
+    let show_all = caller
+        .as_ref()
+        .is_none_or(|user| mgr.has_global_grant(user));
+    let own = caller.map(|user| format!("'{}'@'{}'", user.username, user.hostname));
+    let mut rows = Vec::new();
+    for row in mgr.privilege_rows() {
+        if !show_all && own.as_deref() != Some(row.grantee.as_str()) {
+            continue;
+        }
+        let grantable = if row.grantable { "YES" } else { "NO" };
+        let record = match lower.as_str() {
+            "schema_privileges" if row.table.is_none() => vec![
+                Datum::Bytes(row.grantee.into_bytes()),
+                Datum::Bytes(b"def".to_vec()),
+                Datum::Bytes(row.db.into_bytes()),
+                Datum::Bytes(row.privilege.into_bytes()),
+                Datum::Bytes(grantable.as_bytes().to_vec()),
+            ],
+            "table_privileges" if row.table.is_some() && row.column.is_none() => vec![
+                Datum::Bytes(row.grantee.into_bytes()),
+                Datum::Bytes(b"def".to_vec()),
+                Datum::Bytes(row.db.into_bytes()),
+                Datum::Bytes(row.table.unwrap_or_default().into_bytes()),
+                Datum::Bytes(row.privilege.into_bytes()),
+                Datum::Bytes(grantable.as_bytes().to_vec()),
+            ],
+            "column_privileges" if row.column.is_some() => vec![
+                Datum::Bytes(row.grantee.into_bytes()),
+                Datum::Bytes(b"def".to_vec()),
+                Datum::Bytes(row.db.into_bytes()),
+                Datum::Bytes(row.table.unwrap_or_default().into_bytes()),
+                Datum::Bytes(row.column.unwrap_or_default().into_bytes()),
+                Datum::Bytes(row.privilege.into_bytes()),
+                Datum::Bytes(grantable.as_bytes().to_vec()),
+            ],
+            _ => continue,
+        };
+        rows.push(record);
+    }
+    (columns, rows)
+}
+
+/// TiDB `setDataForColumnsWithOneTable`: `information_schema.columns` only
+/// exposes a table's columns when the session holds at least one *column*
+/// privilege on it, and its `PRIVILEGES` cell lists those privileges
+/// (`select,insert,update,references` order).
+fn columns_for_session(
+    domain: &Domain,
+    columns: &[String],
+    rows: Vec<Vec<sealdb_types::Datum>>,
+) -> Vec<Vec<sealdb_types::Datum>> {
+    use sealdb_parser::ast::PrivilegeType;
+    use sealdb_types::Datum;
+    use std::collections::HashMap;
+
+    let Some(user) = sealdb_privilege::thread_user() else {
+        return rows;
+    };
+    let roles = sealdb_privilege::thread_active_roles();
+    let index = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
+    let (Some(schema_i), Some(table_i), Some(priv_i)) =
+        (index("TABLE_SCHEMA"), index("TABLE_NAME"), index("PRIVILEGES"))
+    else {
+        return rows;
+    };
+    let mgr = domain.privilege();
+    let mut cache: HashMap<(String, String), Option<String>> = HashMap::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        let text = |datum: &Datum| match datum {
+            Datum::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            _ => String::new(),
+        };
+        let schema = text(&row[schema_i]);
+        let table = text(&row[table_i]);
+        let privileges = cache
+            .entry((schema.clone(), table.clone()))
+            .or_insert_with(|| {
+                let mut names = Vec::new();
+                for (privs, name) in [
+                    (PrivilegeType::SELECT, "select"),
+                    (PrivilegeType::INSERT, "insert"),
+                    (PrivilegeType::UPDATE, "update"),
+                    (PrivilegeType::REFERENCES, "references"),
+                ] {
+                    if mgr.request_verification_with_roles(
+                        &user, &roles, &schema, &table, privs,
+                    ) {
+                        names.push(name);
+                    }
+                }
+                (!names.is_empty()).then(|| names.join(","))
+            })
+            .clone();
+        let Some(privileges) = privileges else {
+            continue;
+        };
+        row[priv_i] = Datum::Bytes(privileges.into_bytes());
+        out.push(row);
+    }
+    out
 }

@@ -110,6 +110,10 @@ pub struct Session {
     session_id: u64,
     current_db: Mutex<String>,
     current_user: Mutex<UserIdentity>,
+    /// Host the client authenticated from (TiDB `SessionVars.User.Hostname`).
+    /// Account matching may pick a wildcard (`'%'`); access-denied messages
+    /// still report the real peer host (`127.0.0.1`).
+    login_host: Mutex<Option<String>>,
     txn: Mutex<TxnManager>,
     /// Schema before the first DDL in the current explicit txn.
     schema_snap: Mutex<Option<SchemaSnap>>,
@@ -251,6 +255,7 @@ impl Session {
             session_id,
             current_db: Mutex::new(String::new()),
             current_user: Mutex::new(UserIdentity::root()),
+            login_host: Mutex::new(None),
             txn: Mutex::new(TxnManager::new()),
             schema_snap: Mutex::new(None),
             isolation: Mutex::new(IsolationLevel::RepeatableRead),
@@ -311,13 +316,30 @@ impl Session {
     }
 
     pub fn set_current_user(&self, user: UserIdentity) {
+        let defaults = self.domain.privilege().default_roles(&user);
         *self.current_user.lock().expect("session current_user lock") = user;
+        *self.active_roles.lock().expect("session active roles lock") = defaults;
     }
 
     pub fn current_user(&self) -> UserIdentity {
         self.current_user
             .lock()
             .expect("session current_user lock")
+            .clone()
+    }
+
+    /// Record the peer host seen during authentication (TiDB keeps it
+    /// separately from the matched account host).
+    pub fn set_login_host(&self, host: impl Into<String>) {
+        let host = host.into();
+        *self.login_host.lock().expect("session login_host lock") = (!host.is_empty()).then_some(host);
+    }
+
+    /// Host to report in access-denied errors, falling back to the account host.
+    pub fn login_host(&self) -> Option<String> {
+        self.login_host
+            .lock()
+            .expect("session login_host lock")
             .clone()
     }
 
@@ -1080,19 +1102,14 @@ impl Session {
         // Executors that filter by caller (`SHOW DATABASES`) read the identity
         // from a thread-local; sessions are pinned to a thread per statement.
         sealdb_privilege::set_thread_user(Some(self.current_user()));
+        sealdb_privilege::set_thread_active_roles(
+            self.active_roles
+                .lock()
+                .expect("session active roles lock")
+                .clone(),
+        );
         // `CURRENT_USER()` / `USER()` read the same identity.
         sealdb_expression::set_current_user_identity(Some(self.current_user().display()));
-        let mut owned = None;
-        let stmt = if let Statement::Show(show) = stmt
-            && show.kind == sealdb_parser::ast::ShowStmtKind::Grants
-            && show.user.is_none()
-        {
-            let mut show = show.clone();
-            show.user = Some(self.current_user());
-            owned.insert(Statement::Show(show))
-        } else {
-            stmt
-        };
         self.check_privilege(stmt)?;
         if is_write_stmt(stmt) && self.in_read_only() {
             return Err(sealdb_errno::Error::new(
@@ -1143,6 +1160,26 @@ impl Session {
                 });
             }
             Statement::Do(doit) => {
+                if let Some(op) = sealdb_parser::sqlparser_bridge::take_admin_op() {
+                    use sealdb_parser::sqlparser_bridge::AdminOp;
+                    match op {
+                        AdminOp::SetBdr(role) => self.domain.set_bdr_role(role),
+                        AdminOp::UnsetBdr => self.domain.set_bdr_role(""),
+                        AdminOp::ShowBdr => {
+                            return Ok(QueryResult {
+                                columns: vec!["BDR_ROLE".to_string()],
+                                rows: vec![vec![sealdb_types::Datum::Bytes(
+                                    self.domain.bdr_role().into_bytes(),
+                                )]],
+                                warnings: Vec::new(),
+                                affected_rows: 0,
+                                info: String::new(),
+                            });
+                        }
+                        AdminOp::Other => {}
+                    }
+                    return Ok(empty_result());
+                }
                 for expr in &doit.exprs {
                     let _ = sealdb_expression::eval_expr(expr)?;
                 }
@@ -1372,6 +1409,11 @@ impl Session {
                 *self.active_roles.lock().expect("session active roles lock") = roles;
                 return Ok(empty_result());
             }
+            Statement::SetDefaultRole(set) => {
+                self.domain.privilege().set_default_role(set)?;
+                self.domain.persist_privileges()?;
+                return Ok(empty_result());
+            }
             Statement::SetTxn(set) => {
                 if let Some(isolation) = set.isolation {
                     *self.isolation.lock().expect("session isolation lock") =
@@ -1414,6 +1456,13 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::Prepare(prepare) => {
+                // TiDB builds the plan (and checks privileges) at PREPARE time,
+                // so a denied statement is never registered (a later EXECUTE
+                // reports 8111). Parameter markers may not parse as literals;
+                // those are checked at EXECUTE instead.
+                if let Ok(inner) = self.parser.parse_one_stmt(&prepare.sql) {
+                    self.check_privilege(&inner)?;
+                }
                 let db = self
                     .current_db
                     .lock()
@@ -2005,6 +2054,19 @@ impl Session {
             explain: matches!(stmt, Statement::Explain(_)),
         };
         expand_views(&mut expanded, &is, &current_db, &view_priv)?;
+        // TiDB `buildSelect` collects view-level privileges after the view body
+        // has been accepted (1356 wins over 1142/1143). The original statement
+        // still names the views; expansion has replaced them by CTEs/joins.
+        if let Statement::Select(select) = stmt {
+            self.check_select_table_privileges(select, true)?;
+        }
+        // `EXPLAIN` collects the inner SELECT's visitInfo too: after SHOW VIEW
+        // is satisfied by expansion, a missing SELECT on the view is 1142.
+        if let Statement::Explain(explain) = stmt
+            && let Statement::Select(select) = explain.stmt.as_ref()
+        {
+            self.check_select_table_privileges(select, true)?;
+        }
         // Refuse unknown table qualifiers (`xxxxx.a`, or bare `t.a` when the
         // FROM item is aliased as `tmp`) with TiDB's 1054 clause wording.
         validate_statement_column_refs(&expanded)?;
@@ -2658,6 +2720,133 @@ impl Session {
         self.domain.stats()
     }
 
+    /// TiDB `buildSelect` privilege collection for either the physical tables
+    /// (`views == false`) or the view names (`views == true`) referenced by
+    /// `select`. Wildcards request table-level SELECT (1142); explicit columns
+    /// request column-level SELECT (1143).
+    fn check_select_table_privileges(&self, select: &SelectStmt, views: bool) -> Result<()> {
+        let mgr = self.domain.privilege();
+        if mgr.skip_grant_table() {
+            return Ok(());
+        }
+        let user = self.current_user();
+        let roles = self
+            .active_roles
+            .lock()
+            .expect("session active roles lock")
+            .clone();
+        let current_db = self
+            .current_db
+            .lock()
+            .expect("session current_db lock")
+            .clone();
+        let is = self.domain.infoschema();
+        let tables: Vec<&TableName> = select.join_tables();
+        // information_schema is readable by every account (TiDB filters rows
+        // rather than requiring SELECT).
+        let eligible = |table: &TableName| -> bool {
+            let (schema, name) = table.qualified(&current_db);
+            if schema.eq_ignore_ascii_case("information_schema") {
+                return false;
+            }
+            is.table_by_name(&schema, &name)
+                .is_some_and(|info| info.is_view())
+                == views
+        };
+        let check_column = |qualifier: Option<&str>, column: &str| -> Result<()> {
+            let Some((db, table)) =
+                resolve_update_column(&is, &tables, qualifier, column, &current_db)
+            else {
+                return Ok(());
+            };
+            let Some(owner) = tables.iter().copied().find(|t| {
+                let (d, n) = t.qualified(&current_db);
+                d.eq_ignore_ascii_case(&db) && n.eq_ignore_ascii_case(&table)
+            }) else {
+                return Ok(());
+            };
+            if !eligible(owner) {
+                return Ok(());
+            }
+            if !mgr.request_column_verification_with_roles(
+                &user,
+                &roles,
+                &db,
+                &table,
+                column,
+                PrivilegeType::SELECT,
+            ) {
+                return Err(column_access_denied("SELECT", column, &table, &user));
+            }
+            Ok(())
+        };
+        let check_expr = |expr: &ExprNode| -> Result<()> {
+            for (qualifier, column) in expr.referenced_columns() {
+                check_column(qualifier.as_deref(), &column)?;
+            }
+            Ok(())
+        };
+        // TiDB checks lazily-collected columns; `count(*)`-style stars request
+        // the whole table.
+        let check_table_level = |table: &TableName| -> Result<()> {
+            if eligible(table) {
+                require_table_select(&mgr, &user, &roles, table, &current_db)?;
+            }
+            Ok(())
+        };
+        // Order mirrors TiDB `buildSelect`: join conditions, GROUP BY, WHERE,
+        // HAVING, ORDER BY, then the projection (wildcards last so a WHERE
+        // column denial wins, matching TiDB's visitInfo order).
+        for join in &select.joins {
+            if !join.natural {
+                check_expr(&join.on)?;
+            }
+        }
+        for expr in &select.group_by {
+            check_expr(expr)?;
+        }
+        if let Some(selection) = &select.selection {
+            check_expr(selection)?;
+        }
+        if let Some(having) = &select.having {
+            check_expr(having)?;
+        }
+        for item in &select.order_by {
+            check_expr(&item.expr)?;
+        }
+        for field in &select.fields {
+            if field.expr.is_star_marker() {
+                for table in &tables {
+                    check_table_level(table)?;
+                }
+                continue;
+            }
+            if let ExprNode::Column(column) = &field.expr
+                && column.name == "*"
+            {
+                // `t.*`: only the qualified table needs the privilege.
+                if let Some(table) = tables.iter().find(|t| {
+                    t.name
+                        .eq_ignore_ascii_case(column.table.as_deref().unwrap_or_default())
+                        || t
+                            .resolve_name()
+                            .eq_ignore_ascii_case(column.table.as_deref().unwrap_or_default())
+                }) {
+                    check_table_level(table)?;
+                }
+                continue;
+            }
+            if expr_mentions_star(&field.expr) {
+                for table in &tables {
+                    check_table_level(table)?;
+                }
+                continue;
+            }
+            check_expr(&field.expr)?;
+        }
+        Ok(())
+    }
+
     fn check_privilege(&self, stmt: &Statement) -> Result<()> {
         let mgr = self.domain.privilege();
         if mgr.skip_grant_table() {
@@ -2678,25 +2867,284 @@ impl Session {
             return self.check_privilege(&explain.stmt);
         }
         match stmt {
-            Statement::Grant(_)
-            | Statement::Revoke(_)
-            | Statement::CreateRole(_)
-            | Statement::DropRole(_)
-            | Statement::CreateUser(_)
-            | Statement::DropUser(_)
-            | Statement::GrantRole(_)
+            Statement::Grant(grant) => {
+                let (db, table) = level_names(&grant.level, &current_db);
+                if !mgr.request_grant_option_with_roles(&user, &roles, &db, &table) {
+                    return Err(grant_option_denied());
+                }
+            }
+            Statement::Revoke(revoke) => {
+                let (db, table) = level_names(&revoke.level, &current_db);
+                if !mgr.request_grant_option_with_roles(&user, &roles, &db, &table) {
+                    return Err(grant_option_denied());
+                }
+            }
+            // TiDB `buildImportInto` requests full DML + ALTER on the target,
+            // then FILE (the file is read by the server), in this order.
+            Statement::ImportInto(import) => {
+                let table = import_into_table(&import.raw_sql)
+                    .ok_or_else(|| Error::new(1064, "You have an error in your SQL syntax"))?;
+                for privs in [
+                    PrivilegeType::SELECT,
+                    PrivilegeType::UPDATE,
+                    PrivilegeType::INSERT,
+                    PrivilegeType::DELETE,
+                    PrivilegeType::ALTER,
+                ] {
+                    require(&mgr, &user, &roles, &table, &current_db, privs)?;
+                }
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::FILE,
+                ) {
+                    return Err(specific_access_denied("FILE"));
+                }
+            }
+            // Account/role management uses `mysql.user` DML or the global
+            // CREATE USER / CREATE ROLE bits (TiDB `simple.go`), with the
+            // privilege named in a 1227 message.
+            Statement::CreateUser(_) => {
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "mysql",
+                    "user",
+                    PrivilegeType::INSERT,
+                ) && !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::CREATE_USER,
+                ) {
+                    return Err(specific_access_denied("CREATE User"));
+                }
+            }
+            Statement::DropUser(_) => {
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "mysql",
+                    "user",
+                    PrivilegeType::DELETE,
+                ) && !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::CREATE_USER,
+                ) {
+                    return Err(specific_access_denied("CREATE USER"));
+                }
+            }
+            // TiDB `AlterUserExec`: changing your own password needs no
+            // privilege; another account needs CREATE USER / UPDATE on
+            // mysql.user, and a `SYSTEM_USER` (or restricted) target needs
+            // SYSTEM_USER / SUPER / RESTRICTED_USER_ADMIN.
+            Statement::AlterUser(alter) => {
+                let has_create_user = mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::CREATE_USER,
+                ) || mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "mysql",
+                    "user",
+                    PrivilegeType::UPDATE,
+                );
+                let has_system_user = mgr
+                    .request_verification_with_roles(
+                        &user,
+                        &roles,
+                        "",
+                        "",
+                        PrivilegeType::SYSTEM_USER,
+                    )
+                    || mgr.request_dynamic_verification_with_roles(
+                        &user,
+                        &roles,
+                        "SYSTEM_USER",
+                    )
+                    || mgr.request_dynamic_verification_with_roles(
+                        &user,
+                        &roles,
+                        "RESTRICTED_USER_ADMIN",
+                    );
+                let mut system_target = false;
+                for spec in &alter.users {
+                    let is_self = spec.user.username == user.username
+                        && spec.user.hostname.eq_ignore_ascii_case(&user.hostname);
+                    if is_self {
+                        continue;
+                    }
+                    if !has_create_user {
+                        return Err(specific_access_denied("CREATE USER"));
+                    }
+                    if !has_system_user
+                        && mgr.request_verification_with_roles(
+                            &spec.user,
+                            &[],
+                            "",
+                            "",
+                            PrivilegeType::SYSTEM_USER,
+                        )
+                    {
+                        system_target = true;
+                    }
+                }
+                if system_target {
+                    return Err(specific_access_denied("SYSTEM_USER or SUPER"));
+                }
+            }
+            Statement::CreateRole(_) => {
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "mysql",
+                    "user",
+                    PrivilegeType::INSERT,
+                ) && !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::CREATE_ROLE,
+                ) && !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::CREATE_USER,
+                ) {
+                    return Err(specific_access_denied("CREATE ROLE or CREATE USER"));
+                }
+            }
+            Statement::DropRole(_) => {
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "mysql",
+                    "user",
+                    PrivilegeType::DELETE,
+                ) && !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::DROP_ROLE,
+                ) && !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::CREATE_USER,
+                ) {
+                    return Err(specific_access_denied("DROP ROLE or CREATE USER"));
+                }
+            }
+            Statement::RenameUser(_) => {
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::CREATE_USER,
+                ) {
+                    return Err(specific_access_denied("CREATE USER"));
+                }
+            }
+            Statement::SetPwd(set) => {
+                // TiDB only checks SUPER when changing *another* user's
+                // password (`SET PASSWORD [FOR CURRENT_USER()]` is exempt) and
+                // reports the failure against database `mysql`.
+                let own = set.user.as_ref().is_none_or(|u| u.username.is_empty());
+                if !own
+                    && !mgr.request_verification_with_roles(
+                        &user,
+                        &roles,
+                        "",
+                        "",
+                        PrivilegeType::SUPER,
+                    )
+                {
+                    let mut err_user = user.clone();
+                    if let Some(host) = self.login_host() {
+                        err_user.hostname = host;
+                    }
+                    return Err(access_denied(
+                        "mysql",
+                        "",
+                        PrivilegeType::SUPER,
+                        &err_user,
+                    ));
+                }
+            }
+            Statement::GrantRole(_)
             | Statement::RevokeRole(_)
-            | Statement::SetPwd(_)
+            | Statement::SetDefaultRole(_)
             | Statement::Flush(_)
             | Statement::Shutdown(_)
             | Statement::Kill(_)
-            | Statement::RenameUser(_)
             | Statement::Binlog(_)
             | Statement::Change(_)
             | Statement::AlterInstance(_)
             | Statement::CleanupTableLock(_) => {
                 if !mgr.request_verification_with_roles(&user, &roles, "", "", PrivilegeType::ALL) {
                     return Err(access_denied("", "", PrivilegeType::ALL, &user));
+                }
+            }
+            Statement::CreatePlacementPolicy(_) | Statement::DropPlacementPolicy(_) => {
+                if !mgr.request_dynamic_verification_with_roles(&user, &roles, "PLACEMENT_ADMIN") {
+                    return Err(specific_access_denied("SUPER or PLACEMENT_ADMIN"));
+                }
+            }
+            Statement::CreateResourceGroup(_)
+            | Statement::AlterResourceGroup(_)
+            | Statement::DropResourceGroup(_) => {
+                if !mgr.request_dynamic_verification_with_roles(
+                    &user,
+                    &roles,
+                    "RESOURCE_GROUP_ADMIN",
+                ) {
+                    return Err(specific_access_denied("SUPER or RESOURCE_GROUP_ADMIN"));
+                }
+            }
+            Statement::SetResourceGroup(_) => {
+                if !mgr.request_dynamic_verification_with_roles(
+                    &user,
+                    &roles,
+                    "RESOURCE_GROUP_ADMIN",
+                ) && !mgr.request_dynamic_verification_with_roles(
+                    &user,
+                    &roles,
+                    "RESOURCE_GROUP_USER",
+                ) {
+                    return Err(specific_access_denied(
+                        "SUPER or RESOURCE_GROUP_ADMIN or RESOURCE_GROUP_USER",
+                    ));
+                }
+            }
+            // TiDB's plan builder requires SYSTEM_VARIABLES_ADMIN (SUPER as a
+            // substitute) for every `SET GLOBAL`, before the variable itself is
+            // validated (planner `buildSet`).
+            Statement::Set(set)
+                if set
+                    .assignments
+                    .iter()
+                    .any(|a| a.scope == sealdb_parser::ast::SetVarScope::Global) =>
+            {
+                if !mgr.request_dynamic_verification_with_roles(
+                    &user,
+                    &roles,
+                    "SYSTEM_VARIABLES_ADMIN",
+                ) {
+                    return Err(specific_access_denied("SUPER or SYSTEM_VARIABLES_ADMIN"));
                 }
             }
             Statement::LockStats(lock) => {
@@ -2721,6 +3169,68 @@ impl Session {
                         "SHOW",
                         &user,
                     ));
+                }
+            }
+            Statement::Show(show) if show.kind == sealdb_parser::ast::ShowStmtKind::CreateTable => {
+                if let Some(table) = &show.table {
+                    let (schema, name) = table.qualified(&current_db);
+                    let is = self.domain.infoschema();
+                    if is
+                        .table_by_name(&schema, &name)
+                        .is_some_and(|info| info.is_view())
+                    {
+                        if !mgr.request_verification_with_roles(
+                            &user,
+                            &roles,
+                            &schema,
+                            &name,
+                            PrivilegeType::SHOW_VIEW,
+                        ) {
+                            return Err(sealdb_privilege::Manager::access_denied_command(
+                                &schema,
+                                &name,
+                                "SHOW VIEW",
+                                &user,
+                            ));
+                        }
+                    } else if !mgr
+                        .request_any_table_verification_with_roles(&user, &roles, &schema, &name)
+                    {
+                        // TiDB asks for `AllPrivMask` (any privilege) here.
+                        return Err(sealdb_privilege::Manager::access_denied_command(
+                            &schema, &name, "SHOW", &user,
+                        ));
+                    }
+                }
+            }
+            Statement::Show(show) if show.kind == sealdb_parser::ast::ShowStmtKind::CreateView => {
+                if let Some(table) = &show.table {
+                    let (schema, name) = table.qualified(&current_db);
+                    if !mgr.request_verification_with_roles(
+                        &user,
+                        &roles,
+                        &schema,
+                        &name,
+                        PrivilegeType::SELECT,
+                    ) {
+                        return Err(sealdb_privilege::Manager::access_denied_command(
+                            &schema, &name, "SELECT", &user,
+                        ));
+                    }
+                    if !mgr.request_verification_with_roles(
+                        &user,
+                        &roles,
+                        &schema,
+                        &name,
+                        PrivilegeType::SHOW_VIEW,
+                    ) {
+                        return Err(sealdb_privilege::Manager::access_denied_command(
+                            &schema,
+                            &name,
+                            "SHOW VIEW",
+                            &user,
+                        ));
+                    }
                 }
             }
             Statement::LockTables(lock) => {
@@ -2761,7 +3271,11 @@ impl Session {
             }
             Statement::Show(show)
                 if show.kind == sealdb_parser::ast::ShowStmtKind::Grants
-                    && show.user.as_ref().is_some_and(|u| u != &user)
+                    // An empty identity is `CURRENT_USER()` (the caller).
+                    && show
+                        .user
+                        .as_ref()
+                        .is_some_and(|u| !u.username.is_empty() && u != &user)
                     && !mgr.request_verification_with_roles(
                         &user,
                         &roles,
@@ -2772,37 +3286,133 @@ impl Session {
             {
                 return Err(access_denied("", "", PrivilegeType::ALL, &user));
             }
+            Statement::Show(show)
+                if show.kind == sealdb_parser::ast::ShowStmtKind::DdlJobs
+                    && !mgr.request_verification_with_roles(
+                        &user,
+                        &roles,
+                        "",
+                        "",
+                        PrivilegeType::SUPER,
+                    ) =>
+            {
+                // `ADMIN SHOW DDL JOBS` is lowered to a SHOW over an internal
+                // schema; TiDB still gates it on SUPER.
+                return Err(sealdb_errno::Error::new(
+                    8121,
+                    "privilege check for 'Super' fail",
+                ));
+            }
             Statement::Select(select) => {
-                if let Some(from) = &select.from {
-                    require(
-                        &mgr,
+                // `SELECT … INTO OUTFILE` writes a server-side file: TiDB asks
+                // for the global `FILE` privilege before running the query.
+                if select.text.contains(sealdb_parser::INTO_OUTFILE_MARKER)
+                    && !mgr.request_verification_with_roles(
                         &user,
                         &roles,
-                        from,
-                        &current_db,
-                        PrivilegeType::SELECT,
-                    )?;
+                        "",
+                        "",
+                        PrivilegeType::FILE,
+                    )
+                {
+                    return Err(specific_access_denied("FILE"));
                 }
-                for table in select.join_tables() {
-                    require(
-                        &mgr,
-                        &user,
-                        &roles,
-                        table,
-                        &current_db,
-                        PrivilegeType::SELECT,
-                    )?;
+                let tables: Vec<&TableName> = select.join_tables();
+                // TiDB's `CLUSTER_*` information_schema tables are gated by the
+                // global CONFIG / PROCESS privilege instead of SELECT (the
+                // check happens while building the plan, so `LIMIT 0` does not
+                // bypass it).
+                for table in &tables {
+                    let (schema, name) = table.qualified(&current_db);
+                    if !schema.eq_ignore_ascii_case("information_schema") {
+                        continue;
+                    }
+                    let gate = match name.to_ascii_lowercase().as_str() {
+                        "cluster_config" | "cluster_hardware" => {
+                            Some((PrivilegeType::CONFIG, "CONFIG"))
+                        }
+                        "cluster_info" | "cluster_load" | "cluster_systeminfo" | "cluster_log" => {
+                            Some((PrivilegeType::PROCESS, "PROCESS"))
+                        }
+                        _ => None,
+                    };
+                    if let Some((privilege, label)) = gate
+                        && !mgr.request_verification_with_roles(
+                            &user,
+                            &roles,
+                            "",
+                            "",
+                            privilege,
+                        )
+                    {
+                        return Err(specific_access_denied(label));
+                    }
                 }
+                // Views are checked after their body passes during expansion
+                // (`check_view_body_privileges`): TiDB reports the 1356 body
+                // error before the 1142/1143 view-level denials.
+                self.check_select_table_privileges(select, false)?;
             }
             Statement::Insert(insert) => {
-                require(
-                    &mgr,
-                    &user,
-                    &roles,
-                    &insert.table,
-                    &current_db,
-                    PrivilegeType::INSERT,
-                )?;
+                // TiDB `buildInsert`: a column list requests column-level
+                // INSERT (1143), otherwise the whole table (1142).
+                if insert.columns.is_empty() {
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        &insert.table,
+                        &current_db,
+                        PrivilegeType::INSERT,
+                    )?;
+                } else {
+                    let (schema, name) = insert.table.qualified(&current_db);
+                    for column in &insert.columns {
+                        if !mgr.request_column_verification_with_roles(
+                            &user,
+                            &roles,
+                            &schema,
+                            &name,
+                            column,
+                            PrivilegeType::INSERT,
+                        ) {
+                            return Err(column_access_denied("INSERT", column, &name, &user));
+                        }
+                    }
+                }
+                // `REPLACE INTO` additionally needs DELETE on the table.
+                if insert.replace {
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        &insert.table,
+                        &current_db,
+                        PrivilegeType::DELETE,
+                    )?;
+                }
+                // `ON DUPLICATE KEY UPDATE col = …` needs column-level
+                // UPDATE, reported as 1143 (TiDB `Insert.resolveOnDuplicate`).
+                if !insert.on_duplicate.is_empty() {
+                    let (schema, name) = insert.table.qualified(&current_db);
+                    for assign in &insert.on_duplicate {
+                        if !mgr.request_column_verification_with_roles(
+                            &user,
+                            &roles,
+                            &schema,
+                            &name,
+                            &assign.column,
+                            PrivilegeType::UPDATE,
+                        ) {
+                            return Err(column_access_denied(
+                                "UPDATE",
+                                &assign.column,
+                                &name,
+                                &user,
+                            ));
+                        }
+                    }
+                }
             }
             Statement::Update(update) => {
                 // TiDB `buildUpdate`: the SET targets need UPDATE privilege on
@@ -2811,6 +3421,31 @@ impl Session {
                 // Failures name the column (1143), not the table (1142), and
                 // the SELECT checks run first because the result set (with its
                 // join conditions) and WHERE are built before the SET list.
+                // `WITH cte AS (…) UPDATE … SET cte.col = …`: a CTE is not an
+                // updatable target (TiDB 1288, raised while building the plan
+                // before the privilege checks).
+                let cte_names: Vec<String> = update
+                    .with
+                    .as_ref()
+                    .map(|with| with.ctes.iter().map(|cte| cte.name.clone()).collect())
+                    .unwrap_or_default();
+                let is_cte_qualifier = |qualifier: Option<&str>| {
+                    qualifier.is_some_and(|q| {
+                        cte_names.iter().any(|name| name.eq_ignore_ascii_case(q))
+                    })
+                };
+                if let Some(target) = update.list.iter().find_map(|assign| {
+                    let qualifier = assign.table.as_deref()?;
+                    cte_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(qualifier))
+                        .then(|| qualifier.to_string())
+                }) {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_NON_UPDATABLE_TABLE,
+                        format!("The target table {target} of the UPDATE is not updatable"),
+                    ));
+                }
                 let tables = update_statement_tables(update);
                 let mut read_exprs: Vec<&ExprNode> = Vec::new();
                 if let Some(join) = &update.join {
@@ -2828,6 +3463,9 @@ impl Session {
                 let is = self.infoschema();
                 for expr in read_exprs {
                     for (qualifier, column) in expr.referenced_columns() {
+                        if is_cte_qualifier(qualifier.as_deref()) {
+                            continue;
+                        }
                         let Some((db, table)) = resolve_update_column(
                             &is,
                             &tables,
@@ -2867,11 +3505,75 @@ impl Session {
                         &assign.column,
                         PrivilegeType::UPDATE,
                     ) {
-                        return Err(column_access_denied("UPDATE", &assign.column, &table, &user));
+                        return Err(column_access_denied(
+                            "UPDATE",
+                            &assign.column,
+                            &table,
+                            &user,
+                        ));
                     }
                 }
             }
             Statement::Delete(delete) => {
+                // TiDB `buildDelete` builds the read side (join conditions /
+                // WHERE / ORDER BY) before the delete target: missing SELECT
+                // on a read column is 1143, not the table-level 1142.
+                let is = self.infoschema();
+                let mut tables: Vec<&TableName> = Vec::new();
+                if delete.tables.is_empty() {
+                    tables.push(&delete.table);
+                } else {
+                    tables.extend(delete.tables.iter());
+                }
+                if let Some(join) = &delete.join {
+                    tables.push(&join.left);
+                    tables.push(&join.right);
+                }
+                for join in &delete.additional_joins {
+                    tables.push(&join.left);
+                    tables.push(&join.right);
+                }
+                let mut read_exprs: Vec<&ExprNode> = Vec::new();
+                if let Some(join) = &delete.join {
+                    read_exprs.push(&join.on);
+                }
+                for join in &delete.additional_joins {
+                    read_exprs.push(&join.on);
+                }
+                if let Some(selection) = &delete.selection {
+                    read_exprs.push(selection);
+                }
+                for item in &delete.order_by {
+                    read_exprs.push(&item.expr);
+                }
+                for expr in read_exprs {
+                    for (qualifier, column) in expr.referenced_columns() {
+                        let Some((db, table)) = resolve_update_column(
+                            &is,
+                            &tables,
+                            qualifier.as_deref(),
+                            &column,
+                            &current_db,
+                        ) else {
+                            continue;
+                        };
+                        // A missing table/database is refused as a table-level
+                        // denial (1142), not a column one.
+                        if is.table_by_name(&db, &table).is_none() {
+                            continue;
+                        }
+                        if !mgr.request_column_verification_with_roles(
+                            &user,
+                            &roles,
+                            &db,
+                            &table,
+                            &column,
+                            PrivilegeType::SELECT,
+                        ) {
+                            return Err(column_access_denied("SELECT", &column, &table, &user));
+                        }
+                    }
+                }
                 if delete.tables.is_empty() {
                     require(
                         &mgr,
@@ -2988,7 +3690,8 @@ impl Session {
             }
             Statement::CreateView(create) => {
                 // TiDB requires `CreateViewPriv` (or any view privilege) on the
-                // created view, plus `SelectPriv` on every referenced table.
+                // created view, plus `SelectPriv` on every referenced table or
+                // column (`SELECT *` requests whole-table SELECT).
                 let (view_db, view_name) = create.view_name.qualified(&current_db);
                 let allowed = mgr.request_verification_with_roles(
                     &user,
@@ -3019,25 +3722,52 @@ impl Session {
                         PrivilegeType::CREATE_VIEW,
                     )?;
                 }
-                if let Some(from) = &create.select.from {
-                    require(
-                        &mgr,
-                        &user,
-                        &roles,
-                        from,
-                        &current_db,
-                        PrivilegeType::SELECT,
-                    )?;
-                }
-                for table in create.select.join_tables() {
-                    require(
-                        &mgr,
-                        &user,
-                        &roles,
-                        table,
-                        &current_db,
-                        PrivilegeType::SELECT,
-                    )?;
+                let is = self.infoschema();
+                let tables: Vec<&TableName> = create.select.join_tables();
+                let select = &create.select;
+                let star = select.fields.iter().any(|field| {
+                    field.expr.is_star_marker() || expr_mentions_star(&field.expr)
+                });
+                if star {
+                    for table in &tables {
+                        require(&mgr, &user, &roles, table, &current_db, PrivilegeType::SELECT)?;
+                    }
+                } else {
+                    let mut exprs: Vec<&ExprNode> = select
+                        .fields
+                        .iter()
+                        .map(|field| &field.expr)
+                        .collect();
+                    exprs.extend(select.selection.iter());
+                    exprs.extend(select.group_by.iter());
+                    exprs.extend(select.having.iter());
+                    exprs.extend(select.order_by.iter().map(|item| &item.expr));
+                    exprs.extend(select.joins.iter().map(|join| &join.on));
+                    for expr in exprs {
+                        for (qualifier, column) in expr.referenced_columns() {
+                            let Some((db, table)) = resolve_update_column(
+                                &is,
+                                &tables,
+                                qualifier.as_deref(),
+                                &column,
+                                &current_db,
+                            ) else {
+                                continue;
+                            };
+                            if !mgr.request_column_verification_with_roles(
+                                &user,
+                                &roles,
+                                &db,
+                                &table,
+                                &column,
+                                PrivilegeType::SELECT,
+                            ) {
+                                return Err(column_access_denied(
+                                    "SELECT", &column, &table, &user,
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             Statement::CreateIndex(create) => {
@@ -3051,13 +3781,25 @@ impl Session {
                 )?;
             }
             Statement::AlterTable(alter) => {
+                // `EXCHANGE PARTITION` reports the modified table's missing
+                // ALTER (TiDB `buildExchangePartition`).
+                let exchange = alter.specs.iter().any(|spec| {
+                    matches!(
+                        spec,
+                        sealdb_parser::ast::AlterTableSpec::ExchangePartition { .. }
+                    )
+                });
                 require(
                     &mgr,
                     &user,
                     &roles,
                     &alter.table,
                     &current_db,
-                    PrivilegeType::CREATE,
+                    if exchange {
+                        PrivilegeType::ALTER
+                    } else {
+                        PrivilegeType::CREATE
+                    },
                 )?;
             }
             Statement::DropDatabase(drop) => {
@@ -3106,6 +3848,22 @@ impl Session {
                         &current_db,
                         PrivilegeType::SELECT,
                     )?;
+                }
+            }
+            Statement::Do(_) if sealdb_parser::sqlparser_bridge::peek_admin_op() => {
+                // All `ADMIN` commands require the SUPER privilege (TiDB
+                // `buildAdmin` visitInfo).
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "",
+                    "",
+                    PrivilegeType::SUPER,
+                ) {
+                    return Err(sealdb_errno::Error::new(
+                        8121,
+                        "privilege check for 'Super' fail",
+                    ));
                 }
             }
             _ => {}
@@ -3261,6 +4019,58 @@ fn require(
 
 /// `UPDATE` / `DELETE` table list: the first table plus both sides of every
 /// join in the statement.
+/// `true` when `expr` mentions a `*` (`count(*)`, `t.*`): TiDB turns those
+/// into table-level SELECT requests instead of per-column checks.
+fn expr_mentions_star(expr: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::ExprNode;
+    match expr {
+        ExprNode::Value(v) => {
+            matches!(&v.datum, sealdb_types::Datum::Bytes(b) if b == b"*")
+        }
+        ExprNode::Column(c) => c.name == "*",
+        ExprNode::Binary(b) => expr_mentions_star(&b.left) || expr_mentions_star(&b.right),
+        ExprNode::Unary(u) => expr_mentions_star(&u.expr),
+        ExprNode::Func(f) => f.args.iter().any(expr_mentions_star),
+        ExprNode::Cast(c) => expr_mentions_star(&c.expr),
+        ExprNode::InList(i) => expr_mentions_star(&i.expr) || i.list.iter().any(expr_mentions_star),
+        ExprNode::Between(b) => {
+            expr_mentions_star(&b.expr)
+                || expr_mentions_star(&b.low)
+                || expr_mentions_star(&b.high)
+        }
+        ExprNode::Like(l) => expr_mentions_star(&l.expr) || expr_mentions_star(&l.pattern),
+        ExprNode::IsNull(i) => expr_mentions_star(&i.expr),
+        ExprNode::Case(c) => {
+            c.operand.as_deref().is_some_and(expr_mentions_star)
+                || c.when_then
+                    .iter()
+                    .any(|(w, t)| expr_mentions_star(w) || expr_mentions_star(t))
+                || c.else_expr.as_deref().is_some_and(expr_mentions_star)
+        }
+        ExprNode::Window(w) => {
+            w.args.iter().any(expr_mentions_star)
+                || w.spec.partition_by.iter().any(expr_mentions_star)
+                || w.spec.order_by.iter().any(|item| expr_mentions_star(&item.expr))
+        }
+        ExprNode::Row(r) => r.exprs.iter().any(expr_mentions_star),
+        ExprNode::Exists(_)
+        | ExprNode::InSubquery(_)
+        | ExprNode::ScalarSubquery(_)
+        | ExprNode::QuantifiedCmp(_) => false,
+    }
+}
+
+/// `require` for the table as a whole (`SELECT *` / `count(*)`).
+fn require_table_select(
+    mgr: &sealdb_privilege::Manager,
+    user: &UserIdentity,
+    roles: &[UserIdentity],
+    table: &sealdb_parser::ast::TableName,
+    current_db: &str,
+) -> Result<()> {
+    require(mgr, user, roles, table, current_db, PrivilegeType::SELECT)
+}
+
 fn update_statement_tables(
     update: &sealdb_parser::ast::UpdateStmt,
 ) -> Vec<&sealdb_parser::ast::TableName> {
@@ -3313,12 +4123,90 @@ fn resolve_update_column(
     (tables.len() == 1).then(|| tables[0].qualified(current_db))
 }
 
-fn column_access_denied(
-    command: &str,
-    column: &str,
-    table: &str,
-    user: &UserIdentity,
-) -> Error {
+/// Scope of a `GRANT`/`REVOKE` statement, resolved against the current DB.
+fn level_names(
+    level: &sealdb_parser::ast::GrantLevel,
+    current_db: &str,
+) -> (String, String) {
+    use sealdb_parser::ast::GrantLevelType;
+    match level.level {
+        GrantLevelType::Global => (String::new(), String::new()),
+        GrantLevelType::DB => {
+            let db = if level.db_name.is_empty() {
+                current_db.to_string()
+            } else {
+                level.db_name.clone()
+            };
+            (db, String::new())
+        }
+        GrantLevelType::Table => {
+            let db = if level.db_name.is_empty() {
+                current_db.to_string()
+            } else {
+                level.db_name.clone()
+            };
+            (db, level.table_name.clone())
+        }
+    }
+}
+
+/// Table named by `IMPORT INTO <table> [PARTITION …] FROM …` (the statement is
+/// kept as raw SQL). Returns `None` when no identifier follows `INTO`.
+fn import_into_table(
+    raw_sql: &str,
+) -> Option<sealdb_parser::ast::TableName> {
+    let lower = raw_sql.to_ascii_lowercase();
+    let pos = lower.find("import")?;
+    let mut rest = raw_sql[pos + "import".len()..].trim_start();
+    if rest.len() < 4 || !rest.as_bytes()[..4].eq_ignore_ascii_case(b"into") {
+        return None;
+    }
+    rest = rest[4..].trim_start();
+    let (first, consumed) = read_sql_ident(rest)?;
+    rest = rest[consumed..].trim_start();
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let (name, _) = read_sql_ident(after_dot.trim_start())?;
+        Some(sealdb_parser::ast::TableName::new(Some(first), name))
+    } else {
+        Some(sealdb_parser::ast::TableName::new(None, first))
+    }
+}
+
+/// Backtick or bare identifier with the number of consumed bytes.
+fn read_sql_ident(sql: &str) -> Option<(String, usize)> {
+    let bytes = sql.as_bytes();
+    if bytes.first() == Some(&b'`') {
+        let mut name = String::new();
+        let mut i = 1;
+        while i < bytes.len() {
+            if bytes[i] == b'`' {
+                if bytes.get(i + 1) == Some(&b'`') {
+                    name.push('`');
+                    i += 2;
+                    continue;
+                }
+                return Some((name, i + 1));
+            }
+            name.push(bytes[i] as char);
+            i += 1;
+        }
+        return None;
+    }
+    let mut i = 0;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+    {
+        i += 1;
+    }
+    (i > 0).then(|| (sql[..i].to_string(), i))
+}
+
+/// TiDB 8121 `ErrPrivilegeCheckFail` for the `GRANT OPTION` check.
+fn grant_option_denied() -> Error {
+    Error::new(8121, "privilege check for 'Grant Option' fail")
+}
+
+fn column_access_denied(command: &str, column: &str, table: &str, user: &UserIdentity) -> Error {
     // TiDB formats this error from the lower-cased AST names.
     Error::new(
         sealdb_errno::ERR_COLUMNACCESS_DENIED_ERROR,
@@ -3340,6 +4228,17 @@ fn access_denied(
     user: &UserIdentity,
 ) -> sealdb_errno::Error {
     sealdb_privilege::Manager::access_denied(db, table, wanted, user)
+}
+
+/// TiDB 1227 `ErrSpecificAccessDenied` for a missing privilege named by the
+/// statement (dynamic privileges, `SUPER`, `CREATE USER`, ...).
+fn specific_access_denied(name: &str) -> Error {
+    Error::new(
+        sealdb_errno::ERR_SPECIFIC_ACCESS_DENIED_ERROR,
+        format!(
+            "Access denied; you need (at least one of) the {name} privilege(s) for this operation"
+        ),
+    )
 }
 
 /// `LOCK STATS` / `UNLOCK STATS` run as `INSERT INTO mysql.stats_table_locked
@@ -3623,11 +4522,7 @@ fn check_select_group_by_ambiguity(select: &SelectStmt) -> Result<()> {
 /// columns grouped by another column of that CTE are allowed (TiDB cte suite
 /// `select b from qn group by a`); base-table PK functional dependency is
 /// still out of scope.
-fn check_only_full_group_by(
-    session: &Session,
-    stmt: &Statement,
-    is: &InfoSchema,
-) -> Result<()> {
+fn check_only_full_group_by(session: &Session, stmt: &Statement, is: &InfoSchema) -> Result<()> {
     let select = match stmt {
         Statement::Select(s) => s,
         Statement::Explain(e) => match e.stmt.as_ref() {
@@ -6885,6 +7780,9 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
         | "tidb_ddl_reorg_batch_size"
         | "tidb_ddl_reorg_priority"
         | "tidb_ddl_reorg_max_write_speed" => {}
+        // InnoDB knobs TiDB registers as accepted no-ops (`noop.go`); the
+        // value is still visible through `SHOW GLOBAL VARIABLES`.
+        "innodb_commit_concurrency" => {}
         other if show_variable_kind(other).is_some() => {}
         other => {
             return Err(sealdb_errno::Error::unsupported(format!(
@@ -8918,6 +9816,189 @@ impl ViewPrivCtx<'_> {
     }
 }
 
+/// Parse a stored view definer (`` `user`@`host` ``) into an identity.
+fn view_definer_identity(definer: &str) -> Option<UserIdentity> {
+    let trimmed = definer.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("CURRENT_USER") {
+        return None;
+    }
+    let (user, host) = trimmed.split_once('@')?;
+    let unquote = |s: &str| s.trim().trim_matches('`').to_string();
+    Some(UserIdentity::new(unquote(user), unquote(host)))
+}
+
+/// `(has_star, (qualifier, column))` for every column read by one query block.
+fn select_read_refs(select: &SelectStmt) -> (bool, Vec<(Option<String>, String)>) {
+    let mut has_star = false;
+    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+    let mut push = |expr: &ExprNode| refs.extend(expr.referenced_columns());
+    for field in &select.fields {
+        if is_star_select_expr(&field.expr) {
+            has_star = true;
+        }
+        push(&field.expr);
+    }
+    if let Some(selection) = &select.selection {
+        push(selection);
+    }
+    for expr in &select.group_by {
+        push(expr);
+    }
+    if let Some(having) = &select.having {
+        push(having);
+    }
+    for item in &select.order_by {
+        push(&item.expr);
+    }
+    for join in &select.joins {
+        push(&join.on);
+    }
+    fn collect_on(item: &sealdb_parser::ast::FromItem, out: &mut Vec<(Option<String>, String)>) {
+        if let sealdb_parser::ast::FromItem::Join {
+            left, right, on, ..
+        } = item
+        {
+            out.extend(on.referenced_columns());
+            collect_on(left, out);
+            collect_on(right, out);
+        }
+    }
+    if let Some(item) = &select.from_item {
+        collect_on(item, &mut refs);
+    }
+    (has_star, refs)
+}
+
+/// Columns of `columns` actually read from base table `table` (alias aware).
+/// Returns `None` when the block reads no column of that table, which means a
+/// column-level grant cannot replace the missing table-level one.
+fn view_body_table_columns(
+    table: &TableName,
+    base: &sealdb_meta::TableInfo,
+    has_star: bool,
+    refs: &[(Option<String>, String)],
+) -> Option<Vec<String>> {
+    let alias = table.name.to_ascii_lowercase();
+    let physical = table.resolve_name().to_ascii_lowercase();
+    let base_columns: Vec<String> = base
+        .columns
+        .iter()
+        .filter(|c| !c.hidden)
+        .map(|c| c.name.o().to_string())
+        .collect();
+    if has_star {
+        return Some(base_columns);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (qualifier, column) in refs {
+        let column = column.to_ascii_lowercase();
+        if column == "*" {
+            return Some(base_columns);
+        }
+        if let Some(q) = qualifier {
+            let q = q.to_ascii_lowercase();
+            if q != alias && q != physical {
+                continue;
+            }
+        }
+        if let Some(col) = base_columns
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(&column))
+        {
+            if !out.iter().any(|seen| seen.eq_ignore_ascii_case(col)) {
+                out.push(col.clone());
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// TiDB `BuildDataSourceFromView`: a view's body is planned and privilege
+/// checked as the view's definer (`SQL SECURITY DEFINER`, default roles, and
+/// failures reported as `ErrViewInvalid`) or as the querying user
+/// (`SQL SECURITY INVOKER`, normal 1142/1143 errors).
+fn check_view_body_privileges(
+    schema: &str,
+    name: &str,
+    view: &sealdb_meta::ViewInfo,
+    view_select: &SelectStmt,
+    view_set_rest: &[(sealdb_parser::ast::SetOprType, SelectStmt)],
+    is: &InfoSchema,
+    view_priv: &ViewPrivCtx<'_>,
+) -> Result<()> {
+    let definer_view = !view.security.eq_ignore_ascii_case("INVOKER");
+    let (user, roles) = if definer_view {
+        match view_definer_identity(&view.definer) {
+            // SealDB bootstraps only `root@%`; TiDB's test server also has a
+            // `root@localhost` account, so a `DEFINER=root@localhost` view is
+            // still readable there. Resolve any root definer to the seeded
+            // root account instead of failing the body privilege check.
+            Some(definer) if definer.username.eq_ignore_ascii_case("root") => {
+                (UserIdentity::root(), Vec::new())
+            }
+            Some(definer) => (definer, Vec::new()),
+            None => (view_priv.user.clone(), view_priv.roles.clone()),
+        }
+    } else {
+        (view_priv.user.clone(), view_priv.roles.clone())
+    };
+    let invalid = || {
+        sealdb_errno::Error::new(
+            sealdb_errno::ERR_VIEW_INVALID_TABLE,
+            format!(
+                "View '{schema}.{name}' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them"
+            ),
+        )
+    };
+    let arms = std::iter::once(view_select).chain(view_set_rest.iter().map(|(_, arm)| arm));
+    for arm in arms {
+        let (has_star, refs) = select_read_refs(arm);
+        for table in arm.join_tables() {
+            let (db, tbl) = table.qualified(schema);
+            if db.is_empty() {
+                continue;
+            }
+            let Some(base) = is.table_by_name(&db, &tbl) else {
+                continue;
+            };
+            // Nested views are checked by their own expansion with their own
+            // security context.
+            if base.is_view() {
+                continue;
+            }
+            if view_priv.mgr.request_verification_with_roles(
+                &user,
+                &roles,
+                &db,
+                &tbl,
+                PrivilegeType::SELECT,
+            ) {
+                continue;
+            }
+            let allowed =
+                view_body_table_columns(table, base, has_star, &refs).is_some_and(|columns| {
+                    columns.iter().all(|column| {
+                        view_priv.mgr.request_column_verification_with_roles(
+                            &user,
+                            &roles,
+                            &db,
+                            &tbl,
+                            column,
+                            PrivilegeType::SELECT,
+                        )
+                    })
+                });
+            if !allowed {
+                // TiDB `BuildDataSourceFromView` reports 1356 for both
+                // SECURITY DEFINER and SECURITY INVOKER views when the body
+                // cannot be read by the relevant account.
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// TiDB 1054 for a table-qualified column whose qualifier is not a visible
 /// FROM alias. An alias completely hides the physical table name. Correlated
 /// subqueries inherit the outer block's visible names.
@@ -9264,6 +10345,19 @@ fn inject_view_cte(
     qualify_view_body_tables(&mut view_select, &schema);
     for (_, arm) in &mut view_set_rest {
         qualify_select_tables(arm, &schema, &[]);
+    }
+    // TiDB `BuildDataSourceFromView`: the body is privilege-checked as the
+    // view's definer (DEFINER views report `ErrViewInvalid`) or the invoker.
+    if let Some(view_info) = &info.view {
+        check_view_body_privileges(
+            &schema,
+            &name,
+            view_info,
+            &view_select,
+            &view_set_rest,
+            is,
+            view_priv,
+        )?;
     }
     // A `SELECT *` view whose base table lost columns is invalid (1356).
     validate_view_shape(

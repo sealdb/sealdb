@@ -6223,9 +6223,7 @@ fn emit_cop_children(
                     );
                     continue;
                 }
-                let topn = path
-                    .topn
-                    .map(|(offset, count)| ("TopN", offset, count));
+                let topn = path.topn.map(|(offset, count)| ("TopN", offset, count));
                 let limit = topn.or(path.limit.map(|(offset, count)| ("Limit", offset, count)));
                 let Some((wrapper, offset, count)) = limit else {
                     push_explain_row(
@@ -6255,8 +6253,9 @@ fn emit_cop_children(
                             order_column
                                 .as_ref()
                                 .map(|column| {
-                                    let schema = crate::core::planbuilder::explain_table_schema(table)
-                                        .unwrap_or_else(sealdb_expression::current_db_name);
+                                    let schema =
+                                        crate::core::planbuilder::explain_table_schema(table)
+                                            .unwrap_or_else(sealdb_expression::current_db_name);
                                     format!("{schema}.{table}.{column}")
                                 })
                                 .unwrap_or_default()
@@ -6362,7 +6361,11 @@ fn emit_cop_children(
                 // a sibling continuation bar.
                 push_explain_row(
                     rows,
-                    if probe_topn_info.is_some() { depth + 1 } else { depth },
+                    if probe_topn_info.is_some() {
+                        depth + 1
+                    } else {
+                        depth
+                    },
                     true,
                     next_id,
                     CopRow {
@@ -6380,7 +6383,11 @@ fn emit_cop_children(
                 }
                 push_explain_row(
                     rows,
-                    if probe_topn_info.is_some() { depth + 2 } else { depth + 1 },
+                    if probe_topn_info.is_some() {
+                        depth + 2
+                    } else {
+                        depth + 1
+                    },
                     true,
                     next_id,
                     CopRow {
@@ -6412,7 +6419,11 @@ fn emit_cop_children(
                 }
                 push_explain_row(
                     rows,
-                    if probe_topn_info.is_some() { depth + 1 } else { depth },
+                    if probe_topn_info.is_some() {
+                        depth + 1
+                    } else {
+                        depth
+                    },
                     true,
                     next_id,
                     CopRow {
@@ -8208,10 +8219,9 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                             None => match &v.datum {
                                 // A quoted string needle (`"2023-01-01" MEMBER OF`)
                                 // keeps its JSON cast in ExplainInfo.
-                                sealdb_types::Datum::Bytes(b) => format!(
-                                    "cast(\"{}\", json BINARY)",
-                                    String::from_utf8_lossy(b)
-                                ),
+                                sealdb_types::Datum::Bytes(b) => {
+                                    format!("cast(\"{}\", json BINARY)", String::from_utf8_lossy(b))
+                                }
                                 _ => explain_scalar_expr(&f.args[0], table),
                             },
                         }
@@ -8238,9 +8248,7 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                         {
                             format!("cast({}, json BINARY)", explain_scalar_expr(arg, table))
                         }
-                        ExprNode::Func(inner)
-                            if inner.name.eq_ignore_ascii_case("json_array") =>
-                        {
+                        ExprNode::Func(inner) if inner.name.eq_ignore_ascii_case("json_array") => {
                             let mut array = inner.clone();
                             array.args = inner
                                 .args
@@ -8336,11 +8344,7 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                 explain_scalar_expr(&l.expr, table),
                 pattern
             );
-            if l.not {
-                format!("not({like})")
-            } else {
-                like
-            }
+            if l.not { format!("not({like})") } else { like }
         }
         ExprNode::IsNull(i) => {
             let inner = format!("isnull({})", explain_scalar_expr(&i.expr, table));

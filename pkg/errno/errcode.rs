@@ -128,6 +128,12 @@ pub const ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET: i32 = 1748;
 pub const ERR_ACCESS_DENIED_ERROR: i32 = 1045;
 pub const ERR_DBACCESS_DENIED_ERROR: i32 = 1044;
 pub const ERR_TABLEACCESS_DENIED_ERROR: i32 = 1142;
+/// MySQL `ER_SPECIFIC_ACCESS_DENIED_ERROR`: a global/dynamic privilege check
+/// failed (`Access denied; you need (at least one of) the %s privilege(s)`).
+pub const ERR_SPECIFIC_ACCESS_DENIED_ERROR: i32 = 1227;
+/// MySQL `ER_CANT_CREATE_USER_WITH_GRANT`: `WITH GRANT OPTION` needs the
+/// GRANT OPTION privilege (1410).
+pub const ERR_CANT_CREATE_USER_WITH_GRANT: i32 = 1410;
 /// MySQL `ER_COLUMNACCESS_DENIED_ERROR`: the user may not use a specific
 /// column for the statement's command (1143).
 pub const ERR_COLUMNACCESS_DENIED_ERROR: i32 = 1143;
@@ -285,3 +291,9 @@ pub const ERR_BLOB_CANT_HAVE_DEFAULT: i32 = 1101;
 /// TiDB `ErrCantAggregate2collations` (1267): two operands of a string
 /// function have collations that cannot be aggregated.
 pub const ERR_CANT_AGGREGATE_2COLLATIONS: i32 = 1267;
+/// MySQL `ER_CANNOT_USER` (1396): `ALTER USER …` / account DDL failed for a
+/// missing account.
+pub const ERR_CANNOT_USER: i32 = 1396;
+/// TiDB `ErrRoleNotGranted` (3530): `SHOW GRANTS … USING r` where `r` is not
+/// granted to the displayed account.
+pub const ERR_ROLE_NOT_GRANTED: i32 = 3530;

@@ -18,7 +18,8 @@ use crate::ast::expressions::{
     WindowSpec,
 };
 use crate::ast::misc::{
-    AddQueryWatchStmt, AlterInstanceStmt, AlterResourceGroupStmt, AnalyzeTableStmt, BRIEStmt,
+    AddQueryWatchStmt, AlterInstanceStmt, AlterResourceGroupStmt, AlterUserStmt, AnalyzeTableStmt,
+    BRIEStmt,
     BeginStmt, BinlogStmt, CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt,
     CompactTableStmt, CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt,
     CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt, DoStmt, DropBindingStmt,
@@ -29,7 +30,8 @@ use crate::ast::misc::{
     LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt, PrivElem, PrivilegeType,
     RecommendIndexStmt, RecoverTableStmt, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt,
     RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetBindingStmt,
-    SetPwdStmt, SetResourceGroupStmt, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope,
+    SetDefaultRoleStmt, SetPwdStmt, SetResourceGroupStmt, SetRoleKind, SetRoleStmt, SetStmt,
+    SetTxnStmt, SetVarScope,
     ShowStmt, ShowStmtKind, ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt,
     TableLockItem, TableLockType, TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec,
     UserToUser,
@@ -60,6 +62,11 @@ thread_local! {
     /// records which one the statement named.
     static PENDING_ADMIN_RELOAD: std::cell::Cell<Option<AdminReloadKind>> =
         const { std::cell::Cell::new(None) };
+    /// TiDB `ADMIN …` commands: lowered to `DO 0`; the session requires SUPER
+    /// and then applies the operation (BDR role changes are the only ones with
+    /// observable state so far).
+    static PENDING_ADMIN_OP: std::cell::RefCell<Option<AdminOp>> =
+        const { std::cell::RefCell::new(None) };
     /// `CHECK (expr) [NOT] ENFORCED` stripped from CREATE TABLE, one slot per
     /// CREATE so DDL can attach them to `TableInfo.checks`.
     static PENDING_CREATE_CHECKS: std::cell::RefCell<Vec<Vec<(String, bool)>>> =
@@ -92,6 +99,30 @@ pub enum AdminReloadKind {
 /// Which `ADMIN RELOAD` target the last parsed statement named, if any.
 pub fn take_admin_reload() -> Option<AdminReloadKind> {
     PENDING_ADMIN_RELOAD.with(|cell| cell.replace(None))
+}
+
+/// Operation named by an `ADMIN` command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminOp {
+    /// `ADMIN SET BDR ROLE <role>`
+    SetBdr(String),
+    /// `ADMIN UNSET BDR ROLE`
+    UnsetBdr,
+    /// `ADMIN SHOW BDR ROLE`
+    ShowBdr,
+    /// Any other `ADMIN` command (SUPER-gated no-op until implemented).
+    Other,
+}
+
+/// Whether the parsed statement was an `ADMIN` command (the session checks
+/// SUPER before consuming the operation).
+pub fn peek_admin_op() -> bool {
+    PENDING_ADMIN_OP.with(|cell| cell.borrow().is_some())
+}
+
+/// Take the `ADMIN` operation captured for the current statement.
+pub fn take_admin_op() -> Option<AdminOp> {
+    PENDING_ADMIN_OP.with(|cell| cell.borrow_mut().take())
 }
 
 /// Whether the last parsed statement carried `GROUP BY expr ASC|DESC`.
@@ -216,6 +247,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_dml_ignore(&rewritten);
     let rewritten = rewrite_update_comma_join(&rewritten)?;
     let rewritten = rewrite_show_grants(&rewritten)?;
+    let rewritten = rewrite_into_outfile(&rewritten);
     let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_show_index(&rewritten);
     // MySQL `TABLE t` is a synonym for `SELECT * FROM t`; `EXPLAIN|DESC TABLE t`
@@ -1290,6 +1322,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     db_name: Some(table.name),
                     table: None,
                     user: None,
+                    using_roles: Vec::new(),
                     full: false,
                     pattern: None,
                     column: None,
@@ -1302,6 +1335,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     db_name: None,
                     table: Some(table),
                     user: None,
+                    using_roles: Vec::new(),
                     full: false,
                     pattern: None,
                     column: None,
@@ -1318,6 +1352,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             db_name: None,
             table: Some(object_table_name(obj_name)?),
             user: None,
+            using_roles: Vec::new(),
             full: false,
             pattern: None,
             column: None,
@@ -1330,6 +1365,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             db_name: None,
             table: None,
             user: None,
+            using_roles: Vec::new(),
             full: false,
             pattern: show_like_pattern(show_options),
             column: None,
@@ -1348,6 +1384,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 .transpose()?,
             table: None,
             user: None,
+            using_roles: Vec::new(),
             full: *full,
             pattern: show_like_pattern(show_options),
             column: None,
@@ -1359,6 +1396,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             db_name: None,
             table: None,
             user: None,
+            using_roles: Vec::new(),
             full: false,
             pattern: None,
             column: None,
@@ -1370,6 +1408,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             db_name: None,
             table: None,
             user: None,
+            using_roles: Vec::new(),
             full: false,
             pattern: None,
             column: None,
@@ -1385,6 +1424,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             db_name: None,
             table: None,
             user: None,
+            using_roles: Vec::new(),
             full: false,
             pattern: None,
             column: None,
@@ -1420,6 +1460,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 db_name: None,
                 table: None,
                 user: None,
+                using_roles: Vec::new(),
                 full: false,
                 pattern: None,
                 column: None,
@@ -1440,6 +1481,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 db_name: None,
                 table: Some(object_table_name(table)?),
                 user: None,
+                using_roles: Vec::new(),
                 full: *full,
                 pattern: show_like_pattern(show_options),
                 column: None,
@@ -1455,6 +1497,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 db_name: None,
                 table: Some(object_table_name(table_name)?),
                 user: None,
+                using_roles: Vec::new(),
                 full: false,
                 pattern: None,
                 column: None,
@@ -1679,7 +1722,10 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
 }
 
 const SHOW_GRANT_MARKER: &str = "__sealdb_grant__";
+const SHOW_GRANT_CURRENT_MARKER: &str = "__sealdb_grant_current__";
 const SHOW_GRANT_PREFIX: &str = "__sealdb_grant_";
+/// Separates the grant marker from the encoded `USING` role list.
+const SHOW_GRANT_USING_MARKER: &str = "__using__";
 const SHOW_CREATE_DB_SCHEMA: &str = "__sealdb_db__";
 const SHOW_INDEX_SCHEMA: &str = "__sealdb_index__";
 const SHOW_DDL_JOBS_SCHEMA: &str = "__sealdb_ddl_jobs__";
@@ -2569,25 +2615,61 @@ fn split_rename_index_marker(encoded: &str) -> Result<(String, String)> {
 }
 
 fn rewrite_admin_show_ddl(sql: &str) -> String {
+    PENDING_ADMIN_OP.with(|cell| cell.borrow_mut().take());
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 24);
     let mut i = 0;
-    while i < bytes.len() {
-        if keyword_at(bytes, i, "ADMIN") {
+    'stmt: while i < bytes.len() {
+        if keyword_at(bytes, i, "ADMIN") && at_statement_start(bytes, i) {
             let after_admin = skip_ws(bytes, i + "ADMIN".len());
+            // `ADMIN SET|UNSET BDR ROLE <role>`: record the operation and emit
+            // `DO 0`; the session checks SUPER and applies it.
+            let mut bdr = None;
+            if keyword_at(bytes, after_admin, "SET") {
+                let after_op = skip_ws(bytes, after_admin + "SET".len());
+                if keyword_at(bytes, after_op, "BDR") {
+                    let after_bdr = skip_ws(bytes, after_op + "BDR".len());
+                    if keyword_at(bytes, after_bdr, "ROLE") {
+                        if let Ok((role, end)) = parse_quoted_or_ident(
+                            bytes,
+                            skip_ws(bytes, after_bdr + "ROLE".len()),
+                        ) {
+                            bdr = Some((AdminOp::SetBdr(role), end));
+                        }
+                    }
+                }
+            } else if keyword_at(bytes, after_admin, "UNSET") {
+                let after_op = skip_ws(bytes, after_admin + "UNSET".len());
+                if keyword_at(bytes, after_op, "BDR") {
+                    let after_bdr = skip_ws(bytes, after_op + "BDR".len());
+                    if keyword_at(bytes, after_bdr, "ROLE") {
+                        bdr = Some((AdminOp::UnsetBdr, after_bdr + "ROLE".len()));
+                    }
+                }
+            }
+            if let Some((op, mut j)) = bdr {
+                while j < bytes.len() && bytes[j] != b';' {
+                    j += 1;
+                }
+                PENDING_ADMIN_OP.with(|cell| *cell.borrow_mut() = Some(op));
+                out.push_str("DO 0");
+                i = j;
+                continue;
+            }
             if keyword_at(bytes, after_admin, "CHECK") {
                 let after_check = skip_ws(bytes, after_admin + "CHECK".len());
                 // `ADMIN CHECK TABLE t` / `ADMIN CHECK INDEX t idx` — the
                 // integrity check is a verification no-op for now.
                 for target in ["TABLE", "INDEX"] {
                     if keyword_at(bytes, after_check, target) {
+                        PENDING_ADMIN_OP.with(|cell| *cell.borrow_mut() = Some(AdminOp::Other));
                         out.push_str("DO 0");
                         let mut j = after_check + target.len();
                         while j < bytes.len() && bytes[j] != b';' {
                             j += 1;
                         }
                         i = j;
-                        continue;
+                        continue 'stmt;
                     }
                 }
             }
@@ -2615,26 +2697,48 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
                     j += 1;
                 }
                 PENDING_ADMIN_RELOAD.with(|cell| cell.set(Some(kind)));
+                PENDING_ADMIN_OP.with(|cell| *cell.borrow_mut() = Some(AdminOp::Other));
                 out.push_str("DO 0");
                 i = j;
                 continue;
             }
             if keyword_at(bytes, after_admin, "SHOW") {
                 let after_show = skip_ws(bytes, after_admin + "SHOW".len());
+                if keyword_at(bytes, after_show, "BDR") {
+                    let after_bdr = skip_ws(bytes, after_show + "BDR".len());
+                    if keyword_at(bytes, after_bdr, "ROLE") {
+                        let mut j = after_bdr + "ROLE".len();
+                        while j < bytes.len() && bytes[j] != b';' {
+                            j += 1;
+                        }
+                        PENDING_ADMIN_OP.with(|cell| {
+                            *cell.borrow_mut() = Some(AdminOp::ShowBdr);
+                        });
+                        out.push_str("DO 0");
+                        i = j;
+                        continue;
+                    }
+                }
                 if keyword_at(bytes, after_show, "DDL") {
                     let after_ddl = skip_ws(bytes, after_show + "DDL".len());
-                    let end = if keyword_at(bytes, after_ddl, "JOBS") {
-                        after_ddl + "JOBS".len()
-                    } else {
-                        after_show + "DDL".len()
-                    };
-                    out.push_str("SHOW TABLES FROM `");
-                    out.push_str(SHOW_DDL_JOBS_SCHEMA);
-                    out.push('`');
-                    i = end;
-                    continue;
+                    if keyword_at(bytes, after_ddl, "JOBS") {
+                        out.push_str("SHOW TABLES FROM `");
+                        out.push_str(SHOW_DDL_JOBS_SCHEMA);
+                        out.push('`');
+                        i = after_ddl + "JOBS".len();
+                        continue;
+                    }
                 }
             }
+            // Any other `ADMIN` command: only SUPER-gating is modeled today.
+            let mut j = after_admin;
+            while j < bytes.len() && bytes[j] != b';' {
+                j += 1;
+            }
+            PENDING_ADMIN_OP.with(|cell| *cell.borrow_mut() = Some(AdminOp::Other));
+            out.push_str("DO 0");
+            i = j;
+            continue;
         }
         i = push_sql_char(&mut out, sql, i);
     }
@@ -3674,6 +3778,74 @@ fn decode_show_index(show: &mut ShowStmt) {
     }
 }
 
+/// Alias injected by [`rewrite_into_outfile`]; sessions see it in the
+/// re-serialized `SelectStmt::text` and require the `FILE` privilege.
+pub const INTO_OUTFILE_MARKER: &str = "__sealdb_into_outfile";
+
+/// sqlparser rejects MySQL `SELECT … INTO OUTFILE|DUMPFILE 'path'`. Wrap the
+/// select in a derived table carrying [`INTO_OUTFILE_MARKER`] so parsing
+/// succeeds and the session can demand `FILE` before executing anything.
+fn rewrite_into_outfile(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let first = skip_ws_and_comments(bytes, 0);
+    if !keyword_at(bytes, first, "SELECT") {
+        return sql.to_string();
+    }
+    let mut i = first;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                i = skip_quoted(bytes, i);
+                continue;
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            _ => {}
+        }
+        if keyword_at(bytes, i, "INTO") {
+            let after_into = skip_ws(bytes, i + "INTO".len());
+            let kw_len = if keyword_at(bytes, after_into, "OUTFILE") {
+                "OUTFILE".len()
+            } else if keyword_at(bytes, after_into, "DUMPFILE") {
+                "DUMPFILE".len()
+            } else {
+                0
+            };
+            if kw_len > 0 {
+                let after_kw = skip_ws(bytes, after_into + kw_len);
+                if after_kw < bytes.len()
+                    && (bytes[after_kw] == b'\'' || bytes[after_kw] == b'"')
+                {
+                    let end = skip_quoted(bytes, after_kw);
+                    let head = sql[..i].trim_end();
+                    let tail = sql[end..].trim_start();
+                    let tail = tail.strip_prefix(';').unwrap_or(tail).trim_start();
+                    if tail.is_empty() {
+                        return format!("SELECT * FROM ({head}) AS {INTO_OUTFILE_MARKER}");
+                    }
+                    return format!(
+                        "SELECT * FROM ({head}) AS {INTO_OUTFILE_MARKER} {tail}"
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
+    sql.to_string()
+}
+
 fn rewrite_show_grants(sql: &str) -> Result<String> {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -3696,7 +3868,7 @@ fn rewrite_show_grants(sql: &str) -> Result<String> {
                         } else {
                             after_user
                         };
-                        (SHOW_GRANT_MARKER.to_string(), after_user)
+                        (SHOW_GRANT_CURRENT_MARKER.to_string(), after_user)
                     } else {
                         let (user, end) = parse_user_identity_bytes(bytes, after_for)?;
                         (
@@ -3706,6 +3878,32 @@ fn rewrite_show_grants(sql: &str) -> Result<String> {
                     }
                 } else {
                     (SHOW_GRANT_MARKER.to_string(), after_grants)
+                };
+                // `SHOW GRANTS … USING role_list`: carry the roles in the
+                // marker (they are resolved after the SQL parser returns).
+                let mut end = end;
+                let after_grants = skip_ws(bytes, end);
+                let marker = if keyword_at(bytes, after_grants, "USING") {
+                    let mut j = skip_ws(bytes, after_grants + "USING".len());
+                    let mut roles = Vec::new();
+                    loop {
+                        let (role, next) = parse_user_identity_bytes(bytes, j)?;
+                        roles.push(format!(
+                            "{}@{}",
+                            encode_marker_part(&role.username),
+                            encode_marker_part(&role.hostname)
+                        ));
+                        j = skip_ws(bytes, next);
+                        if j < bytes.len() && bytes[j] == b',' {
+                            j = skip_ws(bytes, j + 1);
+                            continue;
+                        }
+                        break;
+                    }
+                    end = j;
+                    format!("{marker}{SHOW_GRANT_USING_MARKER}{}", roles.join(","))
+                } else {
+                    marker
                 };
                 out.push_str("DESC `");
                 out.push_str(&marker);
@@ -3724,11 +3922,37 @@ fn decode_show_grants(show: &mut ShowStmt) {
     let Some(table) = show.table.as_ref() else {
         return;
     };
-    let name = table.name.clone();
+    let raw = table.name.clone();
+    // `SHOW GRANTS … USING r1, r2` appends the encoded role list to the marker.
+    let (name, using_roles) = match raw.split_once(SHOW_GRANT_USING_MARKER) {
+        Some((base, roles)) => {
+            let parsed = roles
+                .split(',')
+                .filter_map(|role| {
+                    let (user, host) = role.split_once('@')?;
+                    Some(UserIdentity::new(
+                        decode_marker_part(user),
+                        decode_marker_part(host),
+                    ))
+                })
+                .collect();
+            (base.to_string(), parsed)
+        }
+        None => (raw, Vec::new()),
+    };
     if name == SHOW_GRANT_MARKER {
         show.kind = ShowStmtKind::Grants;
         show.table = None;
         show.user = None;
+        show.using_roles = using_roles;
+        return;
+    }
+    if name == SHOW_GRANT_CURRENT_MARKER {
+        show.kind = ShowStmtKind::Grants;
+        show.table = None;
+        // Empty identity = `CURRENT_USER()` (resolved to the caller at run time).
+        show.user = Some(UserIdentity::new("", ""));
+        show.using_roles = using_roles;
         return;
     }
     if let Some(rest) = name
@@ -3738,8 +3962,48 @@ fn decode_show_grants(show: &mut ShowStmt) {
     {
         show.kind = ShowStmtKind::Grants;
         show.table = None;
-        show.user = Some(UserIdentity::new(user, host));
+        show.user = Some(UserIdentity::new(
+            decode_marker_part(user),
+            decode_marker_part(host),
+        ));
+        show.using_roles = using_roles;
     }
+}
+
+/// Escape the characters that structure the encoded `USING` role list.
+fn encode_marker_part(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '@' => out.push_str("%40"),
+            ',' => out.push_str("%2C"),
+            '`' => out.push_str("%60"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn decode_marker_part(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2
+                && let Ok(value) = u8::from_str_radix(&hex, 16)
+            {
+                out.push(value as char);
+                continue;
+            }
+            out.push('%');
+            out.push_str(&hex);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_user_identity_bytes(bytes: &[u8], i: usize) -> Result<(UserIdentity, usize)> {
@@ -6377,6 +6641,17 @@ fn qualify_derived_columns(expr: &mut Expr, alias: &str, base: &str) -> bool {
     }
 }
 
+/// Whether `i` is the first token of a statement (only whitespace after the
+/// previous `;`), so qualified identifiers like `db.admin` are not mistaken
+/// for an `ADMIN` command.
+fn at_statement_start(bytes: &[u8], i: usize) -> bool {
+    let mut j = i;
+    while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    j == 0 || bytes[j - 1] == b';'
+}
+
 fn keyword_at(bytes: &[u8], i: usize, keyword: &str) -> bool {
     let end = i + keyword.len();
     if end > bytes.len() {
@@ -6644,6 +6919,16 @@ fn extract_user_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
             let after = skip_ws(bytes, i + "DROP".len());
             if keyword_at(bytes, after, "USER") {
                 let (stmt, end) = parse_drop_user(bytes, after + "USER".len())?;
+                out.push_str("SET NAMES '__sealdb_user__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "ALTER") {
+            let after = skip_ws(bytes, i + "ALTER".len());
+            if keyword_at(bytes, after, "USER") {
+                let (stmt, end) = parse_alter_user(bytes, after + "USER".len())?;
                 out.push_str("SET NAMES '__sealdb_user__'");
                 ops.push(Some(stmt));
                 i = end;
@@ -7856,19 +8141,15 @@ fn parse_create_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
     loop {
         i = skip_ws(bytes, i);
         let (user, after_user) = read_user_identity(bytes, i)?;
-        i = skip_ws(bytes, after_user);
-        let mut auth = None;
-        if keyword_at(bytes, i, "IDENTIFIED") {
-            i = skip_ws(bytes, i + "IDENTIFIED".len());
-            if !keyword_at(bytes, i, "BY") {
-                return Err(Error::unsupported("IDENTIFIED without BY"));
-            }
-            i = skip_ws(bytes, i + "BY".len());
-            let (pwd, after_pwd) = read_quoted_or_ident(bytes, i);
-            auth = Some(pwd);
-            i = skip_ws(bytes, after_pwd);
-        }
-        users.push(UserSpec { user, auth });
+        let (auth, resource_group, comment, after_opts) =
+            parse_user_options(bytes, skip_ws(bytes, after_user))?;
+        i = after_opts;
+        users.push(UserSpec {
+            user,
+            auth,
+            resource_group,
+            comment,
+        });
         if i < bytes.len() && bytes[i] == b',' {
             i += 1;
             continue;
@@ -7885,6 +8166,86 @@ fn parse_create_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
         }),
         i,
     ))
+}
+
+/// Parse a user-attribute suffix shared by `CREATE USER` and `ALTER USER`:
+/// `IDENTIFIED BY 'pwd'` / `COMMENT '…'` / `RESOURCE GROUP name`, in any
+/// order.
+fn parse_user_options(
+    bytes: &[u8],
+    mut i: usize,
+) -> Result<(Option<String>, Option<String>, Option<String>, usize)> {
+    let mut auth = None;
+    let mut resource_group = None;
+    let mut comment = None;
+    loop {
+        i = skip_ws(bytes, i);
+        if keyword_at(bytes, i, "IDENTIFIED") {
+            i = skip_ws(bytes, i + "IDENTIFIED".len());
+            if keyword_at(bytes, i, "WITH") {
+                return Err(Error::unsupported("IDENTIFIED WITH"));
+            }
+            if !keyword_at(bytes, i, "BY") {
+                return Err(Error::unsupported("IDENTIFIED without BY"));
+            }
+            i = skip_ws(bytes, i + "BY".len());
+            if keyword_at(bytes, i, "PASSWORD") {
+                i = skip_ws(bytes, i + "PASSWORD".len());
+            }
+            let (pwd, after_pwd) = read_quoted_or_ident(bytes, i);
+            auth = Some(pwd);
+            i = skip_ws(bytes, after_pwd);
+            continue;
+        }
+        if keyword_at(bytes, i, "COMMENT") {
+            let start = skip_ws(bytes, i + "COMMENT".len());
+            let (text, end) = read_quoted_or_ident(bytes, start);
+            comment = Some(text);
+            i = skip_ws(bytes, end);
+            continue;
+        }
+        if keyword_at(bytes, i, "RESOURCE") {
+            i = skip_ws(bytes, i + "RESOURCE".len());
+            if !keyword_at(bytes, i, "GROUP") {
+                return Err(Error::unsupported("RESOURCE without GROUP"));
+            }
+            i = skip_ws(bytes, i + "GROUP".len());
+            let (group, end) = read_quoted_or_ident(bytes, i);
+            resource_group = Some(group);
+            i = skip_ws(bytes, end);
+            continue;
+        }
+        break;
+    }
+    Ok((auth, resource_group, comment, i))
+}
+
+/// `ALTER USER 'u'@'%' {IDENTIFIED BY 'pwd' | COMMENT '…' | RESOURCE GROUP g}`
+/// — sqlparser has no MySQL grammar for it.
+fn parse_alter_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    let mut users = Vec::new();
+    loop {
+        i = skip_ws(bytes, i);
+        let (user, after_user) = read_user_identity(bytes, i)?;
+        let (auth, resource_group, comment, after_opts) =
+            parse_user_options(bytes, skip_ws(bytes, after_user))?;
+        users.push(UserSpec {
+            user,
+            auth,
+            resource_group,
+            comment,
+        });
+        i = after_opts;
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if users.is_empty() {
+        return Err(Error::unsupported("ALTER USER without users"));
+    }
+    Ok((Statement::AlterUser(AlterUserStmt { users }), i))
 }
 
 fn parse_drop_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
@@ -7907,6 +8268,66 @@ fn parse_drop_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
     Ok((Statement::DropUser(DropUserStmt { if_exists, users }), end))
 }
 
+/// `SET DEFAULT ROLE {NONE | ALL | role[, …]} TO user[, …]`. Default roles
+/// become active on the next login (TiDB `SetDefaultRoleStmt`).
+fn try_parse_set_default_role(
+    bytes: &[u8],
+    start: usize,
+) -> Result<Option<(Statement, usize)>> {
+    let mut i = skip_ws(bytes, start + "SET".len());
+    if !keyword_at(bytes, i, "DEFAULT") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "DEFAULT".len());
+    if !keyword_at(bytes, i, "ROLE") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "ROLE".len());
+    let kind = if keyword_at(bytes, i, "NONE") {
+        i = skip_ws(bytes, i + "NONE".len());
+        SetRoleKind::None
+    } else if keyword_at(bytes, i, "ALL") {
+        i = skip_ws(bytes, i + "ALL".len());
+        SetRoleKind::All
+    } else {
+        let roles_start = i;
+        let mut depth: i32 = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b'\'' | b'"' | b'`' => {
+                    let q = bytes[i];
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != q {
+                        i += 1;
+                    }
+                }
+                _ if depth == 0 && keyword_at(bytes, i, "TO") => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        let roles = parse_role_list(&bytes[roles_start..i])?;
+        if roles.is_empty() {
+            return Ok(None);
+        }
+        SetRoleKind::Roles(roles)
+    };
+    if !keyword_at(bytes, i, "TO") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "TO".len());
+    let (users, end) = parse_user_list(bytes, i)?;
+    if users.is_empty() {
+        return Err(Error::unsupported("SET DEFAULT ROLE without users"));
+    }
+    Ok(Some((
+        Statement::SetDefaultRole(SetDefaultRoleStmt { kind, users }),
+        end,
+    )))
+}
+
 /// sqlparser rejects MySQL `GRANT role TO user` / dynamic privs like
 /// `GRANT BACKUP_ADMIN ON *.*`. Replace with `SET NAMES '__sealdb_role__'`
 /// and re-attach after lower.
@@ -7916,6 +8337,14 @@ fn extract_role_grants(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     let mut ops = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        if keyword_at(bytes, i, "SET")
+            && let Some((stmt, end)) = try_parse_set_default_role(bytes, i)?
+        {
+            out.push_str("SET NAMES '__sealdb_role__'");
+            ops.push(Some(stmt));
+            i = end;
+            continue;
+        }
         if keyword_at(bytes, i, "GRANT") {
             if let Some((stmt, end)) = try_parse_grant_role(bytes, i)? {
                 out.push_str("SET NAMES '__sealdb_role__'");
@@ -7983,7 +8412,19 @@ fn try_parse_dynamic_grant(bytes: &[u8], start: usize) -> Result<Option<(Stateme
         return Ok(None);
     }
     i = skip_ws(bytes, i + "TO".len());
-    let (users, end) = parse_user_list(bytes, i)?;
+    let (users, mut end) = parse_user_list(bytes, i)?;
+    end = skip_ws(bytes, end);
+    let mut with_grant = false;
+    if keyword_at(bytes, end, "WITH") {
+        let after_with = skip_ws(bytes, end + "WITH".len());
+        if keyword_at(bytes, after_with, "GRANT") {
+            let after_grant = skip_ws(bytes, after_with + "GRANT".len());
+            if keyword_at(bytes, after_grant, "OPTION") {
+                with_grant = true;
+                end = after_grant + "OPTION".len();
+            }
+        }
+    }
     Ok(Some((
         Statement::Grant(GrantStmt {
             privs: Vec::new(),
@@ -7993,7 +8434,7 @@ fn try_parse_dynamic_grant(bytes: &[u8], start: usize) -> Result<Option<(Stateme
                 table_name: String::new(),
             },
             users,
-            with_grant: false,
+            with_grant,
             dynamic_privs: privs,
         }),
         end,
@@ -8042,9 +8483,14 @@ fn try_parse_dynamic_revoke(bytes: &[u8], start: usize) -> Result<Option<(Statem
 /// GRANT/REVOKE statements stay on the sqlparser path.
 fn try_parse_table_priv_grant(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
     let i = skip_ws(bytes, start + "GRANT".len());
-    let Some((privs, after)) = parse_table_priv_list(bytes, i)? else {
+    // Bare `GRANT USAGE …` grants nothing but is valid MySQL/TiDB.
+    let usage_only = keyword_at(bytes, i, "USAGE");
+    let Some((privs, dynamic_privs, after)) = parse_table_priv_list(bytes, i)? else {
         return Ok(None);
     };
+    if privs.is_empty() && dynamic_privs.is_empty() && !usage_only {
+        return Ok(None);
+    }
     let mut i = skip_ws(bytes, after);
     if !keyword_at(bytes, i, "ON") {
         return Ok(None);
@@ -8077,7 +8523,7 @@ fn try_parse_table_priv_grant(bytes: &[u8], start: usize) -> Result<Option<(Stat
             level,
             users,
             with_grant,
-            dynamic_privs: Vec::new(),
+            dynamic_privs,
         }),
         end,
     )))
@@ -8086,6 +8532,8 @@ fn try_parse_table_priv_grant(bytes: &[u8], start: usize) -> Result<Option<(Stat
 fn try_parse_table_priv_revoke(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
     let mut i = skip_ws(bytes, start + "REVOKE".len());
     let mut grant_option = false;
+    // MySQL `REVOKE GRANT OPTION ON level FROM user` lists no privileges.
+    let mut only_grant_option = false;
     if keyword_at(bytes, i, "GRANT") {
         let after = skip_ws(bytes, i + "GRANT".len());
         if keyword_at(bytes, after, "OPTION") {
@@ -8093,11 +8541,20 @@ fn try_parse_table_priv_revoke(bytes: &[u8], start: usize) -> Result<Option<(Sta
             if keyword_at(bytes, after, "FOR") {
                 grant_option = true;
                 i = skip_ws(bytes, after + "FOR".len());
+            } else if keyword_at(bytes, after, "ON") {
+                grant_option = true;
+                only_grant_option = true;
+                i = after;
             }
         }
     }
-    let Some((privs, after)) = parse_table_priv_list(bytes, i)? else {
-        return Ok(None);
+    let (privs, dynamic_privs, after) = if only_grant_option {
+        (Vec::new(), Vec::new(), i)
+    } else {
+        let Some((privs, dynamic_privs, after)) = parse_table_priv_list(bytes, i)? else {
+            return Ok(None);
+        };
+        (privs, dynamic_privs, after)
     };
     let mut i = skip_ws(bytes, after);
     if !keyword_at(bytes, i, "ON") {
@@ -8119,65 +8576,155 @@ fn try_parse_table_priv_revoke(bytes: &[u8], start: usize) -> Result<Option<(Sta
             level,
             users,
             grant_option,
-            dynamic_privs: Vec::new(),
+            dynamic_privs,
         }),
         end,
     )))
 }
 
-fn parse_table_priv_list(bytes: &[u8], mut i: usize) -> Result<Option<(Vec<PrivElem>, usize)>> {
+fn parse_table_priv_list(
+    bytes: &[u8],
+    mut i: usize,
+) -> Result<Option<(Vec<PrivElem>, Vec<String>, usize)>> {
     let mut privs = Vec::new();
-    let mut saw_show_view = false;
+    let mut dynamic_privs = Vec::new();
     loop {
         i = skip_ws(bytes, i);
-        let mut tp = None;
-        for (prefix, value) in [
-            ("SHOW", PrivilegeType::SHOW_VIEW),
-            ("SELECT", PrivilegeType::SELECT),
-            ("INSERT", PrivilegeType::INSERT),
-            ("UPDATE", PrivilegeType::UPDATE),
-            ("DELETE", PrivilegeType::DELETE),
-            ("CREATE", PrivilegeType::CREATE_VIEW),
-            ("DROP", PrivilegeType::DROP),
-        ] {
-            if !keyword_at(bytes, i, prefix) {
+        // TiDB dynamic privileges (`CONNECTION_ADMIN`, `ROLE_ADMIN`, …) live in
+        // the same list as static ones but have their own grant table.
+        let (dyns, next) = parse_dynamic_priv_list(bytes, i)?;
+        if !dyns.is_empty() {
+            dynamic_privs.extend(dyns);
+            i = skip_ws(bytes, next);
+            if matches!(bytes.get(i), Some(b',')) {
+                i += 1;
                 continue;
             }
-            let mut next = skip_ws(bytes, i + prefix.len());
-            if matches!(value, PrivilegeType::SHOW_VIEW | PrivilegeType::CREATE_VIEW) {
-                // `SHOW VIEW` / `CREATE VIEW` are two words.
-                if !keyword_at(bytes, next, "VIEW") {
-                    continue;
-                }
-                next = skip_ws(bytes, next + "VIEW".len());
-            }
-            // A following column list (`SELECT (c1)`) is not a table-level
-            // grant; fall back to sqlparser so TiDB's column semantics apply.
-            if next < bytes.len() && bytes[next] == b'(' {
-                return Ok(None);
-            }
-            tp = Some((value, next));
             break;
         }
-        let Some((tp, next)) = tp else {
-            // Unknown privilege after a parsed list: let sqlparser try.
+        // `GRANT ALL [PRIVILEGES]`.
+        if keyword_at(bytes, i, "ALL") {
+            let mut next = skip_ws(bytes, i + "ALL".len());
+            if keyword_at(bytes, next, "PRIVILEGES") {
+                next = skip_ws(bytes, next + "PRIVILEGES".len());
+            }
+            if matches!(bytes.get(next), Some(b',')) || keyword_at(bytes, next, "ON") {
+                privs.push(PrivElem {
+                    tp: PrivilegeType::ALL,
+                    cols: Vec::new(),
+                });
+                i = next;
+                if matches!(bytes.get(i), Some(b',')) {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            return Ok(None);
+        }
+        // `USAGE` grants no privilege.
+        if keyword_at(bytes, i, "USAGE") {
+            i = skip_ws(bytes, i + "USAGE".len());
+            if keyword_at(bytes, i, "ON") {
+                break;
+            }
+            return Ok(None);
+        }
+        let Some((tp, mut next)) = static_priv_at(bytes, i) else {
+            // Unknown privilege (dynamic privileges are handled before this
+            // point): let sqlparser try.
             return Ok(None);
         };
-        saw_show_view |= tp == PrivilegeType::SHOW_VIEW;
-        privs.push(PrivElem {
-            tp,
-            cols: Vec::new(),
-        });
-        i = skip_ws(bytes, next);
-        if i < bytes.len() && bytes[i] == b',' {
+        next = skip_ws(bytes, next);
+        let mut cols = Vec::new();
+        if matches!(bytes.get(next), Some(b'(')) {
+            let (parsed, after) = parse_priv_columns(bytes, next)?;
+            cols = parsed;
+            next = skip_ws(bytes, after);
+        }
+        privs.push(PrivElem { tp, cols });
+        i = next;
+        if matches!(bytes.get(i), Some(b',')) {
             i += 1;
             continue;
         }
         break;
     }
-    // `GRANT SELECT ON db.t`: the table name follows directly.
-    let _ = saw_show_view;
-    Ok(Some((privs, i)))
+    Ok(Some((privs, dynamic_privs, i)))
+}
+
+/// Longest-first static privilege keyword match (`CREATE ROUTINE` before
+/// `CREATE`, `REPLICATION CLIENT` before …).
+fn static_priv_at(bytes: &[u8], i: usize) -> Option<(PrivilegeType, usize)> {
+    const PRIVS: [(&str, PrivilegeType); 31] = [
+        ("CREATE TEMPORARY TABLES", PrivilegeType::CREATE_TEMP_TABLES),
+        ("ALTER ROUTINE", PrivilegeType::ALTER_ROUTINE),
+        ("CREATE ROUTINE", PrivilegeType::CREATE_ROUTINE),
+        ("CREATE TABLESPACE", PrivilegeType::CREATE_TABLESPACE),
+        ("REPLICATION CLIENT", PrivilegeType::REPLICATION_CLIENT),
+        ("REPLICATION SLAVE", PrivilegeType::REPLICATION_SLAVE),
+        ("CREATE USER", PrivilegeType::CREATE_USER),
+        ("CREATE ROLE", PrivilegeType::CREATE_ROLE),
+        ("CREATE VIEW", PrivilegeType::CREATE_VIEW),
+        ("SHOW VIEW", PrivilegeType::SHOW_VIEW),
+        ("LOCK TABLES", PrivilegeType::LOCK_TABLES),
+        ("DROP ROLE", PrivilegeType::DROP_ROLE),
+        ("SYSTEM_USER", PrivilegeType::SYSTEM_USER),
+        ("SELECT", PrivilegeType::SELECT),
+        ("INSERT", PrivilegeType::INSERT),
+        ("UPDATE", PrivilegeType::UPDATE),
+        ("DELETE", PrivilegeType::DELETE),
+        ("CREATE", PrivilegeType::CREATE),
+        ("DROP", PrivilegeType::DROP),
+        ("RELOAD", PrivilegeType::RELOAD),
+        ("SHUTDOWN", PrivilegeType::SHUTDOWN),
+        ("PROCESS", PrivilegeType::PROCESS),
+        ("FILE", PrivilegeType::FILE),
+        ("REFERENCES", PrivilegeType::REFERENCES),
+        ("INDEX", PrivilegeType::INDEX),
+        ("ALTER", PrivilegeType::ALTER),
+        ("SUPER", PrivilegeType::SUPER),
+        ("EXECUTE", PrivilegeType::EXECUTE),
+        ("EVENT", PrivilegeType::EVENT),
+        ("TRIGGER", PrivilegeType::TRIGGER),
+        ("CONFIG", PrivilegeType::CONFIG),
+    ];
+    for (keyword, tp) in PRIVS {
+        if !keyword_at(bytes, i, keyword) {
+            continue;
+        }
+        let next = skip_ws(bytes, i + keyword.len());
+        // `SELECT …` must not swallow `SELECT` inside another word.
+        if keyword.len() < 3 {
+            continue;
+        }
+        return Some((tp, next));
+    }
+    None
+}
+
+fn parse_priv_columns(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, usize)> {
+    // i points at `(`.
+    i += 1;
+    let mut cols = Vec::new();
+    loop {
+        i = skip_ws(bytes, i);
+        let (name, next) = read_quoted_or_ident(bytes, i);
+        if name.is_empty() {
+            return Ok((cols, i));
+        }
+        cols.push(name);
+        i = skip_ws(bytes, next);
+        if matches!(bytes.get(i), Some(b',')) {
+            i += 1;
+            continue;
+        }
+        if matches!(bytes.get(i), Some(b')')) {
+            i += 1;
+        }
+        break;
+    }
+    Ok((cols, i))
 }
 
 fn parse_table_priv_level(bytes: &[u8], mut i: usize) -> Result<Option<(GrantLevel, usize)>> {
@@ -8251,9 +8798,16 @@ fn parse_dynamic_priv_list(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, u
         }
         privs.push(name.to_ascii_uppercase());
         i = skip_ws(bytes, next);
+        // Only consume the comma when another dynamic privilege follows;
+        // otherwise leave it for the mixed static/dynamic caller
+        // (`GRANT CONNECTION_ADMIN, PROCESS ON *.*`).
         if i < bytes.len() && bytes[i] == b',' {
-            i += 1;
-            continue;
+            let after_comma = skip_ws(bytes, i + 1);
+            let (peek, _) = read_quoted_or_ident(bytes, after_comma);
+            if is_dynamic_priv(&peek) {
+                i = after_comma;
+                continue;
+            }
         }
         break;
     }
@@ -8274,6 +8828,14 @@ fn is_dynamic_priv(name: &str) -> bool {
             | "RESTRICTED_VARIABLES_ADMIN"
             | "RESTRICTED_REPLICA_WRITER_ADMIN"
             | "RESTRICTED_PRIVILEGES_ADMIN"
+            | "PLACEMENT_ADMIN"
+            | "RESOURCE_GROUP_ADMIN"
+            | "RESOURCE_GROUP_USER"
+            | "DASHBOARD_CLIENT"
+            | "TIDB_SERVER_ADMIN"
+            | "TIDB_GC_MANAGER"
+            | "TRACE_ADMIN"
+            | "BDR_ROLE_ADMIN"
     )
 }
 
@@ -8362,18 +8924,42 @@ fn parse_role_list(raw: &[u8]) -> Result<Vec<UserIdentity>> {
     let text = std::str::from_utf8(raw).map_err(|_| Error::new(ERR_PARSE_ERROR, "role list"))?;
     let mut roles = Vec::new();
     for part in text.split(',') {
-        let name = part.trim().trim_matches('`').trim_matches('\'').trim();
-        if name.is_empty() {
+        let part = part.trim();
+        if part.is_empty() {
             continue;
         }
-        if name.contains('@') {
-            let (u, h) = name.split_once('@').unwrap();
-            roles.push(UserIdentity::new(
-                u.trim().trim_matches('\'').trim_matches('`'),
-                h.trim().trim_matches('\'').trim_matches('`'),
-            ));
-        } else {
-            roles.push(UserIdentity::new(name, "%"));
+        // Split `user@host` only at an `@` outside quotes: `'aa@bb'` is one
+        // account name (host `%`) while `'u'@'h'` names both parts.
+        let mut quote: Option<u8> = None;
+        let mut at: Option<usize> = None;
+        for (idx, b) in part.bytes().enumerate() {
+            match quote {
+                Some(q) if b == q => quote = None,
+                Some(_) => {}
+                None if b == b'\'' || b == b'"' || b == b'`' => quote = Some(b),
+                None if b == b'@' => {
+                    at = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let unquote = |value: &str| -> String {
+            let value = value.trim();
+            value
+                .strip_prefix('\'')
+                .and_then(|v| v.strip_suffix('\''))
+                .or_else(|| value.strip_prefix('`').and_then(|v| v.strip_suffix('`')))
+                .or_else(|| value.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+                .unwrap_or(value)
+                .to_string()
+        };
+        match at {
+            Some(idx) => roles.push(UserIdentity::new(
+                unquote(&part[..idx]),
+                unquote(&part[idx + 1..]),
+            )),
+            None => roles.push(UserIdentity::new(unquote(part), "%")),
         }
     }
     Ok(roles)
@@ -8400,6 +8986,18 @@ fn parse_user_list(bytes: &[u8], mut i: usize) -> Result<(Vec<UserIdentity>, usi
 
 fn read_user_identity(bytes: &[u8], mut i: usize) -> Result<(UserIdentity, usize)> {
     i = skip_ws(bytes, i);
+    // MySQL `CURRENT_USER()` grantee = the session account. An empty identity
+    // is the internal "current user" marker.
+    if keyword_at(bytes, i, "CURRENT_USER") {
+        let mut j = skip_ws(bytes, i + "CURRENT_USER".len());
+        if bytes.get(j) == Some(&b'(') {
+            let close = skip_ws(bytes, j + 1);
+            if bytes.get(close) == Some(&b')') {
+                j = close + 1;
+            }
+        }
+        return Ok((UserIdentity::new("", ""), j));
+    }
     let (user, after_user) = read_quoted_or_ident(bytes, i);
     if user.is_empty() {
         return Err(Error::new(ERR_PARSE_ERROR, "missing user"));

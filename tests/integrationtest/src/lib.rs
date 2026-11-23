@@ -315,10 +315,27 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed.starts_with('#') {
+        if trimmed.starts_with('#') || trimmed.starts_with("//") {
             continue;
         }
         if let Some(rest) = strip_prefix_ci(trimmed, "--") {
+            // `--echo <text>` is emitted verbatim (a trailing `;` is part of the
+            // text, unlike directive syntax).
+            if let Some(msg) = strip_prefix_ci(rest.trim_start(), "echo") {
+                steps.push(Step {
+                    sql: String::new(),
+                    expected_error: None,
+                    sorted: false,
+                    show_warnings: false,
+                    echo: Some(msg.trim_start().to_string()),
+                    log_result: true,
+                    show_info: false,
+                    replace_regex: Vec::new(),
+                    replace_column: Vec::new(),
+                    directive: None,
+                });
+                continue;
+            }
             // mysql-tester directives may be written without the usual space and
             // with a trailing `;` (`--enable_warnings;`).
             let rest = rest.trim().trim_end_matches(';').trim();
@@ -360,21 +377,6 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
             }
             if rest.eq_ignore_ascii_case("disable_warnings") {
                 warnings_enabled = false;
-                continue;
-            }
-            if let Some(msg) = strip_prefix_ci(rest, "echo") {
-                steps.push(Step {
-                    sql: String::new(),
-                    expected_error: None,
-                    sorted: false,
-                    show_warnings: false,
-                    echo: Some(msg.trim_start().to_string()),
-                    log_result: true,
-                    show_info: false,
-                    replace_regex: Vec::new(),
-                    replace_column: Vec::new(),
-                    directive: None,
-                });
                 continue;
             }
             // TiDB directives we do not yet honor: skip with clear error on use.
@@ -631,10 +633,27 @@ fn parse_error_code(raw: &str) -> Result<Option<i32>> {
         return Ok(Some(-1));
     }
     let first = codes.first().copied().unwrap_or(raw);
-    first
-        .parse::<i32>()
-        .map(Some)
-        .map_err(|_| Error::new(sealdb_errno::ERR_PARSE_ERROR, format!("bad --error {raw}")))
+    if let Ok(code) = first.parse::<i32>() {
+        return Ok(Some(code));
+    }
+    // TiDB's mysql-tester also accepts symbolic names; the imported corpus
+    // uses a handful of them.
+    let code = match first {
+        "ER_TABLEACCESS_DENIED_ERROR" | "ErrTableaccessDenied" => {
+            sealdb_errno::ERR_TABLEACCESS_DENIED_ERROR
+        }
+        "ErrColumnaccessDenied" => sealdb_errno::ERR_COLUMNACCESS_DENIED_ERROR,
+        "ErrSpecificAccessDenied" => sealdb_errno::ERR_SPECIFIC_ACCESS_DENIED_ERROR,
+        "ErrCantCreateUserWithGrant" => sealdb_errno::ERR_CANT_CREATE_USER_WITH_GRANT,
+        "ErrViewInvalid" => sealdb_errno::ERR_VIEW_INVALID_TABLE,
+        _ => {
+            return Err(Error::new(
+                sealdb_errno::ERR_PARSE_ERROR,
+                format!("bad --error {raw}"),
+            ));
+        }
+    };
+    Ok(Some(code))
 }
 
 pub fn load_suites(root: &Path) -> Result<Vec<Suite>> {
@@ -847,6 +866,15 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
                         if !user.is_empty() {
                             session
                                 .set_current_user(domain.privilege().resolve_login(&user, &host));
+                            // The mysql client dials 127.0.0.1 for `localhost`;
+                            // TiDB reports that peer host in access-denied errors.
+                            session.set_login_host(if host.eq_ignore_ascii_case("localhost") {
+                                "127.0.0.1".to_string()
+                            } else if host.is_empty() {
+                                "127.0.0.1".to_string()
+                            } else {
+                                host.clone()
+                            });
                         }
                         if !db.is_empty() {
                             let _ = session.execute_stmt(&format!("USE `{db}`"));
@@ -1293,6 +1321,15 @@ fn normalize_partition_ids(rest: &str) -> String {
 /// Drop every non-system schema so a persistent TiKV cluster starts a run with
 /// the empty catalog a fresh TiDB instance would have.
 fn reset_tikv_schemas(storage: Arc<dyn sealdb_kv::Storage>) -> Result<()> {
+    // A fresh TiDB instance has no accounts beyond root; DROP DATABASE leaves
+    // the persisted privilege snapshot (users, grants, roles) behind, so clear
+    // it too. Otherwise a prior run's `GRANT ALL ON *.*` leaks into the next
+    // file on a shared TiKV cluster.
+    {
+        let mut txn = storage.begin()?;
+        txn.delete(sealdb_privilege::PRIVILEGE_STORAGE_KEY)?;
+        txn.commit()?;
+    }
     let session = new_session(storage);
     let listed = session
         .execute_stmt("SELECT SCHEMA_NAME FROM information_schema.schemata ORDER BY SCHEMA_NAME")?;

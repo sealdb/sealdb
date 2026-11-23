@@ -22,5 +22,6 @@ sealdb-domain.workspace = true
 sealdb-errno.workspace = true
 sealdb-kv.workspace = true
 sealdb-parser.workspace = true
+sealdb-privilege.workspace = true
 sealdb-session.workspace = true
 sealdb-store.workspace = true

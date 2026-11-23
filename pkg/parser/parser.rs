@@ -645,6 +645,16 @@ mod tests {
             }
             other => panic!("expected SetPwdStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("GRANT CONNECTION_ADMIN, ROLE_ADMIN, SYSTEM_VARIABLES_ADMIN, PROCESS ON *.* TO tsg_r1")
+            .unwrap()
+        {
+            crate::ast::Statement::Grant(stmt) => {
+                assert_eq!(stmt.dynamic_privs.len(), 3);
+                assert_eq!(stmt.privs.len(), 1);
+            }
+            other => panic!("expected GrantStmt, got {other:?}"),
+        }
         match parser.parse_one_stmt("SET PASSWORD = 'x'").unwrap() {
             crate::ast::Statement::SetPwd(stmt) => {
                 assert!(stmt.user.is_none());
@@ -2356,3 +2366,4 @@ mod orig_text_timestamp {
         );
     }
 }
+

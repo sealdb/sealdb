@@ -104,6 +104,8 @@ pub struct Domain {
     /// `mysql.opt_rule_blacklist` / `mysql.expr_pushdown_blacklist` snapshot.
     /// `None` until the first load (lazy) or `ADMIN RELOAD`.
     planner_blacklist: Mutex<Option<sealdb_planner::PlannerBlacklist>>,
+    /// `ADMIN SET|UNSET BDR ROLE`: cluster-wide BDR role (empty when unset).
+    bdr_role: Mutex<String>,
 }
 
 /// One shard allocation window: `remaining` row ids may still be drawn from
@@ -243,12 +245,23 @@ impl Domain {
             analyze_version: AtomicU64::new(2),
             analyze_stats_versions: Mutex::new(HashMap::new()),
             planner_blacklist: Mutex::new(None),
+            bdr_role: Mutex::new(String::new()),
         })
     }
 
     /// Mark that `SHUTDOWN` was requested ( server ops).
     pub fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// `ADMIN SET BDR ROLE <role>` / `ADMIN UNSET BDR ROLE` (empty clears it).
+    pub fn set_bdr_role(&self, role: impl Into<String>) {
+        *self.bdr_role.lock().expect("domain bdr role lock") = role.into();
+    }
+
+    /// Current cluster BDR role (`""` when unset).
+    pub fn bdr_role(&self) -> String {
+        self.bdr_role.lock().expect("domain bdr role lock").clone()
     }
 
     /// True after a successful `SHUTDOWN` statement.
@@ -749,7 +762,11 @@ impl Domain {
     /// Statistics version stored with a table's statistics (`mysql.stats_meta`
     /// `version`), `None` before the first ANALYZE.
     pub fn table_analyze_version(&self, schema: &str, table: &str) -> Option<i32> {
-        let key = format!("{}.{}", schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+        let key = format!(
+            "{}.{}",
+            schema.to_ascii_lowercase(),
+            table.to_ascii_lowercase()
+        );
         self.analyze_stats_versions
             .lock()
             .expect("analyze stats versions lock")
@@ -758,7 +775,11 @@ impl Domain {
     }
 
     pub fn set_table_analyze_version(&self, schema: &str, table: &str, version: i32) {
-        let key = format!("{}.{}", schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+        let key = format!(
+            "{}.{}",
+            schema.to_ascii_lowercase(),
+            table.to_ascii_lowercase()
+        );
         self.analyze_stats_versions
             .lock()
             .expect("analyze stats versions lock")

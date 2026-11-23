@@ -7,9 +7,9 @@ use sealdb_errno::{
     ERR_DBACCESS_DENIED_ERROR, ERR_DEFINER_TOO_LONG, ERR_TABLEACCESS_DENIED_ERROR, Error, Result,
 };
 use sealdb_parser::ast::{
-    CreateRoleStmt, CreateUserStmt, DropRoleStmt, DropUserStmt, GrantLevel, GrantLevelType,
-    GrantRoleStmt, GrantStmt, PrivilegeType, RenameUserStmt, RevokeRoleStmt, RevokeStmt,
-    SetPwdStmt, SetRoleKind, UserIdentity,
+    AlterUserStmt, CreateRoleStmt, CreateUserStmt, DropRoleStmt, DropUserStmt, GrantLevel,
+    GrantLevelType, GrantRoleStmt, GrantStmt, PrivilegeType, RenameUserStmt, RevokeRoleStmt,
+    RevokeStmt, SetDefaultRoleStmt, SetPwdStmt, SetRoleKind, UserIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -22,11 +22,15 @@ pub const PRIVILEGE_STORAGE_KEY: &[u8] = b"mprivilege";
 struct GrantEntry {
     db: String,
     table: String,
+    /// Union of `table_privs` and every column grant's privileges.
     privs: PrivilegeType,
+    /// Privileges granted at table/db/global scope (not column-scoped).
+    table_privs: PrivilegeType,
     /// MySQL GRANT OPTION — required to GRANT the same privileges onward.
     with_grant: bool,
-    /// Column grants (`GRANT SELECT (id) ON t`); empty means table-level.
-    columns: Vec<String>,
+    /// Column grants (`GRANT SELECT (id), UPDATE (b) ON t`): one entry per
+    /// (privilege, column); empty means table-level.
+    columns: Vec<(PrivilegeType, String)>,
 }
 
 /// One materialized `mysql.tables_priv` row (TiDB keeps the same grant
@@ -49,10 +53,65 @@ struct Store {
     roles: HashSet<(String, String)>,
     /// User → granted roles.
     role_graph: HashMap<(String, String), HashSet<(String, String)>>,
-    /// TiDB dynamic privileges (BACKUP_ADMIN, …) per user.
-    dynamic: HashMap<(String, String), HashSet<String>>,
+    /// TiDB dynamic privileges (BACKUP_ADMIN, …) per user; value is
+    /// `WITH GRANT OPTION`.
+    dynamic: HashMap<(String, String), HashMap<String, bool>>,
     /// Created users and optional auth string (IDENTIFIED BY).
     users: HashMap<(String, String), Option<String>>,
+    /// TiDB `mysql.default_roles`: user → roles active by default at login.
+    default_roles: HashMap<(String, String), HashSet<(String, String)>>,
+    /// TiDB `mysql.user.User_attributes` payload (`COMMENT`, `RESOURCE GROUP`).
+    attributes: HashMap<(String, String), UserAttributes>,
+}
+
+/// TiDB user attributes kept in `mysql.user.User_attributes` JSON.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserAttributes {
+    pub comment: Option<String>,
+    pub resource_group: Option<String>,
+}
+
+impl UserAttributes {
+    fn is_empty(&self) -> bool {
+        self.comment.is_none() && self.resource_group.is_none()
+    }
+
+    /// TiDB's JSON text (`{"metadata": {"comment": "…"}, "resource_group": "…"}`).
+    pub fn to_json(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(comment) = &self.comment {
+            parts.push(format!(
+                "\"metadata\": {{\"comment\": {}}}",
+                json_string(comment)
+            ));
+        }
+        if let Some(group) = &self.resource_group {
+            parts.push(format!("\"resource_group\": {}", json_string(group)));
+        }
+        format!("{{{}}}", parts.join(", "))
+    }
+}
+
+/// One materialized `mysql.user` row.
+#[derive(Clone, Debug)]
+pub struct UserRow {
+    pub host: String,
+    pub user: String,
+    pub auth: Option<String>,
+    pub attributes: String,
+    pub global_privs: PrivilegeType,
+    pub with_grant: bool,
+    pub plugin: String,
+}
+
+/// One `information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES` row.
+pub struct PrivRow {
+    pub grantee: String,
+    pub db: String,
+    pub table: Option<String>,
+    pub column: Option<String>,
+    pub privilege: String,
+    pub grantable: bool,
 }
 
 pub struct Manager {
@@ -70,6 +129,8 @@ impl Manager {
                 role_graph: HashMap::new(),
                 dynamic: HashMap::new(),
                 users: HashMap::new(),
+                default_roles: HashMap::new(),
+                attributes: HashMap::new(),
             }),
         }
     }
@@ -83,6 +144,8 @@ impl Manager {
                 role_graph: HashMap::new(),
                 dynamic: HashMap::new(),
                 users: HashMap::new(),
+                default_roles: HashMap::new(),
+                attributes: HashMap::new(),
             }),
         };
         {
@@ -108,15 +171,33 @@ impl Manager {
     }
 
     pub fn grant(&self, stmt: &GrantStmt) -> Result<()> {
+        // TiDB never auto-creates accounts from GRANT; targeting a missing
+        // account fails with ER_CANT_CREATE_USER_WITH_GRANT (1410). Roles are
+        // accounts too (`CREATE ROLE`), so they are valid grantees.
+        if !self.skip_grant_table {
+            let inner = self.inner.lock().expect("privilege lock");
+            for user in &stmt.users {
+                let key = user_key(user);
+                if !inner.users.contains_key(&key) && !inner.roles.contains(&key) {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_CANT_CREATE_USER_WITH_GRANT,
+                        "You are not allowed to create a user with GRANT",
+                    ));
+                }
+            }
+        }
         if !stmt.dynamic_privs.is_empty() {
             let mut inner = self.inner.lock().expect("privilege lock");
             for user in &stmt.users {
                 let set = inner.dynamic.entry(user_key(user)).or_default();
                 for name in &stmt.dynamic_privs {
-                    set.insert(name.to_ascii_uppercase());
+                    let slot = set.entry(name.to_ascii_uppercase()).or_insert(false);
+                    *slot |= stmt.with_grant;
                 }
             }
-            return Ok(());
+            if stmt.privs.is_empty() {
+                return Ok(());
+            }
         }
         for elem in &stmt.privs {
             for user in &stmt.users {
@@ -140,7 +221,9 @@ impl Manager {
                     }
                 }
             }
-            return Ok(());
+            if stmt.privs.is_empty() {
+                return Ok(());
+            }
         }
         for user in &stmt.users {
             let key = user_key(user);
@@ -158,17 +241,26 @@ impl Manager {
                             continue;
                         }
                         if elem.cols.is_empty() {
-                            entry.privs = entry.privs.difference(elem.tp);
-                            entry.columns.clear();
-                        } else {
-                            entry
-                                .columns
-                                .retain(|c| !elem.cols.iter().any(|x| x.eq_ignore_ascii_case(c)));
-                            if entry.columns.is_empty() && !entry.privs.is_all() {
-                                // Column-only revoke emptied the list — drop that priv bit.
-                                entry.privs = entry.privs.difference(elem.tp);
+                            if elem.tp.is_all() {
+                                entry.table_privs = PrivilegeType::default();
+                                entry.columns.clear();
+                            } else {
+                                entry.table_privs = entry.table_privs.difference(elem.tp);
                             }
+                        } else {
+                            entry.columns.retain(|(granted, col)| {
+                                !(granted.contains(elem.tp)
+                                    && elem
+                                        .cols
+                                        .iter()
+                                        .any(|x| x.eq_ignore_ascii_case(col)))
+                            });
                         }
+                        // Rebuild the union from table-level and column grants.
+                        entry.privs = entry
+                            .columns
+                            .iter()
+                            .fold(entry.table_privs, |acc, (bits, _)| acc.union(*bits));
                         if elem.tp.is_all() || entry.privs.is_empty() {
                             entry.with_grant = false;
                         }
@@ -252,7 +344,54 @@ impl Manager {
                     ),
                 ));
             }
-            inner.users.insert(key, spec.auth.clone());
+            inner
+                .users
+                .insert(key.clone(), spec.auth.as_deref().map(encode_native_password));
+            let attrs = UserAttributes {
+                comment: spec.comment.clone(),
+                resource_group: spec.resource_group.clone(),
+            };
+            if !attrs.is_empty() {
+                inner.attributes.insert(key, attrs);
+            }
+        }
+        Ok(())
+    }
+
+    /// `ALTER USER … IDENTIFIED BY | COMMENT | RESOURCE GROUP`. TiDB updates
+    /// the account in place; a missing account fails with 1396.
+    pub fn alter_user(&self, stmt: &AlterUserStmt) -> Result<()> {
+        let mut inner = self.inner.lock().expect("privilege lock");
+        for spec in &stmt.users {
+            validate_account_name(&spec.user)?;
+            let key = user_key(&spec.user);
+            if !inner.users.contains_key(&key) {
+                if self.skip_grant_table {
+                    inner.users.insert(key.clone(), None);
+                } else {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_CANNOT_USER,
+                        format!(
+                            "Operation ALTER USER failed for '{}'@'{}'",
+                            spec.user.username, spec.user.hostname
+                        ),
+                    ));
+                }
+            }
+            if let Some(auth) = &spec.auth {
+                inner
+                    .users
+                    .insert(key.clone(), Some(encode_native_password(auth)));
+            }
+            if spec.comment.is_some() || spec.resource_group.is_some() {
+                let attrs = inner.attributes.entry(key).or_default();
+                if let Some(comment) = &spec.comment {
+                    attrs.comment = Some(comment.clone());
+                }
+                if let Some(group) = &spec.resource_group {
+                    attrs.resource_group = Some(group.clone());
+                }
+            }
         }
         Ok(())
     }
@@ -276,59 +415,156 @@ impl Manager {
             inner.grants.remove(&key);
             inner.dynamic.remove(&key);
             inner.role_graph.remove(&key);
+            inner.attributes.remove(&key);
         }
         Ok(())
     }
 
     /// `RENAME USER old TO new` — move auth + grants under the new identity.
+    /// Pairs are validated and applied in order (TiDB does the same inside one
+    /// pessimistic txn), so a later pair can reuse a name vacated by an
+    /// earlier one; the whole statement rolls back if any pair fails.
     pub fn rename_user(&self, stmt: &RenameUserStmt) -> Result<()> {
         let mut inner = self.inner.lock().expect("privilege lock");
-        for pair in &stmt.user_to_users {
-            let old_key = user_key(&pair.old_user);
-            let new_key = user_key(&pair.new_user);
-            if old_key == new_key {
-                continue;
-            }
-            if !inner.users.contains_key(&old_key) && !self.skip_grant_table {
-                return Err(Error::new(
-                    sealdb_errno::ERR_NO_SUCH_TABLE,
-                    format!(
-                        "Operation RENAME USER failed for '{}'@'{}'",
-                        pair.old_user.username, pair.old_user.hostname
-                    ),
-                ));
-            }
-            if inner.users.contains_key(&new_key) {
-                return Err(Error::new(
-                    sealdb_errno::ERR_TABLE_EXISTS,
-                    format!(
-                        "Operation RENAME USER failed for '{}'@'{}'",
-                        pair.new_user.username, pair.new_user.hostname
-                    ),
-                ));
-            }
-            let auth = inner.users.remove(&old_key).unwrap_or(None);
-            inner.users.insert(new_key.clone(), auth);
-            if let Some(grants) = inner.grants.remove(&old_key) {
-                inner.grants.insert(new_key.clone(), grants);
-            }
-            if let Some(dyns) = inner.dynamic.remove(&old_key) {
-                inner.dynamic.insert(new_key.clone(), dyns);
-            }
-            if let Some(roles) = inner.role_graph.remove(&old_key) {
-                inner.role_graph.insert(new_key.clone(), roles);
-            }
-            // Role memberships pointing at the old user as a role name.
-            if inner.roles.remove(&old_key) {
-                inner.roles.insert(new_key.clone());
-            }
-            for members in inner.role_graph.values_mut() {
-                if members.remove(&old_key) {
-                    members.insert(new_key.clone());
+        let failure = |pair: &sealdb_parser::ast::UserToUser, reason: &str| {
+            Error::new(
+                sealdb_errno::ERR_CANNOT_USER,
+                format!(
+                    "Operation RENAME USER failed for {}@{} TO {}@{} {reason}",
+                    pair.old_user.username,
+                    pair.old_user.hostname,
+                    pair.new_user.username,
+                    pair.new_user.hostname
+                ),
+            )
+        };
+        let snapshot = (
+            inner.grants.clone(),
+            inner.roles.clone(),
+            inner.role_graph.clone(),
+            inner.dynamic.clone(),
+            inner.users.clone(),
+            inner.default_roles.clone(),
+            inner.attributes.clone(),
+        );
+        let result = (|| -> Result<()> {
+            for pair in &stmt.user_to_users {
+                validate_account_name(&pair.new_user)?;
+                if self.skip_grant_table {
+                    continue;
                 }
+                let old_key = user_key(&pair.old_user);
+                let new_key = user_key(&pair.new_user);
+                if !inner.users.contains_key(&old_key) {
+                    return Err(failure(pair, "old did not exist"));
+                }
+                if inner.users.contains_key(&new_key) {
+                    return Err(failure(pair, "new did exist"));
+                }
+                let auth = inner.users.remove(&old_key).unwrap_or(None);
+                inner.users.insert(new_key.clone(), auth);
+                if let Some(grants) = inner.grants.remove(&old_key) {
+                    inner.grants.insert(new_key.clone(), grants);
+                }
+                if let Some(dyns) = inner.dynamic.remove(&old_key) {
+                    inner.dynamic.insert(new_key.clone(), dyns);
+                }
+                if let Some(roles) = inner.role_graph.remove(&old_key) {
+                    inner.role_graph.insert(new_key.clone(), roles);
+                }
+                if let Some(attrs) = inner.attributes.remove(&old_key) {
+                    inner.attributes.insert(new_key.clone(), attrs);
+                }
+                if let Some(defaults) = inner.default_roles.remove(&old_key) {
+                    inner.default_roles.insert(new_key.clone(), defaults);
+                }
+                for roles in inner.default_roles.values_mut() {
+                    if roles.remove(&old_key) {
+                        roles.insert(new_key.clone());
+                    }
+                }
+                // Role memberships pointing at the old user as a role name.
+                if inner.roles.remove(&old_key) {
+                    inner.roles.insert(new_key.clone());
+                }
+                for members in inner.role_graph.values_mut() {
+                    if members.remove(&old_key) {
+                        members.insert(new_key.clone());
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            inner.grants = snapshot.0;
+            inner.roles = snapshot.1;
+            inner.role_graph = snapshot.2;
+            inner.dynamic = snapshot.3;
+            inner.users = snapshot.4;
+            inner.default_roles = snapshot.5;
+            inner.attributes = snapshot.6;
+        }
+        result
+    }
+
+    /// `SET DEFAULT ROLE {NONE|ALL|roles} TO users` (TiDB `mysql.default_roles`).
+    pub fn set_default_role(&self, stmt: &SetDefaultRoleStmt) -> Result<()> {
+        let mut inner = self.inner.lock().expect("privilege lock");
+        for user in &stmt.users {
+            let key = user_key(user);
+            if !inner.users.contains_key(&key) {
+                return Err(Error::new(
+                    sealdb_errno::ERR_CANNOT_USER,
+                    format!(
+                        "Operation SET DEFAULT ROLE failed for {}@{}",
+                        user.username, user.hostname
+                    ),
+                ));
+            }
+            let granted = inner.role_graph.get(&key).cloned().unwrap_or_default();
+            let roles: HashSet<(String, String)> = match &stmt.kind {
+                SetRoleKind::None => HashSet::new(),
+                SetRoleKind::All => granted,
+                SetRoleKind::Roles(roles) => {
+                    let mut selected = HashSet::new();
+                    for role in roles {
+                        let role_key = user_key(role);
+                        if !granted.contains(&role_key) {
+                            return Err(Error::new(
+                                sealdb_errno::ERR_ROLE_NOT_GRANTED,
+                                format!(
+                                    "`{}`@`{}` is not granted to {}@{}",
+                                    role.username, role.hostname, user.username, user.hostname
+                                ),
+                            ));
+                        }
+                        selected.insert(role_key);
+                    }
+                    selected
+                }
+            };
+            if roles.is_empty() {
+                inner.default_roles.remove(&key);
+            } else {
+                inner.default_roles.insert(key, roles);
             }
         }
         Ok(())
+    }
+
+    /// Roles automatically active for `user` at login (`mysql.default_roles`).
+    pub fn default_roles(&self, user: &UserIdentity) -> Vec<UserIdentity> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut roles: Vec<(String, String)> = inner
+            .default_roles
+            .get(&user_key(user))
+            .map(|roles| roles.iter().cloned().collect())
+            .unwrap_or_default();
+        roles.sort();
+        roles
+            .into_iter()
+            .map(|(u, h)| UserIdentity::new(u, h))
+            .collect()
     }
 
     /// `SET PASSWORD` — update auth string (mysql_native_password plugin, ).
@@ -428,7 +664,9 @@ impl Manager {
         let mut inner = self.inner.lock().expect("privilege lock");
         for role in &stmt.roles {
             let rkey = user_key(role);
-            if !inner.roles.contains(&rkey) {
+            // TiDB stores roles and users in the same `mysql.user` namespace:
+            // a user can be granted to another account like a role.
+            if !inner.roles.contains(&rkey) && !inner.users.contains_key(&rkey) {
                 return Err(Error::new(
                     sealdb_errno::ERR_UNKNOWN_TABLE,
                     format!(
@@ -474,6 +712,20 @@ impl Manager {
             .iter()
             .map(|(u, h)| UserIdentity::new(u.clone(), h.clone()))
             .collect()
+    }
+
+    /// Whether `role` is directly granted to `user` (TiDB `FindEdge`). Empty
+    /// role hosts default to `%`.
+    pub fn role_granted_to(&self, user: &UserIdentity, role: &UserIdentity) -> bool {
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut key = user_key(role);
+        if key.1.is_empty() {
+            key.1 = "%".to_string();
+        }
+        inner
+            .role_graph
+            .get(&user_key(user))
+            .is_some_and(|members| members.contains(&key))
     }
 
     /// Resolve active roles for SET ROLE.
@@ -535,6 +787,92 @@ impl Manager {
             .any(|role| has_priv(&inner, role, db, table, wanted))
     }
 
+    /// TiDB `RequestDynamicVerification(..., requireGrantOption=false)`: a
+    /// dynamic privilege held directly by the user or an active role, with the
+    /// global `SUPER` (`ALL`) grant as fallback.
+    pub fn request_dynamic_verification_with_roles(
+        &self,
+        user: &UserIdentity,
+        active_roles: &[UserIdentity],
+        name: &str,
+    ) -> bool {
+        if self.skip_grant_table {
+            return true;
+        }
+        let inner = self.inner.lock().expect("privilege lock");
+        let holds = |identity: &UserIdentity| {
+            if inner
+                .dynamic
+                .get(&user_key(identity))
+                .is_some_and(|names| names.contains_key(name))
+            {
+                return true;
+            }
+            inner
+                .grants
+                .get(&user_key(identity))
+                .is_some_and(|entries| {
+                    entries.iter().any(|e| {
+                        e.db.is_empty()
+                            && e.table.is_empty()
+                            && (e.table_privs.contains(PrivilegeType::ALL)
+                                || e.table_privs.contains(PrivilegeType::SUPER))
+                    })
+                })
+        };
+        holds(user) || active_roles.iter().any(holds)
+    }
+
+    /// TiDB `AllPrivMask` request: any privilege granted at global, database,
+    /// or table scope satisfies it (`SHOW CREATE TABLE`).
+    pub fn request_any_table_verification_with_roles(
+        &self,
+        user: &UserIdentity,
+        active_roles: &[UserIdentity],
+        db: &str,
+        table: &str,
+    ) -> bool {
+        if self.skip_grant_table {
+            return true;
+        }
+        let inner = self.inner.lock().expect("privilege lock");
+        let has_any = |identity: &UserIdentity| {
+            inner
+                .grants
+                .get(&user_key(identity))
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|e| matches_scope(e, db, table) && !e.privs.is_empty())
+                })
+        };
+        has_any(user) || active_roles.iter().any(has_any)
+    }
+
+    /// `GRANT`/`REVOKE` need `GRANT OPTION` at the statement's level (or a
+    /// broader scope). TiDB models this as `Grant_priv`, so a plain `ALL`
+    /// grant without `WITH GRANT OPTION` does not satisfy it (error 8121).
+    pub fn request_grant_option_with_roles(
+        &self,
+        user: &UserIdentity,
+        active_roles: &[UserIdentity],
+        db: &str,
+        table: &str,
+    ) -> bool {
+        if self.skip_grant_table {
+            return true;
+        }
+        let inner = self.inner.lock().expect("privilege lock");
+        let holds = |identity: &UserIdentity| {
+            inner.grants.get(&user_key(identity)).is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|e| matches_scope(e, db, table) && e.with_grant)
+            })
+        };
+        holds(user) || active_roles.iter().any(holds)
+    }
+
     /// Column-granular check (TiDB `RequestVerification` with a `column`): a
     /// global/db grant or a table-level grant covers every column, while a
     /// column grant covers only the listed columns.
@@ -589,29 +927,202 @@ impl Manager {
         Some(out)
     }
 
-    pub fn show_grants(&self, user: &UserIdentity) -> Vec<String> {
+    /// TiDB `SHOW GRANTS`: global/db/table/column static grants (grouped and
+    /// sorted per scope, `WITH GRANT OPTION` merged in), then role grants,
+    /// then dynamic privileges. `USAGE` is printed when the displayed identity
+    /// has no global static privilege (`hasGlobalGrant` convention).
+    pub fn show_grants(&self, user: &UserIdentity, active_roles: &[UserIdentity]) -> Vec<String> {
         let inner = self.inner.lock().expect("privilege lock");
-        let mut out = Vec::new();
-        if let Some(entries) = inner.grants.get(&user_key(user)) {
-            out.extend(entries.iter().map(|e| format_grant(user, e)));
+        // TiDB `FindAllUserEffectiveRoles`: active roles pull in the roles
+        // granted to them, transitively.
+        let mut effective_roles: Vec<UserIdentity> = Vec::new();
+        let mut stack: Vec<UserIdentity> = active_roles.to_vec();
+        while let Some(role) = stack.pop() {
+            let key = user_key(&role);
+            if effective_roles.iter().any(|r| user_key(r) == key) {
+                continue;
+            }
+            if let Some(members) = inner.role_graph.get(&key) {
+                stack.extend(
+                    members
+                        .iter()
+                        .map(|(u, h)| UserIdentity::new(u.clone(), h.clone())),
+                );
+            }
+            effective_roles.push(role);
         }
+        let identities: Vec<&UserIdentity> = std::iter::once(user)
+            .chain(effective_roles.iter())
+            .collect();
+        let mut gs: Vec<String> = Vec::new();
+        let mut global_bits = PrivilegeType::default();
+        let mut global_grant = false;
+        let mut db_privs: std::collections::BTreeMap<String, (PrivilegeType, bool)> =
+            std::collections::BTreeMap::new();
+        let mut table_privs: std::collections::BTreeMap<String, (PrivilegeType, bool)> =
+            std::collections::BTreeMap::new();
+        let mut column_privs: std::collections::BTreeMap<
+            String,
+            Vec<(PrivilegeType, String)>,
+        > = std::collections::BTreeMap::new();
+        for identity in &identities {
+            let Some(entries) = inner.grants.get(&user_key(identity)) else {
+                continue;
+            };
+            for entry in entries {
+                if !entry.table_privs.is_empty() {
+                    if entry.db.is_empty() && entry.table.is_empty() {
+                        global_bits = global_bits.union(entry.table_privs);
+                        global_grant |= entry.with_grant;
+                    } else if entry.table.is_empty() {
+                        let slot = db_privs
+                            .entry(entry.db.to_ascii_lowercase())
+                            .or_insert((PrivilegeType::default(), false));
+                        slot.0 = slot.0.union(entry.table_privs);
+                        slot.1 |= entry.with_grant;
+                    } else {
+                        let key = format!("`{}`.`{}`", entry.db, entry.table);
+                        let slot = table_privs
+                            .entry(key)
+                            .or_insert((PrivilegeType::default(), false));
+                        slot.0 = slot.0.union(entry.table_privs);
+                        slot.1 |= entry.with_grant;
+                    }
+                }
+                if !entry.columns.is_empty() {
+                    let key = format!("`{}`.`{}`", entry.db, entry.table);
+                    column_privs
+                        .entry(key)
+                        .or_default()
+                        .extend(entry.columns.iter().cloned());
+                }
+            }
+        }
+        if global_bits.is_empty() {
+            gs.push(format!(
+                "GRANT USAGE ON *.* TO '{}'@'{}'",
+                user.username, user.hostname
+            ));
+        } else {
+            gs.push(static_grant_line(global_bits, "*.*", user, global_grant));
+        }
+        let db_start = gs.len();
+        for (db, (bits, grant)) in &db_privs {
+            let level = format!("`{db}`.*");
+            if bits.is_empty() {
+                if *grant {
+                    gs.push(format!(
+                        "GRANT USAGE ON {level} TO '{}'@'{}' WITH GRANT OPTION",
+                        user.username, user.hostname
+                    ));
+                }
+            } else {
+                gs.push(static_grant_line(*bits, &level, user, *grant));
+            }
+        }
+        // TiDB sorts each privilege scope's rendered lines (not the db names).
+        gs[db_start..].sort();
+        let db_end = gs.len();
+        for (table, (bits, grant)) in &table_privs {
+            if bits.is_empty() {
+                if *grant {
+                    gs.push(format!(
+                        "GRANT USAGE ON {table} TO '{}'@'{}' WITH GRANT OPTION",
+                        user.username, user.hostname
+                    ));
+                }
+            } else {
+                gs.push(static_grant_line(*bits, table, user, *grant));
+            }
+        }
+        gs[db_end..].sort();
+        let col_start = gs.len();
+        for (table, entries) in &column_privs {
+            let mut parts: Vec<String> = Vec::new();
+            // Render in TiDB's privilege display order, merging columns.
+            for (name, bit) in PrivilegeType::DISPLAY_ORDER {
+                let mut cols: Vec<String> = Vec::new();
+                for (granted, col) in entries {
+                    if !granted.contains(bit) {
+                        continue;
+                    }
+                    if !cols.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                        cols.push(col.clone());
+                    }
+                }
+                if cols.is_empty() {
+                    continue;
+                }
+                parts.push(format!(
+                    "{}({})",
+                    name,
+                    cols.iter()
+                        .map(|c| format!("`{c}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !parts.is_empty() {
+                gs.push(format!(
+                    "GRANT {} ON {} TO '{}'@'{}'",
+                    parts.join(", "),
+                    table,
+                    user.username,
+                    user.hostname
+                ));
+            }
+        }
+        gs[col_start..].sort();
+        // Role grants of the displayed user (not inherited role privileges).
         if let Some(roles) = inner.role_graph.get(&user_key(user)) {
-            for (ru, rh) in roles {
-                out.push(format!(
-                    "GRANT '{}'@'{}' TO '{}'@'{}'",
-                    ru, rh, user.username, user.hostname
+            let mut names: Vec<String> =
+                roles.iter().map(|(u, h)| format!("'{u}'@'{h}'")).collect();
+            names.sort();
+            if !names.is_empty() {
+                gs.push(format!(
+                    "GRANT {} TO '{}'@'{}'",
+                    names.join(", "),
+                    user.username,
+                    user.hostname
                 ));
             }
         }
-        if let Some(dyns) = inner.dynamic.get(&user_key(user)) {
-            for name in dyns {
-                out.push(format!(
-                    "GRANT {} ON *.* TO '{}'@'{}'",
-                    name, user.username, user.hostname
-                ));
+        // Dynamic privileges: sorted names, grouped by grant-option status.
+        let mut dynamic_plain: Vec<String> = Vec::new();
+        let mut dynamic_grant: Vec<String> = Vec::new();
+        let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        for identity in &identities {
+            let Some(names) = inner.dynamic.get(&user_key(identity)) else {
+                continue;
+            };
+            for (name, grantable) in names {
+                let slot = seen.entry(name.clone()).or_insert(false);
+                *slot = *slot || *grantable;
             }
         }
-        out
+        for (name, grantable) in seen {
+            if grantable {
+                dynamic_grant.push(name);
+            } else {
+                dynamic_plain.push(name);
+            }
+        }
+        for (names, grantable) in [(dynamic_plain, false), (dynamic_grant, true)] {
+            if names.is_empty() {
+                continue;
+            }
+            let mut s = format!(
+                "GRANT {} ON *.* TO '{}'@'{}'",
+                names.join(","),
+                user.username,
+                user.hostname
+            );
+            if grantable {
+                s.push_str(" WITH GRANT OPTION");
+            }
+            gs.push(s);
+        }
+        gs
     }
 
     pub fn access_denied(
@@ -665,15 +1176,17 @@ impl Manager {
             entry.privs = entry.privs.union(bits);
             entry.with_grant = entry.with_grant || with_grant;
             if columns.is_empty() {
-                entry.columns.clear();
-            } else if !entry.columns.is_empty() {
+                // A table-level grant subsumes column grants for these bits.
+                entry.table_privs = entry.table_privs.union(bits);
+                entry
+                    .columns
+                    .retain(|(granted, _)| !bits.contains(*granted));
+            } else {
                 for col in columns {
-                    if !entry
-                        .columns
-                        .iter()
-                        .any(|have| have.eq_ignore_ascii_case(col))
-                    {
-                        entry.columns.push(col.clone());
+                    if !entry.columns.iter().any(|(granted, have)| {
+                        granted.bits() == bits.bits() && have.eq_ignore_ascii_case(col)
+                    }) {
+                        entry.columns.push((bits, col.clone()));
                     }
                 }
             }
@@ -683,8 +1196,13 @@ impl Manager {
             db: level.db_name.clone(),
             table: level.table_name.clone(),
             privs: bits,
+            table_privs: if columns.is_empty() {
+                bits
+            } else {
+                PrivilegeType::default()
+            },
             with_grant,
-            columns: columns.to_vec(),
+            columns: columns.iter().map(|col| (bits, col.clone())).collect(),
         });
     }
 
@@ -702,20 +1220,16 @@ impl Manager {
                 if entry.db.is_empty() || entry.table.is_empty() {
                     continue;
                 }
-                let (table_priv, column_priv) = if entry.columns.is_empty() {
-                    (entry.privs.table_priv_set_names().join(","), String::new())
-                } else {
-                    (
-                        String::new(),
-                        entry
-                            .privs
-                            .table_priv_set_names()
-                            .into_iter()
-                            .filter(|name| matches!(*name, "Select" | "Insert" | "Update"))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    )
-                };
+                let table_priv = entry.table_privs.table_priv_set_names().join(",");
+                let column_priv = entry
+                    .columns
+                    .iter()
+                    .fold(PrivilegeType::default(), |acc, (bits, _)| acc.union(*bits))
+                    .table_priv_set_names()
+                    .into_iter()
+                    .filter(|name| matches!(*name, "Select" | "Insert" | "Update"))
+                    .collect::<Vec<_>>()
+                    .join(",");
                 rows.push(TablePrivRow {
                     host: host.clone(),
                     db: entry.db.clone(),
@@ -731,6 +1245,66 @@ impl Manager {
             (&a.host, &a.db, &a.user, &a.table).cmp(&(&b.host, &b.db, &b.user, &b.table))
         });
         rows
+    }
+
+    /// Rows for `information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES`.
+    pub fn privilege_rows(&self) -> Vec<PrivRow> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut rows = Vec::new();
+        for ((user, host), entries) in &inner.grants {
+            let grantee = format!("'{user}'@'{host}'");
+            for entry in entries {
+                if entry.db.is_empty() {
+                    continue;
+                }
+                for name in entry.table_privs.names() {
+                    rows.push(PrivRow {
+                        grantee: grantee.clone(),
+                        db: entry.db.clone(),
+                        table: (!entry.table.is_empty()).then(|| entry.table.clone()),
+                        column: None,
+                        privilege: name.to_string(),
+                        grantable: entry.with_grant,
+                    });
+                }
+                for (bits, column) in &entry.columns {
+                    for name in bits.names() {
+                        rows.push(PrivRow {
+                            grantee: grantee.clone(),
+                            db: entry.db.clone(),
+                            table: (!entry.table.is_empty()).then(|| entry.table.clone()),
+                            column: Some(column.clone()),
+                            privilege: name.to_string(),
+                            grantable: entry.with_grant,
+                        });
+                    }
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            (
+                &a.grantee,
+                &a.db,
+                &a.table,
+                &a.column,
+                &a.privilege,
+            )
+                .cmp(&(&b.grantee, &b.db, &b.table, &b.column, &b.privilege))
+        });
+        rows
+    }
+
+    /// Whether `user` holds any global grant (sees every privilege row).
+    pub fn has_global_grant(&self, user: &UserIdentity) -> bool {
+        let inner = self.inner.lock().expect("privilege lock");
+        inner
+            .grants
+            .get(&user_key(user))
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e.db.is_empty() && !e.table_privs.is_empty())
+            })
     }
 
     /// Serialize grant tables for Storage (TiDB mysql.user / db / tables_priv).
@@ -750,7 +1324,14 @@ impl Manager {
                             table: e.table.clone(),
                             privs: e.privs.bits(),
                             with_grant: e.with_grant,
-                            columns: e.columns.clone(),
+                            columns: e
+                                .columns
+                                .iter()
+                                .map(|(bits, column)| PersistColumnGrant::Grant {
+                                    privs: bits.bits(),
+                                    column: column.clone(),
+                                })
+                                .collect(),
                         })
                         .collect(),
                 })
@@ -771,7 +1352,12 @@ impl Manager {
                 .map(|((u, h), names)| PersistDynamic {
                     user: u.clone(),
                     host: h.clone(),
-                    names: names.iter().cloned().collect(),
+                    names: names.keys().cloned().collect(),
+                    grant_names: names
+                        .iter()
+                        .filter(|(_, grantable)| **grantable)
+                        .map(|(name, _)| name.clone())
+                        .collect(),
                 })
                 .collect(),
             users: inner
@@ -781,6 +1367,25 @@ impl Manager {
                     user: u.clone(),
                     host: h.clone(),
                     auth: auth.clone(),
+                })
+                .collect(),
+            default_roles: inner
+                .default_roles
+                .iter()
+                .map(|((u, h), roles)| PersistDefaultRoles {
+                    user: u.clone(),
+                    host: h.clone(),
+                    roles: roles.iter().cloned().collect(),
+                })
+                .collect(),
+            attributes: inner
+                .attributes
+                .iter()
+                .map(|((u, h), attrs)| PersistAttributes {
+                    user: u.clone(),
+                    host: h.clone(),
+                    comment: attrs.comment.clone(),
+                    resource_group: attrs.resource_group.clone(),
                 })
                 .collect(),
         };
@@ -811,21 +1416,43 @@ impl Manager {
                     .into_iter()
                     .map(|e| {
                         // `ALL` is not a separate bit: snapshots from before
-                        // SHOW VIEW (0x3f) or CREATE VIEW (0x7f) was tracked
-                        // stored exactly those bits as root's global ALL. Treat
-                        // the old masks as today's ALL.
+                        // SHOW VIEW (0x3f), CREATE VIEW (0x7f) or the full
+                        // MySQL privilege set (0xff) was tracked stored exactly
+                        // those bits as root's global ALL. Treat the old masks
+                        // as today's ALL.
                         let privs = PrivilegeType::from_bits(e.privs);
-                        let privs = if matches!(privs.bits(), 0x3f | 0x7f) {
+                        let privs = if matches!(privs.bits(), 0x3f | 0x7f | 0xff) {
                             PrivilegeType::ALL
                         } else {
                             privs
+                        };
+                        let column_grants: Vec<(PrivilegeType, String)> = e
+                            .columns
+                            .into_iter()
+                            .map(|column| match column {
+                                PersistColumnGrant::Legacy(name) => (privs, name),
+                                PersistColumnGrant::Grant { privs, column } => {
+                                    (PrivilegeType::from_bits(privs), column)
+                                }
+                            })
+                            .collect();
+                        let column_bits = column_grants
+                            .iter()
+                            .fold(PrivilegeType::default(), |acc, (bits, _)| {
+                                acc.union(*bits)
+                            });
+                        let table_privs = if column_grants.is_empty() {
+                            privs
+                        } else {
+                            privs.difference(column_bits)
                         };
                         GrantEntry {
                             db: e.db,
                             table: e.table,
                             privs,
+                            table_privs,
                             with_grant: e.with_grant,
-                            columns: e.columns,
+                            columns: column_grants,
                         }
                     })
                     .collect(),
@@ -838,17 +1465,41 @@ impl Manager {
         }
         let mut dynamic = HashMap::new();
         for d in snap.dynamic {
-            dynamic.insert((d.user, d.host), d.names.into_iter().collect());
+            let names = d
+                .names
+                .into_iter()
+                .map(|name| {
+                    let grantable = d.grant_names.iter().any(|g| g == &name);
+                    (name, grantable)
+                })
+                .collect();
+            dynamic.insert((d.user, d.host), names);
         }
         let mut users = HashMap::new();
         for u in snap.users {
             users.insert((u.user, u.host), u.auth);
+        }
+        let mut attributes = HashMap::new();
+        for a in snap.attributes {
+            attributes.insert(
+                (a.user, a.host),
+                UserAttributes {
+                    comment: a.comment,
+                    resource_group: a.resource_group,
+                },
+            );
+        }
+        let mut default_roles = HashMap::new();
+        for edge in snap.default_roles {
+            default_roles.insert((edge.user, edge.host), edge.roles.into_iter().collect());
         }
         let mut inner = self.inner.lock().expect("privilege lock");
         inner.grants = grants;
         inner.roles = roles;
         inner.role_graph = role_graph;
         inner.dynamic = dynamic;
+        inner.attributes = attributes;
+        inner.default_roles = default_roles;
         if !users.is_empty() {
             inner.users = users;
         }
@@ -864,7 +1515,54 @@ impl Manager {
         inner
             .dynamic
             .get(&user_key(user))
-            .is_some_and(|s| s.contains(&name.to_ascii_uppercase()))
+            .is_some_and(|s| s.contains_key(&name.to_ascii_uppercase()))
+    }
+
+    /// TiDB `mysql.user.User_attributes` for `user` (empty when never set).
+    pub fn user_attributes(&self, user: &UserIdentity) -> UserAttributes {
+        self.inner
+            .lock()
+            .expect("privilege lock")
+            .attributes
+            .get(&user_key(user))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Rows for the virtual `mysql.user` table: one per created account, with
+    /// the global static privileges and `User_attributes` JSON.
+    pub fn user_rows(&self) -> Vec<UserRow> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut users: Vec<_> = inner.users.iter().collect();
+        users.sort_by(|((u1, h1), _), ((u2, h2), _)| h1.cmp(h2).then(u1.cmp(u2)));
+        users
+            .into_iter()
+            .map(|((user, host), auth)| {
+                let mut privs = PrivilegeType::default();
+                let mut with_grant = false;
+                for entry in inner.grants.get(&(user.clone(), host.clone())).into_iter().flatten()
+                {
+                    if entry.db.is_empty() && entry.table.is_empty() {
+                        privs = privs.union(entry.table_privs);
+                        with_grant |= entry.with_grant;
+                    }
+                }
+                let attributes = inner
+                    .attributes
+                    .get(&(user.clone(), host.clone()))
+                    .map(UserAttributes::to_json)
+                    .unwrap_or_else(|| "{}".to_string());
+                UserRow {
+                    host: host.clone(),
+                    user: user.clone(),
+                    auth: auth.clone(),
+                    attributes,
+                    global_privs: privs,
+                    with_grant,
+                    plugin: "mysql_native_password".to_string(),
+                }
+            })
+            .collect()
     }
 }
 
@@ -877,6 +1575,29 @@ struct PersistSnapshot {
     dynamic: Vec<PersistDynamic>,
     #[serde(default)]
     users: Vec<PersistUser>,
+    /// `mysql.default_roles` (roles active at login).
+    #[serde(default)]
+    default_roles: Vec<PersistDefaultRoles>,
+    /// User_attributes (`COMMENT` / `RESOURCE GROUP`).
+    #[serde(default)]
+    attributes: Vec<PersistAttributes>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistDefaultRoles {
+    user: String,
+    host: String,
+    roles: Vec<(String, String)>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistAttributes {
+    user: String,
+    host: String,
+    #[serde(default)]
+    comment: Option<String>,
+    #[serde(default)]
+    resource_group: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -884,6 +1605,9 @@ struct PersistDynamic {
     user: String,
     host: String,
     names: Vec<String>,
+    /// Dynamic privileges granted `WITH GRANT OPTION`.
+    #[serde(default)]
+    grant_names: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -907,7 +1631,14 @@ struct PersistGrantEntry {
     privs: u64,
     with_grant: bool,
     #[serde(default)]
-    columns: Vec<String>,
+    columns: Vec<PersistColumnGrant>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum PersistColumnGrant {
+    Legacy(String),
+    Grant { privs: u64, column: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -928,10 +1659,11 @@ fn has_priv(
         return false;
     };
     // A column-only grant does not satisfy a table-level request (TiDB keeps
-    // `mysql.tables_priv` and `mysql.columns_priv` apart).
+    // `mysql.tables_priv` and `mysql.columns_priv` apart). A multi-bit request
+    // passes when any requested privilege is held (`priv & wanted != 0`).
     entries
         .iter()
-        .any(|e| matches_scope(e, db, table) && e.columns.is_empty() && e.privs.contains(wanted))
+        .any(|e| matches_scope(e, db, table) && e.table_privs.intersects(wanted))
 }
 
 /// Column-level request: table grants cover every column, column grants only
@@ -949,11 +1681,10 @@ fn has_column_priv(
     };
     entries.iter().any(|e| {
         matches_scope(e, db, table)
-            && e.privs.contains(wanted)
-            && (e.columns.is_empty()
-                || e.columns
-                    .iter()
-                    .any(|have| have.eq_ignore_ascii_case(column)))
+            && (e.table_privs.intersects(wanted)
+                || e.columns.iter().any(|(granted, have)| {
+                    granted.intersects(wanted) && have.eq_ignore_ascii_case(column)
+                }))
     })
 }
 
@@ -1007,11 +1738,90 @@ fn host_pattern_matches(pattern: &str, host: &str) -> bool {
 /// Already-hashed values (`*…`) are kept; otherwise store the plaintext
 /// (same shape as `CREATE USER … IDENTIFIED BY`, verified by plugin name).
 fn encode_native_password(password: &str) -> String {
-    if password.starts_with('*') {
-        password.to_ascii_uppercase()
-    } else {
-        password.to_string()
+    if password.is_empty() {
+        return String::new();
     }
+    if password.starts_with('*') {
+        return password.to_ascii_uppercase();
+    }
+    // mysql_native_password: `*` + uppercased hex(SHA1(SHA1(password))).
+    let first = sha1_digest(password.as_bytes());
+    let second = sha1_digest(&first);
+    let mut out = String::with_capacity(41);
+    out.push('*');
+    for byte in second {
+        out.push_str(&format!("{byte:02X}"));
+    }
+    out
+}
+
+/// Minimal SHA-1 (mysql_native_password storage hash).
+fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in chunk.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
+            };
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = tmp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// JSON string literal for `User_attributes` text.
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn same_level(entry: &GrantEntry, level: &GrantLevel) -> bool {
@@ -1029,30 +1839,22 @@ fn matches_scope(entry: &GrantEntry, db: &str, table: &str) -> bool {
     entry.table.is_empty() || entry.table.eq_ignore_ascii_case(table)
 }
 
-fn format_grant(user: &UserIdentity, entry: &GrantEntry) -> String {
-    let level = if entry.db.is_empty() && entry.table.is_empty() {
-        "*.*".to_string()
-    } else if entry.table.is_empty() {
-        format!("`{}`.*", entry.db)
-    } else if entry.db.is_empty() {
-        format!("`{}`", entry.table)
-    } else {
-        format!("`{}`.`{}`", entry.db, entry.table)
-    };
-    let priv_names = if entry.columns.is_empty() {
-        entry.privs.names().join(", ")
-    } else {
-        format!(
-            "{} ({})",
-            entry.privs.names().join(", "),
-            entry.columns.join(", ")
-        )
-    };
+/// A `GRANT … ON … TO …` line for a raw static privilege bitmask (dynamic
+/// privileges are emitted separately).
+fn static_grant_line(
+    bits: PrivilegeType,
+    level: &str,
+    user: &UserIdentity,
+    grant_option: bool,
+) -> String {
     let mut s = format!(
         "GRANT {} ON {} TO '{}'@'{}'",
-        priv_names, level, user.username, user.hostname
+        bits.names().join(","),
+        level,
+        user.username,
+        user.hostname
     );
-    if entry.with_grant {
+    if grant_option {
         s.push_str(" WITH GRANT OPTION");
     }
     s
@@ -1066,12 +1868,25 @@ thread_local! {
     /// `sessionctx.Context`).
     static CURRENT_USER: std::cell::RefCell<Option<UserIdentity>> =
         const { std::cell::RefCell::new(None) };
+    /// Roles activated by `SET ROLE` for the statement on this thread.
+    /// `SHOW GRANTS` merges their privileges into the caller's output,
+    /// mirroring TiDB's `ActiveRoles` (empty for `SHOW GRANTS FOR other`).
+    static ACTIVE_ROLES: std::cell::RefCell<Vec<UserIdentity>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub fn set_thread_user(user: Option<UserIdentity>) {
     CURRENT_USER.with(|cell| *cell.borrow_mut() = user);
 }
 
+pub fn set_thread_active_roles(roles: Vec<UserIdentity>) {
+    ACTIVE_ROLES.with(|cell| *cell.borrow_mut() = roles);
+}
+
 pub fn thread_user() -> Option<UserIdentity> {
     CURRENT_USER.with(|cell| cell.borrow().clone())
+}
+
+pub fn thread_active_roles() -> Vec<UserIdentity> {
+    ACTIVE_ROLES.with(|cell| cell.borrow().clone())
 }

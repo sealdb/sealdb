@@ -110,8 +110,8 @@ impl AnalyzeExec {
         // switch it).
         let session_version = self.domain.analyze_version();
         let stored_version = self.domain.table_analyze_version(&schema, &name);
-        let incompatible = !indexes.is_empty()
-            && stored_version.is_some_and(|version| version != session_version);
+        let incompatible =
+            !indexes.is_empty() && stored_version.is_some_and(|version| version != session_version);
         let effective_version = if incompatible {
             stored_version.unwrap_or(session_version)
         } else {
@@ -180,13 +180,8 @@ impl AnalyzeExec {
             topn_size,
         );
         let columns = analyzed_columns.clone();
-        let index_stats = collect_index_stats(
-            &info,
-            &rows,
-            buckets,
-            topn_size,
-            effective_version == 1,
-        );
+        let index_stats =
+            collect_index_stats(&info, &rows, buckets, topn_size, effective_version == 1);
         // TiDB keeps a row count per physical table id in `mysql.stats_meta`; a
         // partition's `DATA_LENGTH` reads its own count, not the table total.
         let part_counts: Vec<(i64, u64)> = if info.partition.is_some() {
@@ -528,7 +523,8 @@ pub fn is_multi_valued_index(info: &TableInfo, index: &sealdb_meta::IndexInfo) -
     })
 }
 
-fn resolve_index_columns(info: &TableInfo, indexes: &[String]) -> Result<Option<HashSet<String>>> {    if indexes.is_empty() {
+fn resolve_index_columns(info: &TableInfo, indexes: &[String]) -> Result<Option<HashSet<String>>> {
+    if indexes.is_empty() {
         return Ok(None);
     }
     let mut cols = HashSet::new();
