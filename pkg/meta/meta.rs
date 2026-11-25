@@ -103,6 +103,16 @@ impl Mutator {
         self.inc_int(format!("NextHandle:{table_id}").as_bytes(), 1)
     }
 
+    /// Reserve `count` consecutive `_tidb_rowid` values (TiDB `AUTO_ID_CACHE`
+    /// batch): returns `(first, last)`. With `count == 1` this is
+    /// [`Mutator::alloc_handle`].
+    pub fn alloc_handle_batch(&mut self, table_id: i64, count: i64) -> Result<(i64, i64)> {
+        let key = format!("NextHandle:{table_id}");
+        let current = self.get_int(key.as_bytes())?;
+        let last = self.inc_int(key.as_bytes(), count)?;
+        Ok((current + 1, last))
+    }
+
     /// Reset auto handle so the next alloc starts at 1 (empty-table state).
     pub fn reset_handle(&mut self, table_id: i64) {
         let key = encode_string_data_key(format!("NextHandle:{table_id}").as_bytes()).into_bytes();
@@ -128,6 +138,22 @@ impl Mutator {
     /// user values above the counter bump it via [`Mutator::bump_auto_id`].
     pub fn alloc_auto_id(&mut self, table_id: i64) -> Result<i64> {
         self.inc_int(format!("NextAutoID:{table_id}").as_bytes(), 1)
+    }
+
+    /// Reserve `count` consecutive `AUTO_INCREMENT` values (TiDB
+    /// `AUTO_ID_CACHE` batch): returns `(first, last)`.
+    pub fn alloc_auto_id_batch(&mut self, table_id: i64, count: i64) -> Result<(i64, i64)> {
+        let key = format!("NextAutoID:{table_id}");
+        let current = self.get_int(key.as_bytes())?;
+        let last = self.inc_int(key.as_bytes(), count)?;
+        Ok((current + 1, last))
+    }
+
+    /// Last handed-out `AUTO_INCREMENT` value (0 when the table never
+    /// allocated one). `SHOW CREATE TABLE` prints `AUTO_INCREMENT=<value + 1>`.
+    pub fn peek_auto_id(&self, table_id: i64) -> i64 {
+        self.get_int(format!("NextAutoID:{table_id}").as_bytes())
+            .unwrap_or(0)
     }
 
     /// Raise the `AUTO_INCREMENT` counter to at least `value` so a later

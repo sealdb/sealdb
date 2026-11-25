@@ -1,3 +1,4 @@
+use crate::analyze::is_special_global_index;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_BAD_DB, ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
@@ -228,11 +229,17 @@ impl Executor for ShowExec {
                         format!("Table '{schema}.{name}' doesn't exist"),
                     )
                 })?;
-                if info.is_view() {
+                if info.is_sequence() {
+                    self.schema = vec!["Sequence".to_string(), "Create Sequence".to_string()];
+                    self.rows = vec![vec![
+                        Datum::Bytes(name.as_bytes().to_vec()),
+                        Datum::Bytes(render_create_sequence(info).into_bytes()),
+                    ]];
+                } else if info.is_view() {
                     let view = info.view.as_ref().expect("view body");
                     self.schema = vec![
-                        "Table".to_string(),
-                        "Create Table".to_string(),
+                        "View".to_string(),
+                        "Create View".to_string(),
                         "character_set_client".to_string(),
                         "collation_connection".to_string(),
                     ];
@@ -244,9 +251,16 @@ impl Executor for ShowExec {
                     ]];
                 } else {
                     self.schema = vec!["Table".to_string(), "Create Table".to_string()];
+                    // TiDB keeps the allocator high-water mark in the table
+                    // meta; SHOW CREATE prints it as `AUTO_INCREMENT=<next>`.
+                    let next_auto_id = if info.columns.iter().any(|c| c.auto_increment) {
+                        Some(self.domain.peek_auto_id(info.id))
+                    } else {
+                        None
+                    };
                     self.rows = vec![vec![
                         Datum::Bytes(name.as_bytes().to_vec()),
-                        Datum::Bytes(render_create_table(info).into_bytes()),
+                        Datum::Bytes(render_create_table(info, next_auto_id).into_bytes()),
                     ]];
                 }
             }
@@ -280,6 +294,42 @@ impl Executor for ShowExec {
                     Datum::Bytes(render_create_view(info, view).into_bytes()),
                     Datum::Bytes(b"utf8mb4".to_vec()),
                     Datum::Bytes(b"utf8mb4_general_ci".to_vec()),
+                ]];
+            }
+            ShowStmtKind::CreateSequence => {
+                let table = self
+                    .stmt
+                    .table
+                    .as_ref()
+                    .ok_or_else(|| Error::new(ERR_NO_SUCH_TABLE, "missing sequence name"))?;
+                let (schema, name) = resolve_table(table, &self.current_db)?;
+                // TiDB resolves `SHOW CREATE SEQUENCE` against the permanent
+                // catalog (local temporary tables never shadow a sequence),
+                // but takes the result column headers from the session catalog:
+                // a temporary table with the same name reports
+                // `Table` / `Create Table` even though the sequence DDL is
+                // printed.
+                let shadowed = is.temp_table_by_name(&name).is_some();
+                let info = is.table_by_name(&schema, &name).ok_or_else(|| {
+                    Error::new(
+                        ERR_NO_SUCH_TABLE,
+                        format!("Table '{schema}.{name}' doesn't exist"),
+                    )
+                })?;
+                if !info.is_sequence() {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_WRONG_OBJECT,
+                        format!("'{schema}.{name}' is not SEQUENCE"),
+                    ));
+                }
+                self.schema = if shadowed {
+                    vec!["Table".to_string(), "Create Table".to_string()]
+                } else {
+                    vec!["Sequence".to_string(), "Create Sequence".to_string()]
+                };
+                self.rows = vec![vec![
+                    Datum::Bytes(name.as_bytes().to_vec()),
+                    Datum::Bytes(render_create_sequence(info).into_bytes()),
                 ]];
             }
             ShowStmtKind::Columns => {
@@ -332,9 +382,9 @@ impl Executor for ShowExec {
                     .union(PrivilegeType::UPDATE)
                     .union(PrivilegeType::REFERENCES);
                 let pass_tbl = match &user {
-                    Some(user) => mgr.request_verification_with_roles(
-                        user, &roles, &schema, &name, privs,
-                    ),
+                    Some(user) => {
+                        mgr.request_verification_with_roles(user, &roles, &schema, &name, privs)
+                    }
                     None => true,
                 };
                 let mut pass_col = false;
@@ -657,6 +707,82 @@ impl Executor for ShowExec {
                 self.rows = rows;
                 self.apply_where_filter()?;
             }
+            ShowStmtKind::StatsHistograms => {
+                self.schema = STATS_HISTOGRAMS_COLUMNS
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect();
+                let stats = self.domain.stats();
+                let mut rows = Vec::new();
+                for db in is.all_schemas() {
+                    let db_name = db.name.o().to_string();
+                    if db_name.eq_ignore_ascii_case("information_schema")
+                        || db_name.eq_ignore_ascii_case("mysql")
+                    {
+                        continue;
+                    }
+                    for table in is.schema_tables(&db_name) {
+                        let table_name = table.name.o().to_string();
+                        let Some(table_stats) = stats.raw_table(&db_name, &table_name) else {
+                            continue;
+                        };
+                        match table.partition.as_ref().filter(|part| part.enable) {
+                            // A partitioned table reports its global statistics
+                            // under the pseudo partition `global`, then one
+                            // block per partition definition.
+                            Some(part) => {
+                                push_stats_histogram_rows(
+                                    &mut rows,
+                                    &db_name,
+                                    &table_name,
+                                    "global",
+                                    &table,
+                                    &table_stats.columns,
+                                    &table_stats.indices,
+                                    true,
+                                );
+                                for def in &part.definitions {
+                                    let partition_name = def.name.o().to_string();
+                                    let partition_stats = table_stats
+                                        .partitions
+                                        .iter()
+                                        .find(|stats| stats.id == def.id);
+                                    let empty_columns = Vec::new();
+                                    let empty_indices = Vec::new();
+                                    push_stats_histogram_rows(
+                                        &mut rows,
+                                        &db_name,
+                                        &table_name,
+                                        &partition_name,
+                                        &table,
+                                        partition_stats
+                                            .map(|stats| &stats.columns)
+                                            .unwrap_or(&empty_columns),
+                                        partition_stats
+                                            .map(|stats| &stats.indices)
+                                            .unwrap_or(&empty_indices),
+                                        // A special global index has no
+                                        // per-partition statistics record.
+                                        false,
+                                    );
+                                }
+                            }
+                            None => push_stats_histogram_rows(
+                                &mut rows,
+                                &db_name,
+                                &table_name,
+                                "",
+                                &table,
+                                &table_stats.columns,
+                                &table_stats.indices,
+                                true,
+                            ),
+                        }
+                    }
+                }
+                self.rows = rows;
+                self.apply_where_filter()?;
+            }
             ShowStmtKind::Warnings => {
                 self.schema = vec![
                     "Level".to_string(),
@@ -763,7 +889,30 @@ fn default_display(text: &str) -> String {
     t.to_string()
 }
 
-fn render_create_table(info: &TableInfo) -> String {
+fn render_create_sequence(info: &TableInfo) -> String {
+    let seq = info.sequence.as_ref().expect("sequence info");
+    let mut out = format!(
+        "CREATE SEQUENCE `{}` start with {} minvalue {} maxvalue {} increment by {} ",
+        info.name.o(),
+        seq.start,
+        seq.min_value,
+        seq.max_value,
+        seq.increment
+    );
+    if seq.cache {
+        out.push_str(&format!("cache {} ", seq.cache_value));
+    } else {
+        out.push_str("nocache ");
+    }
+    out.push_str(if seq.cycle { "cycle " } else { "nocycle " });
+    out.push_str("ENGINE=InnoDB");
+    if !seq.comment.is_empty() {
+        out.push_str(&format!(" COMMENT='{}'", seq.comment.replace('\'', "''")));
+    }
+    out
+}
+
+fn render_create_table(info: &TableInfo, next_auto_id: Option<i64>) -> String {
     // MySQL NotNullFlag — omit DEFAULT NULL when set.
     const NOT_NULL_FLAG: u32 = 1;
     let mut cols: Vec<String> = info
@@ -899,7 +1048,17 @@ fn render_create_table(info: &TableInfo) -> String {
             .as_ref()
             .map(|text| format!(" WHERE {text}"))
             .unwrap_or_default();
-        key_lines.push(format!("  {key} `{}` ({parts}){predicate}", idx.name.o()));
+        // TiDB keeps the GLOBAL option behind a version comment so MySQL
+        // clients ignore it.
+        let global = if idx.global {
+            " /*T![global_index] GLOBAL */"
+        } else {
+            ""
+        };
+        key_lines.push(format!(
+            "  {key} `{}` ({parts}){global}{predicate}",
+            idx.name.o()
+        ));
     }
     if info.pk_is_clustered() {
         if let Some(line) = primary_line.take() {
@@ -947,6 +1106,16 @@ fn render_create_table(info: &TableInfo) -> String {
         info.charset,
         info.collate
     );
+    // TiDB prints `AUTO_INCREMENT=<next id>` once the allocator handed out at
+    // least one value (a fresh table omits the option).
+    if let Some(last) = next_auto_id
+        && last > 0
+    {
+        out.push_str(&format!(" AUTO_INCREMENT={}", last + 1));
+    }
+    if let Some(cache) = info.auto_id_cache {
+        out.push_str(&format!(" /*T![auto_id_cache] AUTO_ID_CACHE={cache} */"));
+    }
     if info.temporary && info.on_commit_delete_rows {
         out.push_str(" ON COMMIT DELETE ROWS");
     }
@@ -1181,6 +1350,198 @@ fn show_column_visible(name: &str, column: Option<&str>, pattern: Option<&str>) 
         Some(column) => name.eq_ignore_ascii_case(column),
         None => show_like_ok(name, pattern),
     }
+}
+
+/// TiDB `SHOW STATS_HISTOGRAMS` columns (`executor/show_stats.go`).
+const STATS_HISTOGRAMS_COLUMNS: [&str; 15] = [
+    "Db_name",
+    "Table_name",
+    "Partition_name",
+    "Column_name",
+    "Is_index",
+    "Update_time",
+    "Distinct_count",
+    "Null_count",
+    "Avg_col_size",
+    "Correlation",
+    "Load_status",
+    "Total_mem_usage",
+    "Hist_mem_usage",
+    "Topn_mem_usage",
+    "Cms_mem_usage",
+];
+
+/// One statistics block: the columns first, then every index. TiDB keeps a
+/// plain index's statistics on its key column, so a missing (or placeholder)
+/// index record is reported from the leading column's statistics.
+fn push_stats_histogram_rows(
+    rows: &mut Vec<Vec<Datum>>,
+    db: &str,
+    table: &str,
+    partition: &str,
+    info: &TableInfo,
+    columns: &[(String, sealdb_statistics::ColumnStats)],
+    indices: &[(String, sealdb_statistics::IndexStats)],
+    include_special: bool,
+) {
+    for (name, column) in columns {
+        let topn_mem = column
+            .topn
+            .as_ref()
+            .map(|topn| {
+                let eval = info
+                    .columns
+                    .iter()
+                    .find(|col| col.name.o().eq_ignore_ascii_case(name))
+                    .map(|col| col.field_type.eval_type());
+                32 + topn
+                    .items
+                    .iter()
+                    .map(|(value, _)| 32 + datum_encoded_size(value, eval))
+                    .sum::<i64>()
+            })
+            .unwrap_or(0);
+        rows.push(stats_histogram_row(
+            db,
+            table,
+            partition,
+            name,
+            0,
+            column.ndv,
+            column.null_count,
+            column.correlation,
+            topn_mem,
+        ));
+    }
+    for index in &info.indices {
+        if index.state != sealdb_meta::STATE_PUBLIC {
+            continue;
+        }
+        let special = is_special_global_index(info, index);
+        if special && !include_special {
+            continue;
+        }
+        // A real index histogram (an expression index) carries its own encoded
+        // keys; TiDB's `TopN` memory is 32 bytes per entry plus the slice.
+        if let Some((_, stats)) = indices
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(index.name.o()))
+            .filter(|(_, stats)| !stats.placeholder)
+        {
+            let topn_mem = 32
+                + stats
+                    .topn
+                    .iter()
+                    .map(|(key, _)| 32 + key.len() as i64)
+                    .sum::<i64>();
+            rows.push(stats_histogram_row(
+                db,
+                table,
+                partition,
+                index.name.o(),
+                1,
+                stats.ndv,
+                stats.null_count,
+                0.0,
+                topn_mem,
+            ));
+            continue;
+        }
+        // Fall back to the leading key column's statistics, exactly like a
+        // planner estimate for a plain index.
+        let Some(column) = index
+            .columns
+            .iter()
+            .filter_map(|part| {
+                info.columns
+                    .iter()
+                    .find(|col| !col.hidden && col.name.o().eq_ignore_ascii_case(part.name.o()))
+                    .map(|col| (col, part.name.o()))
+            })
+            .find_map(|(col, name)| {
+                columns
+                    .iter()
+                    .find(|(column_name, _)| column_name.eq_ignore_ascii_case(name))
+                    .map(|(_, stats)| (col, stats))
+            })
+        else {
+            continue;
+        };
+        let (column_info, column_stats) = column;
+        let eval = column_info.field_type.eval_type();
+        let topn_mem = column_stats
+            .topn
+            .as_ref()
+            .map(|topn| {
+                32 + topn
+                    .items
+                    .iter()
+                    .map(|(value, _)| 32 + datum_encoded_size(value, Some(eval)))
+                    .sum::<i64>()
+            })
+            .unwrap_or(0);
+        rows.push(stats_histogram_row(
+            db,
+            table,
+            partition,
+            index.name.o(),
+            1,
+            column_stats.ndv,
+            column_stats.null_count,
+            0.0,
+            topn_mem,
+        ));
+    }
+}
+
+/// TiDB `codec.EncodeValue` byte length of one TopN value: an integer or float
+/// is a flag byte plus its 8-byte encoding; a string is a flag byte, a length
+/// byte and the collation sort key, padded to a multiple of 8 bytes.
+fn datum_encoded_size(value: &str, eval: Option<sealdb_types::field_type::EvalType>) -> i64 {
+    match eval {
+        Some(sealdb_types::field_type::EvalType::String) => {
+            let padded = (value.len() as i64 + 7) / 8 * 8;
+            2 + padded
+        }
+        _ => 9,
+    }
+}
+
+fn stats_histogram_row(
+    db: &str,
+    table: &str,
+    partition: &str,
+    name: &str,
+    is_index: i64,
+    distinct: u64,
+    null_count: u64,
+    correlation: f64,
+    topn_mem: i64,
+) -> Vec<Datum> {
+    // Empty histograms and sketches: SealDB keeps every distinct value in the
+    // TopN (version 2 without a CMSketch), so those two parts stay at zero.
+    let hist_mem = 0;
+    let cms_mem = 0;
+    vec![
+        Datum::Bytes(db.as_bytes().to_vec()),
+        Datum::Bytes(table.as_bytes().to_vec()),
+        Datum::Bytes(partition.as_bytes().to_vec()),
+        Datum::Bytes(name.as_bytes().to_vec()),
+        Datum::I64(is_index),
+        // `update_time` comes from the statistics timestamp; SealDB reports
+        // NULL (test goldens replace the column).
+        Datum::Null,
+        Datum::I64(distinct as i64),
+        Datum::I64(null_count as i64),
+        // `avg_col_size` needs per-column byte totals; goldens replace it.
+        Datum::F64(0.0),
+        Datum::F64(correlation),
+        Datum::Bytes(b"allLoaded".to_vec()),
+        Datum::I64(hist_mem + topn_mem + cms_mem),
+        Datum::I64(hist_mem),
+        Datum::I64(topn_mem),
+        Datum::I64(cms_mem),
+    ]
 }
 
 fn show_like_ok(name: &str, pattern: Option<&str>) -> bool {

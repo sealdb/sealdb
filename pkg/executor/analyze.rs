@@ -8,7 +8,7 @@ use sealdb_kv::{LockWait, RowLock, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::Statement;
 use sealdb_statistics::{
-    ColumnStats, Histogram, IndexHistogram, IndexStats, Table, TopN, datum_key,
+    ColumnStats, Histogram, IndexHistogram, IndexStats, PartitionStats, Table, TopN, datum_key,
 };
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -90,6 +90,21 @@ impl AnalyzeExec {
                 format!("Table '{schema}.{name}' doesn't exist"),
             )
         })?;
+        // TiDB `checkIsAllSpecialGlobalIndex`: a *special* global index (GLOBAL
+        // plus an expression or prefix key part) keeps one statistics record
+        // without a partition of its own, so it cannot be analyzed together
+        // with an explicit partition list.
+        if !partitions.is_empty()
+            && let Some(index) = special_global_index_blocking_partitions(&info, indexes)
+        {
+            return Err(Error::new(
+                1105,
+                format!(
+                    "Analyze global index '{}' can't work with analyze specified partitions",
+                    index.name.o()
+                ),
+            ));
+        }
         let all_rows = scan_table(
             &self.txn,
             &info,
@@ -169,19 +184,50 @@ impl AnalyzeExec {
             );
         }
         let index_cols = resolve_index_columns(&info, indexes)?;
+        // TiDB's statistics version 2 always collects every record (it warns
+        // "The version 2 would collect all statistics not only the selected
+        // indexes"); only version 1 honors the analyzed index list.
+        let index_only = index_cols.is_some() && effective_version != 2;
+        let column_filter = if effective_version == 2 {
+            None
+        } else {
+            index_cols.as_ref()
+        };
         let skip_types = self.domain.analyze_skip_column_types();
+        // TiDB reports the *global* statistics of a partitioned table with a
+        // zero correlation (the global row order is meaningless across
+        // partitions); partition-level and plain-table statistics keep it.
+        let table_correlation = info.partition.is_none();
         let analyzed_columns = collect_column_stats(
             &info,
             &rows,
-            index_cols.as_ref(),
+            column_filter,
             requested_columns,
             &skip_types,
             buckets,
             topn_size,
+            table_correlation,
         );
         let columns = analyzed_columns.clone();
         let index_stats =
             collect_index_stats(&info, &rows, buckets, topn_size, effective_version == 1);
+        // Per-partition statistics (TiDB `GetPartitionStats`): only partition
+        // results are reported under their partition name by
+        // `SHOW STATS_HISTOGRAMS`.
+        let partition_stats = if info.partition.is_some() {
+            collect_partition_stats(
+                &info,
+                &rows,
+                column_filter,
+                requested_columns,
+                &skip_types,
+                buckets,
+                topn_size,
+                effective_version == 1,
+            )
+        } else {
+            Vec::new()
+        };
         // TiDB keeps a row count per physical table id in `mysql.stats_meta`; a
         // partition's `DATA_LENGTH` reads its own count, not the table total.
         let part_counts: Vec<(i64, u64)> = if info.partition.is_some() {
@@ -197,7 +243,7 @@ impl AnalyzeExec {
             Vec::new()
         };
         let stats = if let Some(mut prev) = self.domain.stats().table(&schema, &name) {
-            if index_cols.is_some() {
+            if index_only {
                 prev.count = count;
                 prev.version += 1;
                 for (cname, cstats) in columns {
@@ -225,6 +271,43 @@ impl AnalyzeExec {
                         prev.indices.push((iname, istats));
                     }
                 }
+                // An index-only analyze refreshes just its own key columns, so
+                // merge the partition results instead of replacing them.
+                for part in partition_stats {
+                    let pos = match prev.partitions.iter().position(|p| p.id == part.id) {
+                        Some(pos) => pos,
+                        None => {
+                            prev.partitions.push(PartitionStats {
+                                id: part.id,
+                                ..Default::default()
+                            });
+                            prev.partitions.len() - 1
+                        }
+                    };
+                    let slot = &mut prev.partitions[pos];
+                    for (cname, cstats) in part.columns {
+                        if let Some((_, slot)) = slot
+                            .columns
+                            .iter_mut()
+                            .find(|(n, _)| n.eq_ignore_ascii_case(&cname))
+                        {
+                            *slot = cstats;
+                        } else {
+                            slot.columns.push((cname, cstats));
+                        }
+                    }
+                    for (iname, istats) in part.indices {
+                        if let Some((_, slot)) = slot
+                            .indices
+                            .iter_mut()
+                            .find(|(n, _)| n.eq_ignore_ascii_case(&iname))
+                        {
+                            *slot = istats;
+                        } else {
+                            slot.indices.push((iname, istats));
+                        }
+                    }
+                }
                 prev
             } else {
                 let mut indices = prev.indices;
@@ -244,6 +327,7 @@ impl AnalyzeExec {
                     columns,
                     indices,
                     part_counts,
+                    partitions: partition_stats,
                     version: prev.version + 1,
                 }
             }
@@ -254,6 +338,7 @@ impl AnalyzeExec {
                 columns,
                 indices: index_stats,
                 part_counts,
+                partitions: partition_stats,
                 version: 1,
             }
         };
@@ -440,11 +525,19 @@ fn collect_index_stats(
             continue;
         }
         let mut freq: HashMap<Vec<u8>, u64> = HashMap::new();
+        // TiDB counts a row into an index's `null_count` only when the whole
+        // index key is NULL (every key part is NULL); a key with one NULL part
+        // is not encodable and is dropped from the sample.
+        let mut null_count = 0u64;
         for row in rows {
             let mut key = Vec::new();
+            let mut all_null = true;
             for &pos in &parts {
                 let field_type = info.columns[pos].field_type.clone();
                 let value = row.values.get(pos).unwrap_or(&Datum::Null);
+                if !matches!(value, Datum::Null) {
+                    all_null = false;
+                }
                 match sealdb_statistics::range_est::encode_index_key(&field_type, value) {
                     Some(encoded) => key.extend_from_slice(&encoded),
                     None => {
@@ -452,6 +545,10 @@ fn collect_index_stats(
                         break;
                     }
                 }
+            }
+            if all_null {
+                null_count += 1;
+                continue;
             }
             if key.is_empty() {
                 continue;
@@ -494,7 +591,7 @@ fn collect_index_stats(
             index.name.o().to_string(),
             IndexStats {
                 ndv,
-                null_count: 0,
+                null_count,
                 histogram: Some(histogram),
                 topn,
                 cm_sketch: None,
@@ -521,6 +618,56 @@ pub fn is_multi_valued_index(info: &TableInfo, index: &sealdb_meta::IndexInfo) -
                 lower.contains("cast(") && lower.ends_with("array)")
             })
     })
+}
+
+/// TiDB `checkIsAllSpecialGlobalIndex`: the first GLOBAL index that mixes an
+/// expression or prefix key part and is visible to a partition-scoped
+/// `ANALYZE`. `analyze table t partition pN index` walks every public index and
+/// stops at the first ordinary one (no error); an explicit index list keeps
+/// only the named ones.
+fn special_global_index_blocking_partitions<'a>(
+    info: &'a TableInfo,
+    indexes: &[String],
+) -> Option<&'a sealdb_meta::IndexInfo> {
+    let public: Vec<&sealdb_meta::IndexInfo> = if indexes.is_empty() {
+        info.indices
+            .iter()
+            .filter(|idx| idx.state == sealdb_meta::STATE_PUBLIC)
+            .collect()
+    } else {
+        indexes
+            .iter()
+            .filter_map(|name| {
+                info.indices
+                    .iter()
+                    .find(|idx| idx.name.o().eq_ignore_ascii_case(name))
+                    .filter(|idx| idx.state == sealdb_meta::STATE_PUBLIC)
+            })
+            .collect()
+    };
+    for index in public {
+        if !is_special_global_index(info, index) {
+            return None;
+        }
+        return Some(index);
+    }
+    None
+}
+
+/// A GLOBAL index whose key part is an expression (virtual hidden column) or a
+/// column prefix.
+pub(crate) fn is_special_global_index(info: &TableInfo, index: &sealdb_meta::IndexInfo) -> bool {
+    index.global
+        && index.columns.iter().any(|part| {
+            if part.length != -1 {
+                return true;
+            }
+            info.columns.iter().any(|col| {
+                col.hidden
+                    && col.name.o().eq_ignore_ascii_case(part.name.o())
+                    && col.generated_expr.is_some()
+            })
+        })
 }
 
 fn resolve_index_columns(info: &TableInfo, indexes: &[String]) -> Result<Option<HashSet<String>>> {
@@ -554,6 +701,7 @@ fn collect_column_stats(
     skip_types: &[String],
     buckets: Option<u64>,
     topn_size: Option<u64>,
+    correlation: bool,
 ) -> Vec<(String, ColumnStats)> {
     // Columns backing any index are collected even when their type is on the
     // skip list (TiDB keeps prefix-index statistics for TEXT columns).
@@ -599,6 +747,9 @@ fn collect_column_stats(
         let mut distinct = HashSet::new();
         let mut null_count = 0;
         let mut values = Vec::new();
+        // TiDB `SampleItem.Ordinal`: the row's 0-based position in the sampled
+        // rows of the task (nulls included), used by `calcCorrelation`.
+        let mut samples: Vec<(usize, String)> = Vec::new();
         let mut freq: HashMap<String, u64> = HashMap::new();
         // TiDB `stats_histograms.tot_col_size`: bytes one value takes in a row,
         // a varint length byte plus the content, summed per physical table id.
@@ -607,7 +758,7 @@ fn collect_column_stats(
         let var_len = col.field_type.storage_length().is_none();
         let mut tot_col_size = 0u64;
         let mut part_tot_col_size: Vec<(i64, u64)> = Vec::new();
-        for row in rows {
+        for (row_pos, row) in rows.iter().enumerate() {
             let value = row.values.get(idx).unwrap_or(&Datum::Null);
             if var_len {
                 let size = stored_value_size(value);
@@ -631,10 +782,16 @@ fn collect_column_stats(
                     };
                     distinct.insert(key.clone());
                     values.push(key.clone());
+                    samples.push((row_pos, key.clone()));
                     *freq.entry(key).or_default() += 1;
                 }
             }
         }
+        let correlation = if correlation {
+            calc_correlation(&samples)
+        } else {
+            0.0
+        };
         values.sort();
         let max_buckets = buckets
             .map(|n| n as usize)
@@ -672,6 +829,7 @@ fn collect_column_stats(
                 tot_col_size,
                 part_tot_col_size,
                 ci,
+                correlation,
             },
         ));
     }
@@ -688,4 +846,76 @@ fn stored_value_size(value: &Datum) -> u64 {
         Datum::Time(_) => 1 + 8,
         other => datum_key(other).len() as u64 + 1,
     }
+}
+
+/// TiDB `calcCorrelation` (`statistics/builder.go`): Pearson correlation
+/// between the row order (`SampleItem.Ordinal`) and the value order.
+fn calc_correlation(samples: &[(usize, String)]) -> f64 {
+    let n = samples.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 {
+        return 1.0;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| samples[*a].1.cmp(&samples[*b].1));
+    let mut sum_xy = 0.0;
+    for (rank, pos) in order.iter().enumerate() {
+        sum_xy += rank as f64 * samples[*pos].0 as f64;
+    }
+    let count = n as f64;
+    let sum = (count - 1.0) * count / 2.0;
+    let sum_sq = (count - 1.0) * count * (2.0 * count - 1.0) / 6.0;
+    (count * sum_xy - sum * sum) / (count * sum_sq - sum * sum)
+}
+
+/// Per-partition statistics (TiDB `ANALYZE` partition tasks): each partition's
+/// rows are sampled in handle order, exactly like a standalone table.
+#[allow(clippy::too_many_arguments)]
+fn collect_partition_stats(
+    info: &TableInfo,
+    rows: &[crate::table_reader::ScannedRow],
+    index_cols: Option<&HashSet<String>>,
+    requested_columns: &[String],
+    skip_types: &[String],
+    buckets: Option<u64>,
+    topn_size: Option<u64>,
+    skip_multi_valued: bool,
+) -> Vec<PartitionStats> {
+    let mut groups: Vec<(i64, Vec<crate::table_reader::ScannedRow>)> = Vec::new();
+    for row in rows {
+        match groups.iter_mut().find(|(id, _)| *id == row.physical_id) {
+            Some((_, group)) => group.push(row.clone()),
+            None => groups.push((row.physical_id, vec![row.clone()])),
+        }
+    }
+    // Partition definitions in `TableInfo` order so `SHOW STATS_HISTOGRAMS`
+    // lists `p0, p1, …` for a fresh analyze.
+    let mut ordered: Vec<(i64, Vec<crate::table_reader::ScannedRow>)> = Vec::new();
+    if let Some(part) = info.partition.as_ref().filter(|part| part.enable) {
+        for def in &part.definitions {
+            if let Some(pos) = groups.iter().position(|(id, _)| *id == def.id) {
+                ordered.push(groups.remove(pos));
+            }
+        }
+    }
+    ordered.extend(groups);
+    ordered
+        .into_iter()
+        .map(|(id, part_rows)| PartitionStats {
+            id,
+            columns: collect_column_stats(
+                info,
+                &part_rows,
+                index_cols,
+                requested_columns,
+                skip_types,
+                buckets,
+                topn_size,
+                true,
+            ),
+            indices: collect_index_stats(info, &part_rows, buckets, topn_size, skip_multi_valued),
+        })
+        .collect()
 }

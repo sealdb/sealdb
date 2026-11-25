@@ -168,12 +168,23 @@ pub struct ColumnDef {
     pub auto_random: Option<u32>,
     /// Explicit `NOT NULL` (or PRIMARY KEY implied) column option.
     pub not_null: bool,
+    /// Explicit `NULL` column option (TiDB `hasNullFlag`); a primary key
+    /// column declared `NULL` is rejected with 1171.
+    pub explicit_null: bool,
+    /// The `PRIMARY KEY` was declared on this column (`id int primary key`),
+    /// as opposed to a table-level `PRIMARY KEY (id)` constraint. TiDB sets
+    /// `PriKeyFlag` while processing column options in this case, which makes
+    /// `DEFAULT NULL` report 1067 instead of 1171.
+    pub inline_primary_key: bool,
     /// Column `CHARACTER SET <name>` (TiDB `FieldType.Charset`).
     pub charset: Option<String>,
     /// Column `COLLATE <name>` (TiDB `FieldType.Collate`).
     pub collate: Option<String>,
     /// Column `COMMENT '<text>'` (TiDB `ColumnInfo.Comment`).
     pub comment: Option<String>,
+    /// Column `ON UPDATE <expr>` (TiDB `ColumnOptionOnUpdate`); only
+    /// `CURRENT_TIMESTAMP` matching the column fsp is accepted.
+    pub on_update: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,6 +209,10 @@ impl ColumnDef {
         if let Some(default) = &self.default {
             ctx.write_str(" DEFAULT ");
             ctx.write_str(default);
+        }
+        if let Some(on_update) = &self.on_update {
+            ctx.write_str(" ON UPDATE ");
+            ctx.write_str(on_update);
         }
         if let Some(g) = &self.generated {
             ctx.write_str(" GENERATED ALWAYS AS (");
@@ -377,6 +392,9 @@ pub struct IndexDef {
     /// TiDB partial index predicate (`UNIQUE KEY idx (c) WHERE <expr>`): only
     /// rows satisfying it take a key entry.
     pub where_clause: Option<String>,
+    /// `FULLTEXT KEY (...)`: TiDB's InnoDB storage engine does not support it,
+    /// so DDL drops the definition with warning 1214 instead of storing it.
+    pub fulltext: bool,
 }
 
 /// `FOREIGN KEY (a, b) REFERENCES t (c, d) ON UPDATE … ON DELETE …`.
@@ -506,6 +524,14 @@ impl PartitionDef {
             placement_policy: None,
         }
     }
+}
+
+/// One `idx GLOBAL|LOCAL` entry of TiDB `ALTER TABLE … PARTITION BY … UPDATE INDEXES (...)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexUpdate {
+    pub name: String,
+    /// `true` for `GLOBAL`, `false` for `LOCAL`.
+    pub global: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -650,6 +676,9 @@ pub struct CreateTableStmt {
     pub shard_row_id_bits: Option<u32>,
     /// TiDB `PRE_SPLIT_REGIONS = n` table option.
     pub pre_split_regions: Option<u32>,
+    /// TiDB `AUTO_ID_CACHE [=] n` table option, kept as raw digits so an
+    /// out-of-range value reports 1105 instead of a parse error.
+    pub auto_id_cache: Option<String>,
     /// `CHECK (expr) [NOT] ENFORCED` constraints stripped from the CREATE text.
     pub checks: Vec<(String, bool)>,
     /// `PLACEMENT POLICY [=] 'name'` table option (TiDB).
@@ -709,12 +738,16 @@ pub struct DropTableStmt {
     pub is_view: bool,
     /// `DROP TEMPORARY TABLE`: only session-local temporary tables.
     pub temporary: bool,
+    /// `DROP GLOBAL TEMPORARY TABLE`: only global temporary tables.
+    pub global_temporary: bool,
 }
 
 impl DropTableStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         if self.is_view {
             ctx.write_str("DROP VIEW ");
+        } else if self.global_temporary {
+            ctx.write_str("DROP GLOBAL TEMPORARY TABLE ");
         } else if self.temporary {
             ctx.write_str("DROP TEMPORARY TABLE ");
         } else {
@@ -1071,8 +1104,12 @@ pub enum AlterTableSpec {
         /// `ADD PARTITION PARTITIONS n` (HASH/KEY); `None` for a definition list.
         count: Option<u64>,
     },
-    /// `ALTER TABLE t PARTITION BY ...` — repartition an existing table.
-    Repartition(PartitionOption),
+    /// `ALTER TABLE t PARTITION BY ... [UPDATE INDEXES (idx GLOBAL|LOCAL, …)]`.
+    Repartition {
+        option: PartitionOption,
+        /// `UPDATE INDEXES (...)` overrides for individual indexes.
+        update_indexes: Vec<IndexUpdate>,
+    },
     /// `DROP PARTITION p0 [, p1 ...]`.
     DropPartition {
         if_exists: bool,
@@ -1106,6 +1143,12 @@ pub enum AlterTableSpec {
     },
     /// `COALESCE PARTITION n`.
     CoalescePartition(u64),
+    /// `CONVERT TO CHARACTER SET <charset> [COLLATE <collation>]`: rewrite
+    /// every string column to the target charset and re-check index lengths.
+    ConvertCharset {
+        charset: String,
+        collate: Option<String>,
+    },
     /// Unsupported partition maintenance (`CHECK`/`OPTIMIZE`/…) → DDL 8200.
     UnsupportedPartitionOp(String),
     /// `FIRST PARTITION LESS THAN (bound)` (INTERVAL tables).
@@ -1364,9 +1407,24 @@ impl AlterTableSpec {
                 ctx.write_str(")");
                 Ok(())
             }
-            AlterTableSpec::Repartition(spec) => {
+            AlterTableSpec::Repartition {
+                option,
+                update_indexes,
+            } => {
                 ctx.write_str("PARTITION BY ");
-                spec.restore(ctx)
+                option.restore(ctx)?;
+                if !update_indexes.is_empty() {
+                    ctx.write_str(" UPDATE INDEXES (");
+                    for (i, update) in update_indexes.iter().enumerate() {
+                        if i > 0 {
+                            ctx.write_str(", ");
+                        }
+                        ctx.write_str(&update.name);
+                        ctx.write_str(if update.global { " GLOBAL" } else { " LOCAL" });
+                    }
+                    ctx.write_str(")");
+                }
+                Ok(())
             }
             AlterTableSpec::DropPartition { if_exists, names } => {
                 ctx.write_str("DROP PARTITION ");
@@ -1554,6 +1612,15 @@ impl AlterTableSpec {
             }
             AlterTableSpec::Cache { cached } => {
                 ctx.write_str(if *cached { "CACHE" } else { "NOCACHE" });
+                Ok(())
+            }
+            AlterTableSpec::ConvertCharset { charset, collate } => {
+                ctx.write_str("CONVERT TO CHARACTER SET ");
+                ctx.write_str(charset);
+                if let Some(collate) = collate {
+                    ctx.write_str(" COLLATE ");
+                    ctx.write_str(collate);
+                }
                 Ok(())
             }
         }

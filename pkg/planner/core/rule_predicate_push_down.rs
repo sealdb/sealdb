@@ -459,11 +459,32 @@ fn push_into(
             // A full index scan can only push predicates whose columns live in
             // the index (plus the row handle it stores); the rest filter the
             // probed table rows (Selection(Probe)).
-            let on_probe = |expr: &ExprNode| {
-                !expr.referenced_columns().iter().all(|(_, col)| {
-                    index_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
-                        || handle_cols.iter().any(|c| c.eq_ignore_ascii_case(col))
+            // A prefix index stores only `name(2)`, so a residual filter on the
+            // prefix column (a `like` that merely seeded the access range) can
+            // only be answered from the probed table row: `Selection(Probe)`.
+            let prefix_cols: Vec<String> = table_info
+                .as_ref()
+                .and_then(|info| {
+                    info.indices
+                        .iter()
+                        .find(|idx| idx.name.o().eq_ignore_ascii_case(&index))
                 })
+                .map(|idx| {
+                    idx.columns
+                        .iter()
+                        .filter(|c| c.length != -1)
+                        .map(|c| c.name.o().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let on_probe = |expr: &ExprNode| {
+                let cols = expr.referenced_columns();
+                cols.iter()
+                    .any(|(_, col)| prefix_cols.iter().any(|p| p.eq_ignore_ascii_case(col)))
+                    || !cols.iter().all(|(_, col)| {
+                        index_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
+                            || handle_cols.iter().any(|c| c.eq_ignore_ascii_case(col))
+                    })
             };
             let (index_side, probe_side): (Vec<_>, Vec<_>) =
                 if pushed.is_some() && access_range.is_none() {
@@ -503,10 +524,31 @@ fn push_into(
                 ExprNode::compose_cnf(probe_side.clone())
             };
             let probe_base = access_range.as_ref().map_or(row_count, |range| range.rows);
+            // A prefix-column predicate seeded the index range (`like(d, "ab%")`
+            // → `["ab","ac")`), so `range.filter_rows` already accounts for it;
+            // it must not shrink the probe estimate a second time.
+            let probe_sel_side: Vec<ExprNode> = probe_side
+                .iter()
+                .filter(|expr| {
+                    !expr
+                        .referenced_columns()
+                        .iter()
+                        .any(|(_, col)| prefix_cols.iter().any(|p| p.eq_ignore_ascii_case(col)))
+                })
+                .cloned()
+                .collect();
             let probe_est = probe_filter.as_ref().map_or(0.0, |filter| {
+                if probe_sel_side.is_empty() {
+                    return probe_base;
+                }
+                let probe_sel_filter = if probe_sel_side.len() == probe_side.len() {
+                    filter.clone()
+                } else {
+                    ExprNode::compose_cnf(probe_sel_side.clone()).unwrap_or_else(|| filter.clone())
+                };
                 table_info
                     .as_ref()
-                    .and_then(|info| unique_eq_rows(info, filter))
+                    .and_then(|info| unique_eq_rows(info, &probe_sel_filter))
                     .unwrap_or_else(|| {
                         // TiDB sizes the `TableRowIDScan`'s filter from the
                         // table's column statistics (`cardinality.Selectivity`),
@@ -517,10 +559,10 @@ fn push_into(
                         let sel = super::planbuilder::stats_filter_selectivity(
                             table_info,
                             super::planbuilder::statement_stats(&table).as_ref(),
-                            filter,
+                            &probe_sel_filter,
                         )
                         .or_else(|| {
-                            sealdb_statistics::pseudo::selectivity(&probe_side, 10_000.0, None)
+                            sealdb_statistics::pseudo::selectivity(&probe_sel_side, 10_000.0, None)
                         })
                         .unwrap_or(1.0);
                         probe_base * sel

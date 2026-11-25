@@ -161,6 +161,19 @@ impl InfoSchema {
         self.tables.get(&key).or_else(|| self.temp_tables.get(&key))
     }
 
+    /// Look up a session-local temporary table by bare name. Statements that
+    /// deliberately ignore temporary tables (`SHOW CREATE VIEW|SEQUENCE`) still
+    /// need to know whether one shadows the name: TiDB derives their result
+    /// column headers from the session catalog, which does include `TEMPORARY`
+    /// tables (e.g. a shadowed `SHOW CREATE SEQUENCE` reports
+    /// `Table` / `Create Table` while rendering the permanent sequence DDL).
+    pub fn temp_table_by_name(&self, table: &str) -> Option<&TableInfo> {
+        let table_l = table.to_ascii_lowercase();
+        self.temp_tables
+            .iter()
+            .find_map(|((_, name), info)| (name == &table_l).then_some(info))
+    }
+
     /// Register a session-local temporary table under `schema` (a reserved
     /// schema name the session rewrites unqualified references to).
     pub fn insert_temp_table(&mut self, schema: &str, info: TableInfo) {

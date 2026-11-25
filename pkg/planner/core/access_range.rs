@@ -752,6 +752,17 @@ fn bounds_fit_column(
     high: &Option<(sealdb_types::Datum, bool)>,
 ) -> bool {
     let fits = |bound: &Option<(sealdb_types::Datum, bool)>| match bound {
+        // MySQL never turns `varchar_col = 1` into a key range: the comparison
+        // is numeric, so `'01'` also matches, and a string range on `'1'`
+        // cannot express that. Keep the predicate in the cop Selection.
+        Some((
+            sealdb_types::Datum::I64(_)
+            | sealdb_types::Datum::U64(_)
+            | sealdb_types::Datum::F64(_)
+            | sealdb_types::Datum::Decimal(_)
+            | sealdb_types::Datum::Year(_),
+            _,
+        )) if field_type.is_character_type() => false,
         // A hex/bit literal is a binary string: ranger converts it to the key
         // type, and a value wider than a BIT column fails that conversion
         // (`col1 = 0x30` on `bit(1)`), so the predicate stays in the cop

@@ -114,7 +114,13 @@ impl Executor for TableReaderExec {
         )?;
         let scanned_rows = scanned.len();
         // Heap tables expose the row handle as `_tidb_rowid` when referenced.
+        // The hidden column must be in the schema *before* the pushed filter runs:
+        // a `_tidb_rowid` conjunct (`BETWEEN …`) is evaluated here with the handle
+        // appended to each row, since the cop layer cannot see the pseudo column.
         let expose_rowid = self.with_rowid && !info.pk_is_handle;
+        if expose_rowid {
+            self.schema.push("\u{1}_tidb_rowid".to_string());
+        }
         self.rows = filter_rows(
             scanned
                 .into_iter()
@@ -143,9 +149,6 @@ impl Executor for TableReaderExec {
                 scanned_rows,
                 self.rows.len(),
             );
-        }
-        if expose_rowid {
-            self.schema.push("\u{1}_tidb_rowid".to_string());
         }
         Ok(())
     }

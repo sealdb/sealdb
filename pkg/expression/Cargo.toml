@@ -12,6 +12,7 @@ path = "lib.rs"
 aes.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+regex.workspace = true
 sealdb-errno.workspace = true
 sealdb-meta.workspace = true
 sealdb-parser.workspace = true

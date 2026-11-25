@@ -31,14 +31,14 @@ pub use evaluator::{
     note_binary_columns_from_table, note_message, note_warning, session_local_time_exists,
     session_local_to_utc, session_local_to_utc_gap_shift, set_current_dml_table,
     set_current_user_identity, set_default_week_format, set_last_insert_id, set_session_timestamp,
-    set_window_concurrency, shift_time_minutes, sql_mode_flag, strict_not_null_check,
-    take_warnings, take_warnings_from, time_to_unix_millis, truthy, utc_to_session_local,
-    validate_string_cmp_literals, validate_string_cmp_literals_on, warnings_len,
-    window_concurrency, with_allow_auto_increment_in_generated,
+    set_window_concurrency, shift_time_minutes, sql_mode_flag, strict_double_type_check,
+    strict_not_null_check, take_warnings, take_warnings_from, time_to_unix_millis, truthy,
+    utc_to_session_local, validate_string_cmp_literals, validate_string_cmp_literals_on,
+    warnings_len, window_concurrency, with_allow_auto_increment_in_generated,
     with_allow_auto_random_explicit_insert, with_allow_write_row_id, with_block_encryption_mode,
     with_collation, with_collation_ci, with_current_db, with_div_by_zero_mode,
     with_index_dst_double, with_insert_value_eval, with_sql_mode, with_strict_dml,
-    with_strict_not_null_check, with_time_zone, with_user_vars,
+    with_strict_double_type_check, with_strict_not_null_check, with_time_zone, with_user_vars,
 };
 pub use funcs::{FuncCategory, FuncMeta, builtin_list, check_arg_count, implemented_names, lookup};
 pub use sealdb_util::collate::CollateMode;

@@ -268,6 +268,10 @@ pub struct ColumnStats {
     /// Column collation is case-insensitive (`*_ci`): values are folded to the
     /// collation sort key before counting, so `'a'` and `'A'` share a bucket.
     pub ci: bool,
+    /// TiDB `Histogram.Correlation`: Pearson correlation between the row order
+    /// and the value order (`calcCorrelation`). Partition-level statistics keep
+    /// it; a partitioned table's *global* statistics always report `0`.
+    pub correlation: f64,
 }
 
 impl ColumnStats {
@@ -415,7 +419,30 @@ pub struct Table {
     /// `mysql.stats_meta` keyed by physical ID). Empty for a non-partitioned
     /// table, whose rows live under the table id in `count`.
     pub part_counts: Vec<(i64, u64)>,
+    /// Per-partition histograms, keyed by physical table id (TiDB
+    /// `GetPartitionStats`): `SHOW STATS_HISTOGRAMS` reports a row for each
+    /// partition. Empty for a non-partitioned table.
+    pub partitions: Vec<PartitionStats>,
     pub version: u64,
+}
+
+/// One partition's column and index statistics (TiDB's partition-level
+/// `statistics.Table` stored under a physical table id).
+#[derive(Clone, Debug, Default)]
+pub struct PartitionStats {
+    /// Physical table id / partition id (`partition_definition.id`).
+    pub id: i64,
+    pub columns: Vec<(String, ColumnStats)>,
+    pub indices: Vec<(String, IndexStats)>,
+}
+
+impl PartitionStats {
+    pub fn column(&self, name: &str) -> Option<&ColumnStats> {
+        self.columns
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, s)| s)
+    }
 }
 
 impl Table {

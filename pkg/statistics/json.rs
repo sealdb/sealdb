@@ -53,6 +53,7 @@ pub fn table_from_tidb_json(raw: &str) -> Result<(String, String, Table)> {
             columns,
             indices,
             part_counts: Vec::new(),
+            partitions: Vec::new(),
             version,
         },
     ))
@@ -90,6 +91,7 @@ fn column_from_json(col: &Value) -> Result<ColumnStats> {
         tot_col_size: 0,
         part_tot_col_size: Vec::new(),
         ci: false,
+        correlation: 0.0,
     })
 }
 

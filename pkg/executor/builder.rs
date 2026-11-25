@@ -461,6 +461,7 @@ impl ExecutorBuilder {
             PhysicalPlan::IndexMerge {
                 partitions,
                 pushed,
+                probe_selection,
                 paths,
                 keep_order,
                 order_column,
@@ -485,6 +486,7 @@ impl ExecutorBuilder {
                     partitions.clone(),
                     pushed.clone(),
                     select.selection.clone(),
+                    probe_selection.clone(),
                     paths.clone(),
                     *keep_order,
                     order_column.clone(),
@@ -532,6 +534,7 @@ impl ExecutorBuilder {
                     txn,
                     select_row_lock(select),
                     select_lock_wait(select),
+                    Self::select_references_tidb_rowid(select),
                 )))
             }
             PhysicalPlan::BatchPointGet {
@@ -1230,13 +1233,15 @@ impl ExecutorBuilder {
     ) -> Result<Box<dyn Executor>> {
         let stmt = Statement::SetOpr(set.clone());
         let stats = domain.stats();
-        let plan = PlanBuilder::new().build_with_schema(
-            &stmt,
-            Some(&domain.infoschema()),
-            current_db,
-            Some(stats.as_ref()),
-            sealdb_planner::PartitionPruneMode::Dynamic,
-        )?;
+        let plan = with_txn_dirty_tables(&txn, || {
+            PlanBuilder::new().build_with_schema(
+                &stmt,
+                Some(&domain.infoschema()),
+                current_db,
+                Some(stats.as_ref()),
+                sealdb_planner::PartitionPruneMode::Dynamic,
+            )
+        })?;
         Self::build(&plan, &stmt, domain, current_db, txn)
     }
 
@@ -1248,15 +1253,35 @@ impl ExecutorBuilder {
     ) -> Result<Box<dyn Executor>> {
         let stmt = Statement::Select(select.clone());
         let stats = domain.stats();
-        let plan = PlanBuilder::new().build_with_schema(
-            &stmt,
-            Some(&domain.infoschema()),
-            current_db,
-            Some(stats.as_ref()),
-            sealdb_planner::PartitionPruneMode::Dynamic,
-        )?;
+        let plan = with_txn_dirty_tables(&txn, || {
+            PlanBuilder::new().build_with_schema(
+                &stmt,
+                Some(&domain.infoschema()),
+                current_db,
+                Some(stats.as_ref()),
+                sealdb_planner::PartitionPruneMode::Dynamic,
+            )
+        })?;
         Self::build(&plan, &stmt, domain, current_db, txn)
     }
+}
+
+/// Plan a statement built lazily at execution time (subquery, CTE body, set-op
+/// arm) with the current transaction's pending writes visible.
+///
+/// The session publishes `MemBuffer` dirty tables while it plans the outer
+/// statement, but a decorrelated subquery is planned later, while the executor
+/// runs. Without this scope the inner scan gets no `UnionScan` and misses rows
+/// this transaction inserted but has not committed yet.
+pub(crate) fn with_txn_dirty_tables<T>(txn: &TxnHandle, f: impl FnOnce() -> T) -> T {
+    let keys = txn.with_txn(|txn| Ok(txn.dirty_keys())).unwrap_or_default();
+    let mut ids: Vec<i64> = keys
+        .iter()
+        .filter_map(|key| sealdb_tablecodec::decode_table_id(key))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    sealdb_planner::with_dirty_tables(ids, f)
 }
 
 /// Fold set-op arms with TiDB precedence: reduce `INTERSECT` first, then
@@ -3467,11 +3492,7 @@ fn mysql_user_rows(domain: &Domain, columns: &[String]) -> Vec<Vec<sealdb_types:
                 .map(|column| match column.to_ascii_lowercase().as_str() {
                     "host" => bytes(row.host.clone()),
                     "user" => bytes(row.user.clone()),
-                    "authentication_string" => row
-                        .auth
-                        .clone()
-                        .map(bytes)
-                        .unwrap_or(Datum::Null),
+                    "authentication_string" => row.auth.clone().map(bytes).unwrap_or(Datum::Null),
                     "plugin" => bytes(row.plugin.clone()),
                     "select_priv" => yn(row.global_privs.contains(PrivilegeType::SELECT)),
                     "insert_priv" => yn(row.global_privs.contains(PrivilegeType::INSERT)),
@@ -3489,13 +3510,9 @@ fn mysql_user_rows(domain: &Domain, columns: &[String]) -> Vec<Vec<sealdb_types:
                     "create_tmp_table_priv" => {
                         yn(row.global_privs.contains(PrivilegeType::CREATE_TEMP_TABLES))
                     }
-                    "lock_tables_priv" => {
-                        yn(row.global_privs.contains(PrivilegeType::LOCK_TABLES))
-                    }
+                    "lock_tables_priv" => yn(row.global_privs.contains(PrivilegeType::LOCK_TABLES)),
                     "execute_priv" => yn(row.global_privs.contains(PrivilegeType::EXECUTE)),
-                    "create_view_priv" => {
-                        yn(row.global_privs.contains(PrivilegeType::CREATE_VIEW))
-                    }
+                    "create_view_priv" => yn(row.global_privs.contains(PrivilegeType::CREATE_VIEW)),
                     "show_view_priv" => yn(row.global_privs.contains(PrivilegeType::SHOW_VIEW)),
                     "create_routine_priv" => {
                         yn(row.global_privs.contains(PrivilegeType::CREATE_ROUTINE))
@@ -3503,20 +3520,18 @@ fn mysql_user_rows(domain: &Domain, columns: &[String]) -> Vec<Vec<sealdb_types:
                     "alter_routine_priv" => {
                         yn(row.global_privs.contains(PrivilegeType::ALTER_ROUTINE))
                     }
-                    "create_user_priv" => {
-                        yn(row.global_privs.contains(PrivilegeType::CREATE_USER))
-                    }
+                    "create_user_priv" => yn(row.global_privs.contains(PrivilegeType::CREATE_USER)),
                     "event_priv" => yn(row.global_privs.contains(PrivilegeType::EVENT)),
                     "trigger_priv" => yn(row.global_privs.contains(PrivilegeType::TRIGGER)),
                     "create_tablespace_priv" => {
                         yn(row.global_privs.contains(PrivilegeType::CREATE_TABLESPACE))
                     }
-                    "create_role_priv" => {
-                        yn(row.global_privs.contains(PrivilegeType::CREATE_ROLE))
-                    }
+                    "create_role_priv" => yn(row.global_privs.contains(PrivilegeType::CREATE_ROLE)),
                     "drop_role_priv" => yn(row.global_privs.contains(PrivilegeType::DROP_ROLE)),
                     "ssl_type" | "ssl_cipher" | "x509_issuer" | "x509_subject" => bytes(""),
-                    "max_questions" | "max_updates" | "max_connections"
+                    "max_questions"
+                    | "max_updates"
+                    | "max_connections"
                     | "max_user_connections" => Datum::I64(0),
                     "password_expired" | "account_locked" => bytes("N"),
                     "password_last_changed" => bytes("2020-01-01 00:00:00"),
@@ -3534,7 +3549,8 @@ fn mysql_user_rows(domain: &Domain, columns: &[String]) -> Vec<Vec<sealdb_types:
 
 /// `mysql.tables_priv` rows from the privilege manager (TiDB persists one row
 /// per table-scope grant; the engine keeps the same data in memory).
-fn tables_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {    use sealdb_types::Datum;
+fn tables_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {
+    use sealdb_types::Datum;
     let columns: Vec<String> = [
         "Host",
         "DB",
@@ -3668,9 +3684,11 @@ fn columns_for_session(
     };
     let roles = sealdb_privilege::thread_active_roles();
     let index = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
-    let (Some(schema_i), Some(table_i), Some(priv_i)) =
-        (index("TABLE_SCHEMA"), index("TABLE_NAME"), index("PRIVILEGES"))
-    else {
+    let (Some(schema_i), Some(table_i), Some(priv_i)) = (
+        index("TABLE_SCHEMA"),
+        index("TABLE_NAME"),
+        index("PRIVILEGES"),
+    ) else {
         return rows;
     };
     let mgr = domain.privilege();
@@ -3693,9 +3711,7 @@ fn columns_for_session(
                     (PrivilegeType::UPDATE, "update"),
                     (PrivilegeType::REFERENCES, "references"),
                 ] {
-                    if mgr.request_verification_with_roles(
-                        &user, &roles, &schema, &table, privs,
-                    ) {
+                    if mgr.request_verification_with_roles(&user, &roles, &schema, &table, privs) {
                         names.push(name);
                     }
                 }

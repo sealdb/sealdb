@@ -31,6 +31,11 @@ impl TxnManager {
         self.explicit
     }
 
+    /// The open transaction handle, if a transaction is in progress.
+    pub fn handle(&self) -> Option<Arc<TxnHandle>> {
+        self.handle.clone()
+    }
+
     pub fn schema_ver(&self) -> i64 {
         self.schema_ver
     }

@@ -370,7 +370,7 @@ mod tests {
                     .specs
                     .iter()
                     .find_map(|spec| match spec {
-                        crate::ast::AlterTableSpec::Repartition(part) => Some(part),
+                        crate::ast::AlterTableSpec::Repartition { option, .. } => Some(option),
                         _ => None,
                     })
                     .expect("expected Repartition spec");
@@ -2366,4 +2366,3 @@ mod orig_text_timestamp {
         );
     }
 }
-

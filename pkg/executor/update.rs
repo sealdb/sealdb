@@ -120,8 +120,25 @@ impl UpdateExec {
             ));
         }
         let col_names = col_names(&info);
+        // `UPDATE t t1 SET t1.c = …`: the single-table path labels its columns
+        // without a qualifier, so an assignment targeting the statement's alias
+        // (or the physical name behind it) is unqualified here.
+        let mut list = self.stmt.list.clone();
+        for item in &mut list {
+            if let Some(table) = item.table.as_deref()
+                && (table.eq_ignore_ascii_case(&self.stmt.table.name)
+                    || self
+                        .stmt
+                        .table
+                        .physical
+                        .as_deref()
+                        .is_some_and(|p| table.eq_ignore_ascii_case(p)))
+            {
+                item.table = None;
+            }
+        }
         let assignments =
-            resolve_default_assignments(&self.stmt.list, &[(info.name.o(), &info, 0)], &col_names)?;
+            resolve_default_assignments(&list, &[(info.name.o(), &info, 0)], &col_names)?;
         // A heap / common-handle table exposes `_tidb_rowid` to predicates; the
         // execute-time filter sees the scanned row's handle as that column.
         let rowid_eval = !info.pk_is_handle;
@@ -319,13 +336,26 @@ impl UpdateExec {
             &join.right,
             lock,
         )?;
-        let schema = joined_schema(&join.left.name, &left_names, &join.right.name, &right_names);
+        let left_rowid = dml_side_rowid(left_info.as_ref());
+        let right_rowid = dml_side_rowid(right_info.as_ref());
+        let schema = joined_schema_with_rowid(
+            &join.left,
+            &left_names,
+            left_rowid,
+            &join.right,
+            &right_names,
+            right_rowid,
+        );
         let mut tables: Vec<(&str, &TableInfo, usize)> = Vec::new();
         if let Some(info) = left_info.as_ref() {
             tables.push((join.left.name.as_str(), info, 0));
         }
         if let Some(info) = right_info.as_ref() {
-            tables.push((join.right.name.as_str(), info, left_names.len()));
+            tables.push((
+                join.right.name.as_str(),
+                info,
+                left_names.len() + usize::from(left_rowid),
+            ));
         }
         let assignments = resolve_default_assignments(&self.stmt.list, &tables, &schema)?;
         reject_derived_assignments(&assignments, &tables, &schema, &self.stmt.derived_tables)?;
@@ -334,6 +364,8 @@ impl UpdateExec {
         let right_values: Vec<Vec<Datum>> = right_rows.iter().map(|r| r.values.clone()).collect();
         let pairs = hash_join_pairs(join, &left_names, &right_names, &left_values, &right_values)?;
         let left_width = left_names.len();
+        // Schema slot where the right side starts (past the left rowid label).
+        let right_start = left_width + usize::from(left_rowid);
         // A self-join addresses one physical row through both aliases: their
         // assignments merge (base values plus per-alias column overrides).
         type JoinRow = (ScannedRow, Vec<Datum>, Vec<(usize, Datum)>);
@@ -342,7 +374,14 @@ impl UpdateExec {
         for (left_i, right_i) in pairs {
             let left_row = left_i.map(|i| &left_rows[i]);
             let right_row = right_i.map(|i| &right_rows[i]);
-            let joined = concat_optional(left_row, right_row, left_width, right_names.len());
+            let joined = joined_values_with_rowid(
+                left_row,
+                right_row,
+                left_width,
+                right_names.len(),
+                left_rowid,
+                right_rowid,
+            );
             // A join `ON` without a hash key (the flattened derived-table arm's
             // predicate) is evaluated here; the hash pairing above already
             // enforced the equality key.
@@ -362,14 +401,14 @@ impl UpdateExec {
                 &assignments,
                 &schema,
                 &joined,
-                left_width,
+                right_start,
                 left_new.as_deref_mut(),
                 right_new.as_deref_mut(),
             )?;
             cast_joined_assigned_values(
                 &assignments,
                 &schema,
-                left_width,
+                right_start,
                 left_info.as_ref(),
                 right_info.as_ref(),
                 &mut left_new,
@@ -452,16 +491,26 @@ impl UpdateExec {
             rows.push(side_rows);
             infos.push(side_info);
         }
+        let rowid_sides: Vec<bool> = infos
+            .iter()
+            .map(|info| dml_side_rowid(info.as_ref()))
+            .collect();
         let mut offsets = Vec::with_capacity(sides);
         let mut width = 0usize;
-        for side_names in &names {
+        for (side, side_names) in names.iter().enumerate() {
             offsets.push(width);
-            width += side_names.len();
+            width += side_names.len() + usize::from(rowid_sides[side]);
         }
         let schema: Vec<String> = chain_tables
             .iter()
             .zip(&names)
-            .flat_map(|(table, cols)| cols.iter().map(move |c| format!("{}.{}", table.name, c)))
+            .zip(&rowid_sides)
+            .flat_map(|((table, cols), rowid)| {
+                cols.iter()
+                    .map(|c| format!("{}.{}", table.name, c))
+                    .chain(rowid.then(|| format!("{}._tidb_rowid", table.name)))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         let tables: Vec<(&str, &TableInfo, usize)> = chain_tables
             .iter()
@@ -488,7 +537,11 @@ impl UpdateExec {
         loop {
             let mut joined = Vec::with_capacity(width);
             for (side, &index) in indices.iter().enumerate() {
-                joined.extend(rows[side][index].values.iter().cloned());
+                let row = &rows[side][index];
+                joined.extend(row.values.iter().cloned());
+                if rowid_sides[side] {
+                    joined.push(Datum::I64(row.handle));
+                }
             }
             let mut matched = true;
             for factor in &factors {
@@ -515,7 +568,10 @@ impl UpdateExec {
                     let Some((side, slot)) = offsets
                         .iter()
                         .enumerate()
-                        .find(|(i, start)| idx >= **start && idx < **start + names[*i].len())
+                        .find(|(i, start)| {
+                            idx >= **start
+                                && idx < **start + names[*i].len() + usize::from(rowid_sides[*i])
+                        })
                         .map(|(i, start)| (i, idx - start))
                     else {
                         continue;
@@ -679,17 +735,70 @@ pub(crate) fn table_matches(target: &TableName, source: &TableName, current_db: 
 }
 
 /// Concatenate `t.col` names so join filters and SET exprs can resolve both sides.
+/// A schema-qualified table keeps its database in the label (`db.t.col`), so a
+/// join across two databases can tell same-named tables apart.
 pub(crate) fn joined_schema(
-    left_table: &str,
+    left_table: &sealdb_parser::ast::TableName,
     left_names: &[String],
-    right_table: &str,
+    right_table: &sealdb_parser::ast::TableName,
     right_names: &[String],
 ) -> Vec<String> {
+    fn label(table: &sealdb_parser::ast::TableName, column: &str) -> String {
+        match table.schema.as_deref().filter(|schema| !schema.is_empty()) {
+            Some(schema) => format!("{schema}.{}.{column}", table.name),
+            None => format!("{}.{column}", table.name),
+        }
+    }
     left_names
         .iter()
-        .map(|c| format!("{left_table}.{c}"))
-        .chain(right_names.iter().map(|c| format!("{right_table}.{c}")))
+        .map(|c| label(left_table, c))
+        .chain(right_names.iter().map(|c| label(right_table, c)))
         .collect()
+}
+
+/// A heap table in a DML join exposes its handle as `_tidb_rowid` to the join
+/// filter (non-transactional DML can name it as the shard column).
+pub(crate) fn dml_side_rowid(info: Option<&TableInfo>) -> bool {
+    info.is_some_and(|info| !info.pk_is_handle && !info.common_handle)
+}
+
+/// `joined_schema` plus the hidden `_tidb_rowid` label of each heap side.
+pub(crate) fn joined_schema_with_rowid(
+    left_table: &sealdb_parser::ast::TableName,
+    left_names: &[String],
+    left_rowid: bool,
+    right_table: &sealdb_parser::ast::TableName,
+    right_names: &[String],
+    right_rowid: bool,
+) -> Vec<String> {
+    let mut out = joined_schema(left_table, left_names, right_table, right_names);
+    if left_rowid {
+        out.insert(left_names.len(), format!("{}._tidb_rowid", left_table.name));
+    }
+    if right_rowid {
+        out.push(format!("{}._tidb_rowid", right_table.name));
+    }
+    out
+}
+
+/// `concat_optional` plus each heap side's hidden `_tidb_rowid` value.
+pub(crate) fn joined_values_with_rowid(
+    left_row: Option<&ScannedRow>,
+    right_row: Option<&ScannedRow>,
+    left_width: usize,
+    right_width: usize,
+    left_rowid: bool,
+    right_rowid: bool,
+) -> Vec<Datum> {
+    let mut out = concat_optional(left_row, right_row, left_width, right_width);
+    if left_rowid {
+        let value = left_row.map_or(Datum::Null, |row| Datum::I64(row.handle));
+        out.insert(left_width, value);
+    }
+    if right_rowid {
+        out.push(right_row.map_or(Datum::Null, |row| Datum::I64(row.handle)));
+    }
+    out
 }
 
 /// Concatenate optional join sides; unmatched outer rows are padded with NULL.
@@ -1236,9 +1345,23 @@ fn column_matches(schema_name: &str, table: Option<&str>, column: &str) -> bool 
     let name_ok = name.eq_ignore_ascii_case(column) || schema_name.eq_ignore_ascii_case(column);
     match table {
         Some(wanted) => {
-            name_ok
-                && (qual.is_none_or(|t| t.eq_ignore_ascii_case(wanted))
-                    || schema_name.eq_ignore_ascii_case(&format!("{wanted}.{column}")))
+            if !name_ok {
+                return false;
+            }
+            let qualified = format!("{wanted}.{column}");
+            if schema_name.eq_ignore_ascii_case(&qualified) {
+                return true;
+            }
+            // `db.t` labels keep the database so a cross-schema join can tell
+            // same-named tables apart; a plain table name still binds either.
+            let Some(qual) = qual else { return false };
+            let (qual_schema, qual_table) = match qual.rsplit_once('.') {
+                Some((schema, table)) => (Some(schema), table),
+                None => (None, qual),
+            };
+            qual.eq_ignore_ascii_case(wanted)
+                || qual_table.eq_ignore_ascii_case(wanted)
+                || qual_schema.is_some_and(|schema| schema.eq_ignore_ascii_case(wanted))
         }
         None => name_ok,
     }

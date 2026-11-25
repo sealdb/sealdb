@@ -849,11 +849,13 @@ impl InsertStmt {
         if let Some(select) = &self.select {
             ctx.write_str(" ");
             select.restore(ctx)?;
+            self.restore_on_duplicate(ctx)?;
             return Ok(());
         }
         if let Some(set) = &self.select_set {
             ctx.write_str(" ");
             set.restore(ctx)?;
+            self.restore_on_duplicate(ctx)?;
             return Ok(());
         }
         ctx.write_str(" VALUES ");
@@ -869,6 +871,21 @@ impl InsertStmt {
                 expr.restore(ctx)?;
             }
             ctx.write_str(")");
+        }
+        self.restore_on_duplicate(ctx)
+    }
+
+    /// `ON DUPLICATE KEY UPDATE col = expr, ...` (after the source rows).
+    fn restore_on_duplicate(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if self.on_duplicate.is_empty() {
+            return Ok(());
+        }
+        ctx.write_str(" ON DUPLICATE KEY UPDATE ");
+        for (i, assignment) in self.on_duplicate.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(",");
+            }
+            assignment.restore(ctx)?;
         }
         Ok(())
     }
@@ -1028,6 +1045,9 @@ impl DeleteStmt {
             with.restore(ctx)?;
         }
         ctx.write_str("DELETE ");
+        if self.ignore {
+            ctx.write_str("IGNORE ");
+        }
         if self.tables.is_empty() {
             ctx.write_str("FROM ");
             restore_table_join(ctx, &self.table, self.join.as_ref())?;

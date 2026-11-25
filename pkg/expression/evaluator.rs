@@ -53,6 +53,8 @@ thread_local! {
     static ALLOW_AUTO_INCREMENT_IN_GENERATED: Cell<bool> = const { Cell::new(false) };
     /// Session `@@tidb_enable_strict_not_null_check` (default ON).
     static STRICT_NOT_NULL_CHECK: Cell<bool> = const { Cell::new(true) };
+    /// Session `@@tidb_enable_strict_double_type_check` (default ON).
+    static STRICT_DOUBLE_TYPE_CHECK: Cell<bool> = const { Cell::new(true) };
     /// Session `@@default_week_format` (default 0).
     static DEFAULT_WEEK_FORMAT: Cell<i64> = const { Cell::new(0) };
 }
@@ -110,6 +112,22 @@ pub fn with_strict_not_null_check<T>(strict: bool, f: impl FnOnce() -> T) -> T {
 /// Whether an explicit NULL in a NOT NULL column aborts the statement.
 pub fn strict_not_null_check() -> bool {
     STRICT_NOT_NULL_CHECK.with(Cell::get)
+}
+
+/// Run `f` under `@@tidb_enable_strict_double_type_check` from the session.
+pub fn with_strict_double_type_check<T>(strict: bool, f: impl FnOnce() -> T) -> T {
+    STRICT_DOUBLE_TYPE_CHECK.with(|cell| {
+        let prev = cell.get();
+        cell.set(strict);
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
+/// Whether `DOUBLE(M)` without a decimal count is a syntax error (1149).
+pub fn strict_double_type_check() -> bool {
+    STRICT_DOUBLE_TYPE_CHECK.with(Cell::get)
 }
 
 /// Run `f` under `@@tidb_opt_write_row_id` from the session.
@@ -889,15 +907,31 @@ fn column_matches(col: &ColumnNameExpr, schema_name: &str) -> bool {
         name.eq_ignore_ascii_case(&col.name) || schema_name.eq_ignore_ascii_case(&col.name);
     match col.table.as_deref() {
         Some(wanted) => {
+            if !name_ok {
+                return false;
+            }
             // Schema-qualified labels (`dbg.m2.b`) must still bind `m2.b`;
-            // the database prefix only labels the column.
+            // the database prefix only labels the column. A join across two
+            // schemas keeps the prefix in both labels, so an explicit
+            // `db1.t.c` reference must only bind the matching database side.
             let qualified = format!("{wanted}.{}", col.name);
+            if schema_name.eq_ignore_ascii_case(&qualified) {
+                return true;
+            }
+            let label_schema = schema_name
+                .rsplit_once('.')
+                .and_then(|(qual, _)| qual.rsplit_once('.'))
+                .map(|(schema, _)| schema);
+            if let Some(wanted_schema) = col.schema.as_deref().filter(|s| !s.is_empty())
+                && let Some(label_schema) = label_schema
+                && !label_schema.eq_ignore_ascii_case(wanted_schema)
+            {
+                return false;
+            }
             let suffix = format!(".{qualified}").to_ascii_lowercase();
-            name_ok
-                && (table.is_none()
-                    || table.is_some_and(|t| t.eq_ignore_ascii_case(wanted))
-                    || schema_name.eq_ignore_ascii_case(&qualified)
-                    || schema_name.to_ascii_lowercase().ends_with(&suffix))
+            table.is_none()
+                || table.is_some_and(|t| t.eq_ignore_ascii_case(wanted))
+                || schema_name.to_ascii_lowercase().ends_with(&suffix)
         }
         None => name_ok,
     }
@@ -1975,6 +2009,11 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "LOWER" | "LCASE" => eval_case_convert(func, schema, row, false),
         "UPPER" | "UCASE" => eval_case_convert(func, schema, row, true),
         "SUBSTRING" | "SUBSTR" | "MID" => eval_substring(func, schema, row),
+        // MySQL regular-expression functions (ICU in MySQL, POSIX-ish here).
+        "REGEXP_LIKE" => eval_regexp_like(func, schema, row),
+        "REGEXP_SUBSTR" => eval_regexp_substr(func, schema, row),
+        "REGEXP_INSTR" => eval_regexp_instr(func, schema, row),
+        "REGEXP_REPLACE" => eval_regexp_replace(func, schema, row),
         // MySQL `TO_BASE64(str)` / `FROM_BASE64(str)`.
         "TO_BASE64" => {
             if func.args.len() != 1 {
@@ -2177,7 +2216,23 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "JSON_CONTAINS" => eval_json_contains(func, schema, row),
         "JSON_OVERLAPS" => eval_json_overlaps(func, schema, row),
         "JSON_MEMBEROF" | "JSON_MEMBER_OF" => eval_json_memberof(func, schema, row),
-        "JSON_SET" => eval_json_set(func, schema, row),
+        "JSON_SET" => eval_json_modify(func, schema, row, JsonModify::Set),
+        "JSON_INSERT" => eval_json_modify(func, schema, row, JsonModify::Insert),
+        "JSON_REPLACE" => eval_json_modify(func, schema, row, JsonModify::Replace),
+        "JSON_REMOVE" => eval_json_remove(func, schema, row),
+        "JSON_ARRAY_APPEND" => eval_json_array_append(func, schema, row),
+        "JSON_TYPE" => eval_json_type(func, schema, row),
+        "JSON_QUOTE" => eval_json_quote(func, schema, row),
+        "JSON_ARRAY" => eval_json_array(func, schema, row),
+        "JSON_OBJECT" => eval_json_object(func, schema, row),
+        "JSON_MERGE" | "JSON_MERGE_PRESERVE" => eval_json_merge(func, schema, row, false),
+        "JSON_MERGE_PATCH" => eval_json_merge(func, schema, row, true),
+        "JSON_SEARCH" => eval_json_search(func, schema, row),
+        "JSON_KEYS" => eval_json_keys(func, schema, row),
+        "JSON_STORAGE_SIZE" => eval_json_storage_size(func, schema, row),
+        "JSON_DEPTH" => eval_json_depth(func, schema, row),
+        "JSON_LENGTH" => eval_json_length(func, schema, row),
+        "JSON_PRETTY" => eval_json_pretty(func, schema, row),
         "JSON_UNQUOTE" => eval_json_unquote(func, schema, row),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
         "TIMESTAMPDIFF" => eval_timestamp_diff(func, schema, row),
@@ -3082,9 +3137,24 @@ fn eval_json_unquote(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> R
     }
 }
 
-/// MySQL `JSON_SET(doc, path, val[, path, val]…)`: write each value at its
-/// path, creating missing object members, and return the new document text.
-fn eval_json_set(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+/// How `JSON_SET` / `JSON_INSERT` / `JSON_REPLACE` treat a path.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum JsonModify {
+    /// Replace an existing value or create the path.
+    Set,
+    /// Create the path only when it does not exist yet.
+    Insert,
+    /// Replace the value only when the path already exists.
+    Replace,
+}
+
+/// MySQL `JSON_SET` / `JSON_INSERT` / `JSON_REPLACE(doc, path, val…)`.
+fn eval_json_modify(
+    func: &FuncCallExpr,
+    schema: &[String],
+    row: &[Datum],
+    mode: JsonModify,
+) -> Result<Datum> {
     if func.args.len() < 3 || func.args.len().is_multiple_of(2) {
         return Err(Error::new(
             sealdb_errno::ERR_WRONG_ARGUMENTS,
@@ -3116,11 +3186,612 @@ fn eval_json_set(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Resul
             return Ok(Datum::Null);
         }
         let path = String::from_utf8_lossy(&path.as_bytes()).to_string();
-        json_path_set(&mut parsed, &path, datum_to_json(&value));
+        let exists = json_path_get(&parsed, &path).is_some();
+        match mode {
+            JsonModify::Set => json_path_set(&mut parsed, &path, datum_to_json(&value)),
+            JsonModify::Insert => {
+                if !exists {
+                    json_path_set(&mut parsed, &path, datum_to_json(&value));
+                }
+            }
+            JsonModify::Replace => {
+                if exists {
+                    json_path_set(&mut parsed, &path, datum_to_json(&value));
+                }
+            }
+        }
     }
     Ok(Datum::Bytes(
         serde_json::to_vec(&parsed).unwrap_or_else(|_| b"null".to_vec()),
     ))
+}
+
+/// Parse a JSON-document argument, reporting 3140 on malformed text.
+fn json_document(func: &FuncCallExpr, datum: &Datum, position: usize) -> Result<serde_json::Value> {
+    let bytes = datum.as_bytes();
+    serde_json::from_slice(&bytes).map_err(|_| {
+        Error::new(
+            sealdb_errno::ERR_INVALID_JSON_TEXT_IN_PARAM,
+            format!(
+                "Invalid JSON text in argument {position} to function {}: \"{}\".",
+                func.name.to_ascii_lowercase(),
+                String::from_utf8_lossy(&bytes)
+            ),
+        )
+    })
+}
+
+/// A value argument of `JSON_ARRAY` / `JSON_OBJECT`: a JSON column keeps its
+/// document, every other value is the matching JSON scalar (a SQL string
+/// literal stays a JSON string).
+fn json_value_arg(expr: &sealdb_parser::ast::ExprNode, datum: &Datum) -> serde_json::Value {
+    match expr {
+        sealdb_parser::ast::ExprNode::Column(_) => json_arg_value(datum),
+        sealdb_parser::ast::ExprNode::Cast(cast) if cast.target.eq_ignore_ascii_case("json") => {
+            json_arg_value(datum)
+        }
+        _ => datum_to_json(datum),
+    }
+}
+
+/// MySQL `JSON_TYPE(json_val)`: OBJECT / ARRAY / BOOLEAN / INTEGER / DOUBLE /
+/// STRING / NULL.
+fn eval_json_type(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_type'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let parsed = json_document(func, &value, 1)?;
+    let name = match &parsed {
+        serde_json::Value::Null => "NULL",
+        serde_json::Value::Bool(_) => "BOOLEAN",
+        serde_json::Value::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                "INTEGER"
+            } else {
+                "DOUBLE"
+            }
+        }
+        serde_json::Value::String(_) => "STRING",
+        serde_json::Value::Array(_) => "ARRAY",
+        serde_json::Value::Object(_) => "OBJECT",
+    };
+    Ok(Datum::Bytes(name.as_bytes().to_vec()))
+}
+
+/// MySQL `JSON_QUOTE(str)`: the argument as a quoted JSON string.
+fn eval_json_quote(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_quote'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let text = String::from_utf8_lossy(&value.as_bytes()).into_owned();
+    Ok(Datum::Bytes(
+        serde_json::to_vec(&serde_json::Value::String(text)).unwrap_or_else(|_| b"\"\"".to_vec()),
+    ))
+}
+
+/// MySQL `JSON_ARRAY(val, …)`.
+fn eval_json_array(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let mut items = Vec::with_capacity(func.args.len());
+    for arg in &func.args {
+        let value = eval_expr_with_row(arg, schema, row)?;
+        items.push(if value.is_null() {
+            serde_json::Value::Null
+        } else {
+            json_value_arg(arg, &value)
+        });
+    }
+    Ok(Datum::Bytes(
+        serde_json::to_vec(&serde_json::Value::Array(items)).unwrap_or_else(|_| b"[]".to_vec()),
+    ))
+}
+
+/// MySQL `JSON_OBJECT(key, val, …)`.
+fn eval_json_object(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if !func.args.len().is_multiple_of(2) {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_object'",
+        ));
+    }
+    let mut map = serde_json::Map::new();
+    for pair in func.args.chunks(2) {
+        let key = eval_expr_with_row(&pair[0], schema, row)?;
+        let value = eval_expr_with_row(&pair[1], schema, row)?;
+        if key.is_null() {
+            return Err(Error::new(
+                sealdb_errno::ERR_INVALID_JSON_TEXT_IN_PARAM,
+                "JSON documents may not contain NULL member names",
+            ));
+        }
+        let key = String::from_utf8_lossy(&key.as_bytes()).into_owned();
+        map.insert(
+            key,
+            if value.is_null() {
+                serde_json::Value::Null
+            } else {
+                json_value_arg(&pair[1], &value)
+            },
+        );
+    }
+    Ok(Datum::Bytes(
+        serde_json::to_vec(&serde_json::Value::Object(map)).unwrap_or_else(|_| b"{}".to_vec()),
+    ))
+}
+
+/// MySQL `JSON_MERGE_PRESERVE` (arrays concatenate) and `JSON_MERGE_PATCH`
+/// (RFC 7386: `null` removes a member, objects merge recursively).
+fn eval_json_merge(
+    func: &FuncCallExpr,
+    schema: &[String],
+    row: &[Datum],
+    patch: bool,
+) -> Result<Datum> {
+    if func.args.len() < 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!(
+                "Incorrect parameter count in the call to native function '{}'",
+                func.name.to_ascii_lowercase()
+            ),
+        ));
+    }
+    let mut merged: Option<serde_json::Value> = None;
+    for (position, arg) in func.args.iter().enumerate() {
+        let value = eval_expr_with_row(arg, schema, row)?;
+        if value.is_null() {
+            return Ok(Datum::Null);
+        }
+        let doc = json_document(func, &value, position + 1)?;
+        merged = Some(match merged {
+            None => doc,
+            Some(current) => {
+                if patch {
+                    json_merge_patch_value(current, doc)
+                } else {
+                    json_merge_preserve_value(current, doc)
+                }
+            }
+        });
+    }
+    Ok(Datum::Bytes(
+        serde_json::to_vec(&merged.unwrap_or(serde_json::Value::Null))
+            .unwrap_or_else(|_| b"null".to_vec()),
+    ))
+}
+
+fn json_merge_preserve_value(
+    left: serde_json::Value,
+    right: serde_json::Value,
+) -> serde_json::Value {
+    match (left, right) {
+        (serde_json::Value::Object(mut a), serde_json::Value::Object(b)) => {
+            for (key, value) in b {
+                let slot = a.remove(&key);
+                let merged = match slot {
+                    Some(existing) => json_merge_preserve_value(existing, value),
+                    None => value,
+                };
+                a.insert(key, merged);
+            }
+            serde_json::Value::Object(a)
+        }
+        (serde_json::Value::Array(mut a), serde_json::Value::Array(b)) => {
+            a.extend(b);
+            serde_json::Value::Array(a)
+        }
+        (a, b) => serde_json::Value::Array(vec![a, b]),
+    }
+}
+
+fn json_merge_patch_value(left: serde_json::Value, right: serde_json::Value) -> serde_json::Value {
+    match right {
+        serde_json::Value::Object(b) => {
+            let mut a = match left {
+                serde_json::Value::Object(a) => a,
+                _ => serde_json::Map::new(),
+            };
+            for (key, value) in b {
+                if value.is_null() {
+                    a.remove(&key);
+                } else {
+                    let merged = match a.remove(&key) {
+                        Some(existing) => json_merge_patch_value(existing, value),
+                        None => value,
+                    };
+                    a.insert(key, merged);
+                }
+            }
+            serde_json::Value::Object(a)
+        }
+        other => other,
+    }
+}
+
+/// MySQL `JSON_REMOVE(doc, path…)`.
+fn eval_json_remove(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() < 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_remove'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut parsed = json_document(func, &value, 1)?;
+    for arg in &func.args[1..] {
+        let path = eval_expr_with_row(arg, schema, row)?;
+        if path.is_null() {
+            return Ok(Datum::Null);
+        }
+        let path = String::from_utf8_lossy(&path.as_bytes()).into_owned();
+        json_path_remove(&mut parsed, &path);
+    }
+    Ok(Datum::Bytes(
+        serde_json::to_vec(&parsed).unwrap_or_else(|_| b"null".to_vec()),
+    ))
+}
+
+/// Remove the value a path addresses; a missing path is a no-op.
+fn json_path_remove(value: &mut serde_json::Value, path: &str) {
+    let Some(parts) = parse_json_path(path) else {
+        return;
+    };
+    let Some((last, parents)) = parts.split_last() else {
+        return;
+    };
+    let mut current = value;
+    for part in parents {
+        match part {
+            JsonPathPart::Key(key) => match current.get_mut(key) {
+                Some(child) => current = child,
+                None => return,
+            },
+            JsonPathPart::Index(idx) => {
+                let serde_json::Value::Array(items) = current else {
+                    return;
+                };
+                match items.get_mut(*idx) {
+                    Some(child) => current = child,
+                    None => return,
+                }
+            }
+            JsonPathPart::Invalid => return,
+        }
+    }
+    match last {
+        JsonPathPart::Key(key) => {
+            if let serde_json::Value::Object(map) = current {
+                map.remove(key);
+            }
+        }
+        JsonPathPart::Index(idx) => {
+            if let serde_json::Value::Array(items) = current
+                && *idx < items.len()
+            {
+                items.remove(*idx);
+            }
+        }
+        JsonPathPart::Invalid => {}
+    }
+}
+
+/// MySQL `JSON_ARRAY_APPEND(doc, path, val…)`.
+fn eval_json_array_append(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() < 3 || func.args.len().is_multiple_of(2) {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_array_append'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut parsed = json_document(func, &value, 1)?;
+    for pair in func.args[1..].chunks(2) {
+        let path = eval_expr_with_row(&pair[0], schema, row)?;
+        let appended = eval_expr_with_row(&pair[1], schema, row)?;
+        if path.is_null() {
+            return Ok(Datum::Null);
+        }
+        let path = String::from_utf8_lossy(&path.as_bytes()).into_owned();
+        let new = datum_to_json(&appended);
+        if let Some(existing) = json_path_get_mut(&mut parsed, &path) {
+            match existing {
+                serde_json::Value::Array(items) => items.push(new),
+                other => {
+                    let old = std::mem::replace(other, serde_json::Value::Null);
+                    *other = serde_json::Value::Array(vec![old, new]);
+                }
+            }
+        }
+    }
+    Ok(Datum::Bytes(
+        serde_json::to_vec(&parsed).unwrap_or_else(|_| b"null".to_vec()),
+    ))
+}
+
+/// Mutable counterpart of `json_path_get`.
+fn json_path_get_mut<'a>(
+    value: &'a mut serde_json::Value,
+    path: &str,
+) -> Option<&'a mut serde_json::Value> {
+    let parts = parse_json_path(path)?;
+    let mut current = value;
+    for part in parts {
+        current = match part {
+            JsonPathPart::Key(key) => current.get_mut(&key)?,
+            JsonPathPart::Index(idx) => match current {
+                serde_json::Value::Array(items) => items.get_mut(idx)?,
+                _ => return None,
+            },
+            JsonPathPart::Invalid => return None,
+        };
+    }
+    Some(current)
+}
+
+/// MySQL `JSON_SEARCH(doc, one_or_all, search_str[, escape[, path…]])`.
+fn eval_json_search(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() < 3 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_search'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mode = eval_expr_with_row(&func.args[1], schema, row)?;
+    let needle = eval_expr_with_row(&func.args[2], schema, row)?;
+    if mode.is_null() || needle.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mode = String::from_utf8_lossy(&mode.as_bytes()).to_ascii_lowercase();
+    let one = mode == "one";
+    let needle = String::from_utf8_lossy(&needle.as_bytes()).into_owned();
+    let mut escape = '\\';
+    let mut path_start = 3;
+    if func.args.len() > 3 {
+        let candidate = eval_expr_with_row(&func.args[3], schema, row)?;
+        let text = String::from_utf8_lossy(&candidate.as_bytes()).into_owned();
+        if text.chars().count() == 1 {
+            escape = text.chars().next().unwrap_or('\\');
+            path_start = 4;
+        }
+    }
+    let mut roots = Vec::new();
+    if path_start < func.args.len() {
+        for arg in &func.args[path_start..] {
+            let path = eval_expr_with_row(arg, schema, row)?;
+            if path.is_null() {
+                return Ok(Datum::Null);
+            }
+            let path = String::from_utf8_lossy(&path.as_bytes()).into_owned();
+            if let Some(found) = json_path_get(&json_arg_value(&value), &path) {
+                roots.push((path, found.clone()));
+            }
+        }
+    } else {
+        roots.push(("$".to_string(), json_arg_value(&value)));
+    }
+    let mut matches = Vec::new();
+    for (root, doc) in &roots {
+        json_search_value(doc, root, &needle, escape, one, &mut matches);
+        if one && !matches.is_empty() {
+            break;
+        }
+    }
+    if matches.is_empty() {
+        return Ok(Datum::Null);
+    }
+    let output = if one {
+        serde_json::Value::String(matches.remove(0))
+    } else {
+        serde_json::Value::Array(matches.into_iter().map(serde_json::Value::String).collect())
+    };
+    Ok(json_scalar_datum(&output))
+}
+
+fn json_search_value(
+    value: &serde_json::Value,
+    path: &str,
+    needle: &str,
+    escape: char,
+    one: bool,
+    out: &mut Vec<String>,
+) {
+    if one && !out.is_empty() {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = format!("{path}.{key}");
+                json_search_value(child, &child_path, needle, escape, one, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, child) in items.iter().enumerate() {
+                let child_path = format!("{path}[{idx}]");
+                json_search_value(child, &child_path, needle, escape, one, out);
+            }
+        }
+        serde_json::Value::String(text) => {
+            if json_search_match(text, needle, escape) {
+                out.push(path.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// MySQL `LIKE`-style match used by `JSON_SEARCH`.
+fn json_search_match(text: &str, pattern: &str, escape: char) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    fn go(text: &[char], pattern: &[char], escape: char) -> bool {
+        let Some((&head, rest)) = pattern.split_first() else {
+            return text.is_empty();
+        };
+        if head == escape {
+            if let Some((&literal, rest)) = rest.split_first() {
+                return text.first() == Some(&literal) && go(&text[1..], rest, escape);
+            }
+            return go(text, rest, escape);
+        }
+        match head {
+            '%' => (0..=text.len()).any(|skip| go(&text[skip..], rest, escape)),
+            '_' => !text.is_empty() && go(&text[1..], rest, escape),
+            literal => text.first() == Some(&literal) && go(&text[1..], rest, escape),
+        }
+    }
+    go(&text, &pattern, escape)
+}
+
+/// MySQL `JSON_KEYS(doc[, path])`.
+fn eval_json_keys(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.is_empty() || func.args.len() > 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_keys'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut parsed = json_arg_value(&value);
+    if func.args.len() == 2 {
+        let path = eval_expr_with_row(&func.args[1], schema, row)?;
+        if path.is_null() {
+            return Ok(Datum::Null);
+        }
+        let path = String::from_utf8_lossy(&path.as_bytes()).into_owned();
+        match json_path_get(&parsed, &path) {
+            Some(found) => parsed = found.clone(),
+            None => return Ok(Datum::Null),
+        }
+    }
+    let serde_json::Value::Object(map) = parsed else {
+        return Ok(Datum::Null);
+    };
+    let keys: Vec<serde_json::Value> = map
+        .keys()
+        .map(|key| serde_json::Value::String(key.clone()))
+        .collect();
+    Ok(Datum::Bytes(
+        serde_json::to_vec(&serde_json::Value::Array(keys)).unwrap_or_else(|_| b"[]".to_vec()),
+    ))
+}
+
+/// MySQL `JSON_STORAGE_SIZE(doc)`.
+fn eval_json_storage_size(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_storage_size'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let parsed = json_document(func, &value, 1)?;
+    let size = serde_json::to_vec(&parsed)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    Ok(Datum::I64(size as i64))
+}
+
+/// MySQL `JSON_DEPTH(doc)`.
+fn eval_json_depth(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_depth'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let parsed = json_document(func, &value, 1)?;
+    Ok(Datum::I64(i64::from(json_depth_of(&parsed))))
+}
+
+fn json_depth_of(value: &serde_json::Value) -> u32 {
+    match value {
+        serde_json::Value::Object(map) => 1 + map.values().map(json_depth_of).max().unwrap_or(0),
+        serde_json::Value::Array(items) => 1 + items.iter().map(json_depth_of).max().unwrap_or(0),
+        _ => 1,
+    }
+}
+
+/// MySQL `JSON_LENGTH(doc[, path])`.
+fn eval_json_length(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.is_empty() || func.args.len() > 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_length'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut parsed = json_arg_value(&value);
+    if func.args.len() == 2 {
+        let path = eval_expr_with_row(&func.args[1], schema, row)?;
+        if path.is_null() {
+            return Ok(Datum::Null);
+        }
+        let path = String::from_utf8_lossy(&path.as_bytes()).into_owned();
+        match json_path_get(&parsed, &path) {
+            Some(found) => parsed = found.clone(),
+            None => return Ok(Datum::Null),
+        }
+    }
+    let length = match parsed {
+        serde_json::Value::Object(map) => map.len(),
+        serde_json::Value::Array(items) => items.len(),
+        _ => 1,
+    };
+    Ok(Datum::I64(length as i64))
+}
+
+/// MySQL `JSON_PRETTY(doc)`.
+fn eval_json_pretty(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect parameter count in the call to native function 'json_pretty'",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let parsed = json_document(func, &value, 1)?;
+    let text = serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| "null".to_string());
+    Ok(Datum::Bytes(text.into_bytes()))
 }
 
 /// `Datum` → JSON value, the way TiDB coerces a `JSON_SET` argument.
@@ -3500,6 +4171,190 @@ fn eval_substring(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Resu
         return Ok(Datum::Bytes(Vec::new()));
     }
     let out: String = chars[start as usize..end as usize].iter().collect();
+    Ok(Datum::Bytes(out.into_bytes()))
+}
+
+/// Parsed MySQL regular-expression call arguments.
+struct RegexpArgs {
+    text: String,
+    pattern: String,
+    replacement: String,
+    /// 1-based character position; negative counts from the end.
+    pos: i64,
+    /// 1-based occurrence to act on; 0 means "all" (REGEXP_REPLACE).
+    occurrence: i64,
+    match_type: String,
+}
+
+/// Evaluate the shared `(expr, pat[, repl][, pos[, occurrence[, match_type]]])`
+/// argument list. Returns `Ok(None)` when any argument is NULL.
+fn regexp_args(
+    func: &FuncCallExpr,
+    schema: &[String],
+    row: &[Datum],
+    has_replacement: bool,
+) -> Result<Option<RegexpArgs>> {
+    let min = if has_replacement { 3 } else { 2 };
+    let max = if has_replacement { 6 } else { 5 };
+    if func.args.len() < min || func.args.len() > max {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("Incorrect arguments to {}", func.name.to_ascii_uppercase()),
+        ));
+    }
+    let mut values = Vec::with_capacity(func.args.len());
+    for arg in &func.args {
+        let value = eval_expr_with_row(arg, schema, row)?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        values.push(value);
+    }
+    let text = String::from_utf8_lossy(&values[0].as_bytes()).into_owned();
+    let pattern = String::from_utf8_lossy(&values[1].as_bytes()).into_owned();
+    let (replacement, rest) = if has_replacement {
+        (
+            String::from_utf8_lossy(&values[2].as_bytes()).into_owned(),
+            &values[3..],
+        )
+    } else {
+        (String::new(), &values[2..])
+    };
+    let pos = match rest.first() {
+        Some(value) => value.as_i64()?,
+        None => 1,
+    };
+    let occurrence = match rest.get(1) {
+        Some(value) => value.as_i64()?,
+        None => 1,
+    };
+    let match_type = match rest.get(2) {
+        Some(value) => String::from_utf8_lossy(&value.as_bytes()).into_owned(),
+        None => String::new(),
+    };
+    Ok(Some(RegexpArgs {
+        text,
+        pattern,
+        replacement,
+        pos,
+        occurrence,
+        match_type,
+    }))
+}
+
+/// Build a regex for MySQL `match_type`: `i` case-insensitive (the default),
+/// `c` case-sensitive, `m` multi-line, `n` `.` matches a newline, `u` unix
+/// line endings (a no-op here), `x` extended/ignore-whitespace.
+fn build_mysql_regexp(pattern: &str, match_type: &str) -> Result<regex::Regex> {
+    let mut insensitive = true;
+    let mut builder = regex::RegexBuilder::new(pattern);
+    for ch in match_type.chars() {
+        match ch.to_ascii_lowercase() {
+            'i' => insensitive = true,
+            'c' => insensitive = false,
+            'm' => {
+                builder.multi_line(true);
+            }
+            'n' => {
+                builder.dot_matches_new_line(true);
+            }
+            'u' => {}
+            'x' => {
+                builder.ignore_whitespace(true);
+            }
+            _ => {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "Incorrect arguments to REGEXP_LIKE",
+                ));
+            }
+        }
+    }
+    builder
+        .case_insensitive(insensitive)
+        .build()
+        .map_err(|_| Error::new(3688, "The regular expression contains an error"))
+}
+
+/// Byte offset of the 1-based `pos` character in `text` (clamped to the end).
+fn regexp_start_byte(text: &str, pos: i64) -> usize {
+    let total = text.chars().count() as i64;
+    let index = if pos > 0 { pos - 1 } else { total + pos };
+    if index <= 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(index as usize)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+/// The `occurrence`-th match of `re` in `text` at or after `pos`; the returned
+/// offsets are absolute byte offsets into `text`.
+fn regexp_find_nth(
+    re: &regex::Regex,
+    text: &str,
+    pos: i64,
+    occurrence: i64,
+) -> Option<(usize, usize)> {
+    let start = regexp_start_byte(text, pos);
+    if start > text.len() {
+        return None;
+    }
+    let slice = &text[start..];
+    let wanted = occurrence.max(1);
+    re.find_iter(slice)
+        .nth((wanted - 1) as usize)
+        .map(|m| (start + m.start(), start + m.end()))
+}
+
+fn eval_regexp_like(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let Some(args) = regexp_args(func, schema, row, false)? else {
+        return Ok(Datum::Null);
+    };
+    let re = build_mysql_regexp(&args.pattern, &args.match_type)?;
+    Ok(Datum::I64(i64::from(re.is_match(&args.text))))
+}
+
+fn eval_regexp_substr(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let Some(args) = regexp_args(func, schema, row, false)? else {
+        return Ok(Datum::Null);
+    };
+    let re = build_mysql_regexp(&args.pattern, &args.match_type)?;
+    match regexp_find_nth(&re, &args.text, args.pos, args.occurrence) {
+        Some((start, end)) => Ok(Datum::Bytes(args.text[start..end].as_bytes().to_vec())),
+        None => Ok(Datum::Null),
+    }
+}
+
+fn eval_regexp_instr(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let Some(args) = regexp_args(func, schema, row, false)? else {
+        return Ok(Datum::Null);
+    };
+    let re = build_mysql_regexp(&args.pattern, &args.match_type)?;
+    match regexp_find_nth(&re, &args.text, args.pos, args.occurrence) {
+        // MySQL reports a 1-based character position.
+        Some((start, _)) => Ok(Datum::I64(args.text[..start].chars().count() as i64 + 1)),
+        None => Ok(Datum::I64(0)),
+    }
+}
+
+fn eval_regexp_replace(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let Some(args) = regexp_args(func, schema, row, true)? else {
+        return Ok(Datum::Null);
+    };
+    let re = build_mysql_regexp(&args.pattern, &args.match_type)?;
+    let start = regexp_start_byte(&args.text, args.pos);
+    let head = &args.text[..start];
+    let tail = &args.text[start..];
+    let replaced = if args.occurrence > 0 {
+        re.replacen(tail, args.occurrence as usize, args.replacement.as_str())
+    } else {
+        re.replace_all(tail, args.replacement.as_str())
+    };
+    let mut out = String::with_capacity(args.text.len());
+    out.push_str(head);
+    out.push_str(&replaced);
     Ok(Datum::Bytes(out.into_bytes()))
 }
 
@@ -5594,6 +6449,10 @@ fn eval_unix_timestamp(func: &FuncCallExpr, schema: &[String], row: &[Datum]) ->
         return Ok(Datum::Null);
     }
     let mut t = datum_as_time(&v)?;
+    // The zero date/time has no epoch position: TiDB reports 0.
+    if t.year == 0 && t.month == 0 && t.day == 0 {
+        return Ok(Datum::I64(0));
+    }
     // Column TIMESTAMP is UTC; convert to session local before suite hard-codes
     // / wall-clock mapping (TiDB UNIX_TIMESTAMP uses session TZ).
     if matches!(t.tp, TimeType::Timestamp) {
@@ -6069,6 +6928,7 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
         }
         "DOUBLE" | "REAL" | "FLOAT" => FieldType::new_double(),
         "CHAR" | "BINARY" | "CHARSET" => FieldType::new_string(),
+        _ if target.starts_with("BINARY(") => FieldType::new_string(),
         // `CAST(x AS CHAR CHARACTER SET gbk)`: the target charset decides the
         // byte encoding (sorting compares the encoded bytes).
         _ if target.starts_with("CHAR CHARSET ") => {
@@ -6212,6 +7072,27 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
     {
         return Ok(Datum::Bytes(bytes.clone()));
     }
+    // `CAST(x AS BINARY(n))`: the raw bytes truncated / zero-padded to `n`
+    // (`cast(0x10 as binary(2))` is `0x1000`, not the text `"16"`).
+    if let Some(rest) = target.strip_prefix("BINARY(") {
+        let length = rest
+            .trim_end_matches(')')
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0);
+        let mut bytes = match &value {
+            Datum::Bit(bytes) | Datum::Bytes(bytes) => bytes.clone(),
+            other => other.as_bytes(),
+        };
+        if length > 0 {
+            if bytes.len() >= length {
+                bytes.truncate(length);
+            } else {
+                bytes.resize(length, 0);
+            }
+        }
+        return Ok(Datum::Bytes(bytes));
+    }
     // Unsigned integer overflow clamps to u64::MAX (1292 warning), but strict
     // DML raises 1690 (`cast('18446744073709551616' as unsigned)`).
     if ft.unsigned
@@ -6282,6 +7163,43 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 .clamped(ft.flen, ft.decimal);
             return Ok(Datum::Decimal(d));
         }
+    }
+    // TiDB's `CAST(str AS TIME)` reports ignored trailing text as a truncation
+    // (`ErrTruncatedWrongVal`) while still returning the parsed clock.
+    if ft.tp == sealdb_types::field_type::TYPE_DURATION
+        && let Datum::Bytes(bytes) = &value
+        && let Some((_, truncated)) =
+            sealdb_types::time::parse_duration_string_truncated(&String::from_utf8_lossy(bytes))
+        && truncated
+    {
+        push_warning(
+            ERR_TRUNCATED_WRONG_VALUE,
+            format!(
+                "Truncated incorrect time value: '{}'",
+                String::from_utf8_lossy(bytes)
+            ),
+        );
+    }
+    if matches!(
+        ft.tp,
+        sealdb_types::field_type::TYPE_DATE
+            | sealdb_types::field_type::TYPE_DATETIME
+            | sealdb_types::field_type::TYPE_TIMESTAMP
+            | sealdb_types::field_type::TYPE_DURATION
+    ) {
+        return match value.cast(&ft) {
+            Ok(out) => Ok(out),
+            // A query's CAST turns a malformed temporal value into NULL (TiDB
+            // `ec.HandleError`); a strict DML assignment keeps the error.
+            Err(err) if err.code == ERR_TRUNCATED_WRONG_VALUE => {
+                if strict_dml() && current_dml_table().is_some() {
+                    return Err(err);
+                }
+                push_warning(err.code, err.message);
+                Ok(Datum::Null)
+            }
+            Err(err) => Err(err),
+        };
     }
     value.cast(&ft)
 }

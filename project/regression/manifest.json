@@ -14,11 +14,11 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 131,
-      "pending": 105,
-      "in_progress": 8,
       "deferred": 2,
-      "local": 8
+      "green": 139,
+      "in_progress": 8,
+      "local": 8,
+      "pending": 97
     },
     "by_wave": {
       "D": 2,
@@ -296,7 +296,7 @@
     {
       "name": "ddl/db_integration",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/db_integration.test",
       "result": "r/ddl/db_integration.result",
       "has_result": true,
@@ -1402,7 +1402,7 @@
     {
       "name": "globalindex/analyze",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/globalindex/analyze.test",
       "result": "r/globalindex/analyze.result",
       "has_result": true,
@@ -1512,7 +1512,7 @@
     {
       "name": "globalindex/misc",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/globalindex/misc.test",
       "result": "r/globalindex/misc.result",
       "has_result": true,
@@ -1522,7 +1522,7 @@
     {
       "name": "globalindex/multi_valued_index",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/globalindex/multi_valued_index.test",
       "result": "r/globalindex/multi_valued_index.result",
       "has_result": true,
@@ -2292,7 +2292,7 @@
     {
       "name": "session/common",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/session/common.test",
       "result": "r/session/common.result",
       "has_result": true,
@@ -2302,7 +2302,7 @@
     {
       "name": "session/nontransactional",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/session/nontransactional.test",
       "result": "r/session/nontransactional.result",
       "has_result": true,
@@ -2332,7 +2332,7 @@
     {
       "name": "session/temporary_table",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/session/temporary_table.test",
       "result": "r/session/temporary_table.result",
       "has_result": true,
@@ -2362,7 +2362,7 @@
     {
       "name": "session/vars",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/session/vars.test",
       "result": "r/session/vars.result",
       "has_result": true,

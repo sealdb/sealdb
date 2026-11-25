@@ -16,6 +16,12 @@ pub const ERR_PARSE_ERROR: i32 = 1064;
 /// double range (`Illegal double '…' value found during parsing`), 1367.
 pub const ERR_ILLEGAL_VALUE_FOR_TYPE: i32 = 1367;
 pub const ERR_UNKNOWN_TABLE: i32 = 1109;
+/// MySQL `ER_WRONG_DB_NAME`: `[db.]table.column` names a database other than
+/// the target (`Incorrect database name '…'`), 1102.
+pub const ERR_WRONG_DB_NAME: i32 = 1102;
+/// MySQL `ER_WRONG_TABLE_NAME`: `[db.]table.column` names a table other than
+/// the target (`Incorrect table name '…'`), 1103.
+pub const ERR_WRONG_TABLE_NAME: i32 = 1103;
 pub const ERR_BAD_FIELD: i32 = 1054;
 /// Column name collides across join inputs (`Column 'a' in from clause is ambiguous`).
 pub const ERR_AMBIGUOUS_COLUMN: i32 = 1052;
@@ -29,12 +35,40 @@ pub const ERR_NO_REFERENCED_ROW_2: i32 = 1452;
 /// MySQL `ER_DATETIME_FUNCTION_OVERFLOW`: a date/time function produced a
 /// value outside the supported range (1441).
 pub const ERR_DATETIME_FUNCTION_OVERFLOW: i32 = 1441;
+/// MySQL `ER_INVALID_ON_UPDATE` (1294): `ON UPDATE` on a non-temporal column
+/// or a `CURRENT_TIMESTAMP` whose fsp differs from the column's.
+pub const ERR_INVALID_ON_UPDATE: i32 = 1294;
+/// MySQL `ER_TOO_MANY_KEYS` (1069): more than 64 keys on one table.
+pub const ERR_TOO_MANY_KEYS: i32 = 1069;
+/// MySQL `ER_TOO_MANY_FIELDS` (1117): more than 1017 columns on one table.
+pub const ERR_TOO_MANY_FIELDS: i32 = 1117;
+/// MySQL `ER_M_BIGGER_THAN_D` (1427): `FLOAT/DOUBLE/DECIMAL(M,D)` with
+/// `M < D`.
+pub const ERR_M_BIGGER_THAN_D: i32 = 1427;
+/// MySQL `ER_CANT_REMOVE_ALL_FIELDS` (1090): dropping the last visible column
+/// of a table.
+pub const ERR_CANT_REMOVE_ALL_FIELDS: i32 = 1090;
+/// MySQL `ER_WRONG_AUTO_KEY` (1075): a table defines more than one
+/// `AUTO_INCREMENT` column.
+pub const ERR_WRONG_AUTO_KEY: i32 = 1075;
+/// MySQL `ER_WRONG_NAME_FOR_INDEX` (1280): a secondary index named `PRIMARY`
+/// (`Incorrect index name '…'`).
+pub const ERR_WRONG_NAME_FOR_INDEX: i32 = 1280;
+/// MySQL `ER_TABLE_MUST_HAVE_COLUMNS` (1113): `CREATE TABLE` without columns
+/// or a DDL that drops the last remaining column.
+pub const ERR_TABLE_MUST_HAVE_COLUMNS: i32 = 1113;
+/// MySQL `ER_WRONG_FK_DEF` (1239): malformed `FOREIGN KEY` definition, e.g. the
+/// local and referenced column lists have different lengths.
+pub const ERR_WRONG_FK_DEF: i32 = 1239;
 pub const ERR_UNKNOWN_ERROR: i32 = 1105;
 pub const ERR_WRONG_VALUE_COUNT: i32 = 1058;
 /// MySQL `ER_WRONG_VALUE_COUNT_ON_ROW`: VALUES arity differs from the columns.
 pub const ERR_WRONG_VALUE_COUNT_ON_ROW: i32 = 1136;
 pub const ERR_BAD_NULL: i32 = 1048;
 pub const ERR_DUP_ENTRY: i32 = 1062;
+/// MySQL `ER_RECORD_FILE_FULL`: a temporary table grew past
+/// `tidb_tmp_table_max_size` (`The table '…' is full`), 1114.
+pub const ERR_RECORD_FILE_FULL: i32 = 1114;
 pub const ERR_DATA_OUT_OF_RANGE: i32 = 1690;
 pub const ERR_TRUNCATED_WRONG_VALUE: i32 = 1292;
 /// MySQL `ER_DUPLICATED_VALUE_IN_TYPE`: duplicate member in ENUM/SET (1291).
@@ -59,6 +93,9 @@ pub const ERR_DATA_TOO_LONG: i32 = 1406;
 /// MySQL `ER_WARN_ALLOWED_PACKET_OVERFLOWED`: a function result exceeds
 /// `max_allowed_packet` (1301).
 pub const ERR_ALLOWED_PACKET_OVERFLOWED: i32 = 1301;
+/// MySQL `ER_NOT_SUPPORTED_YET`-adjacent warning TiDB raises for a FULLTEXT
+/// index, which InnoDB cannot store (1214).
+pub const ERR_WARN_TABLE_TYPE_NOT_SUPPORT_FULLTEXT: i32 = 1214;
 /// MySQL `ER_AUTOINC_READ_FAILED` (1467): the auto-increment allocator ran out
 /// of values for the column type.
 pub const ERR_AUTOINC_READ_FAILED: i32 = 1467;
@@ -181,6 +218,9 @@ pub const ERR_PRIMARY_KEY_ON_EXPR_COLUMN: i32 = 3756;
 pub const ERR_FUNCTIONAL_INDEX_ON_FIELD: i32 = 3758;
 /// TiDB `ErrFunctionalIndexOnBlob`: the storage engine cannot index the expr.
 pub const ERR_FUNCTIONAL_INDEX_ON_BLOB: i32 = 3761;
+/// TiDB `ErrFunctionalIndexOnBlob` proper (3757): an expression index part whose
+/// result is a length-less BLOB/TEXT (`b->>'$.a'`, `json_pretty(b)`).
+pub const ERR_FUNCTIONAL_INDEX_ON_BLOB_RESULT: i32 = 3757;
 /// TiDB `ErrFunctionalIndexRowValueIsNotAllowed`: `KEY k (((j, j)))`.
 pub const ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED: i32 = 3800;
 /// TiDB `ErrNonUpdatableTable`: the UPDATE/DELETE target is a view, sequence
@@ -245,6 +285,17 @@ pub const ERR_FIELD_NOT_DEFAULT: i32 = 1364;
 /// MySQL `ER_WRONG_KEY_COLUMN`: a key part has an invalid length, e.g. the
 /// prefix length 0 in `KEY (b(0))` (1391).
 pub const ERR_WRONG_KEY_COLUMN: i32 = 1391;
+/// TiDB `ErrWrongKeyColumn`: the storage engine cannot index the column, e.g.
+/// a key over `CHAR(0)` / `VARCHAR(0)` / `BINARY(0)` (1167).
+pub const ERR_WRONG_STORAGE_ENGINE_KEY: i32 = 1167;
+/// MySQL `ER_MULTIPLE_PRI_KEY`: a table declares a second PRIMARY KEY (1068).
+pub const ERR_MULTIPLE_PRI_KEY: i32 = 1068;
+/// TiDB `ErrKeyColumnDoesNotExits`: an index names a column the table does
+/// not have (1072).
+pub const ERR_KEY_COLUMN_DOES_NOT_EXIST: i32 = 1072;
+/// MySQL `ER_WRONG_COLUMN_NAME`: an unusable column name (`_tidb_rowid` or a
+/// trailing space), 1166.
+pub const ERR_WRONG_COLUMN_NAME: i32 = 1166;
 /// TiDB `ErrWrongSubKey`: an index prefix on a column that cannot carry one
 /// (`KEY (i(3))` on an `INT`) or a prefix longer than the column (1089).
 pub const ERR_WRONG_SUB_KEY: i32 = 1089;
@@ -271,6 +322,11 @@ pub const ERR_GENERATED_COLUMN_REF_AUTO_INC: i32 = 3109;
 /// TiDB `ErrColumnWithGeneratedDependencies`: a generated column's position
 /// would break another generated column's dependency order (3107).
 pub const ERR_COLUMN_WITH_GENERATED_DEPENDENCIES: i32 = 3107;
+/// MySQL `ER_PK_INDEX_CANT_BE_INVISIBLE` (3522): the index that acts as the
+/// table's primary key (an explicit `PRIMARY KEY` or TiDB's implicit primary
+/// key, the first `UNIQUE` index whose columns are all `NOT NULL`) cannot be
+/// marked invisible.
+pub const ERR_PK_INDEX_CANT_BE_INVISIBLE: i32 = 3522;
 /// TiDB `ErrFunctionalIndexOnAutoIncrementColumn` (3754).
 pub const ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT: i32 = 3754;
 /// TiDB `ErrUnsupportedModifyCharset` (8200): an existing column's character
@@ -282,6 +338,21 @@ pub const ERR_AFFINITY: i32 = 8266;
 /// TiDB `ErrOptOnTemporaryTable` (8006): an option or operation that is not
 /// supported on temporary tables, e.g. `CREATE GLOBAL BINDING` over one.
 pub const ERR_OPT_ON_TEMPORARY_TABLE: i32 = 8006;
+/// TiDB `ErrDropTableOnTemporaryTable` (8007): `DROP GLOBAL TEMPORARY TABLE`
+/// may only name global temporary tables.
+pub const ERR_DROP_TABLE_ON_TEMPORARY_TABLE: i32 = 8007;
+/// TiDB `ErrSyntax` (1149): the parser class's syntax error code, e.g. the
+/// `DOUBLE(10)` form rejected under `tidb_enable_strict_double_type_check`.
+pub const ERR_SYNTAX: i32 = 1149;
+/// TiDB `ErrInvalidGroupFuncUse` (1111): an aggregate/grouping function inside
+/// a generated column or expression index.
+pub const ERR_INVALID_GROUP_FUNC_USE: i32 = 1111;
+/// TiDB `ErrDDLSetting` (8246): a failure while switching the DDL owner on or
+/// off, e.g. disabling DDL while this is the only TiDB instance.
+pub const ERR_DDL_SETTING: i32 = 8246;
+/// TiDB `ErrWrongPartitionName` (1567): a partition name that is empty or ends
+/// with a space is an incorrect identifier.
+pub const ERR_WRONG_PARTITION_NAME: i32 = 1567;
 /// TiDB `ErrWrongParamcountToNativeFct` (1582): a builtin function is called
 /// with an argument count outside its signature, e.g. `LOWER(a, 2)`.
 pub const ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT: i32 = 1582;

@@ -10,10 +10,10 @@
 use crate::create_table::field_type_from_name;
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_DUP_FIELDNAME, ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT,
-    ERR_FUNCTIONAL_INDEX_ON_BLOB, ERR_FUNCTIONAL_INDEX_ON_FIELD,
-    ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION,
-    ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED, ERR_TOO_LONG_KEY, ERR_WRONG_KEY_COLUMN,
-    ERR_WRONG_SUB_KEY, Error, Result,
+    ERR_FUNCTIONAL_INDEX_ON_BLOB, ERR_FUNCTIONAL_INDEX_ON_BLOB_RESULT,
+    ERR_FUNCTIONAL_INDEX_ON_FIELD, ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION,
+    ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED, ERR_KEY_COLUMN_DOES_NOT_EXIST, ERR_TOO_LONG_KEY,
+    ERR_WRONG_KEY_COLUMN, ERR_WRONG_STORAGE_ENGINE_KEY, ERR_WRONG_SUB_KEY, Error, Result,
 };
 use sealdb_meta::{ColumnInfo, IndexColumn, TableInfo};
 use sealdb_parser::ast::ExprNode;
@@ -37,28 +37,14 @@ pub(crate) fn resolve_index_parts(
     info: &TableInfo,
     index_name: &str,
     parts: &[IndexPart],
+    primary: bool,
 ) -> Result<(Vec<IndexColumn>, Vec<ColumnInfo>)> {
     let mut hidden: Vec<ColumnInfo> = Vec::new();
     let mut columns = Vec::with_capacity(parts.len());
     let mut seen: Vec<String> = Vec::with_capacity(parts.len());
-    // TiDB `buildIndexInfo`: an expression index cannot be auto-analyzed (the
-    // column stats do not cover the expression), so the DDL asks for a manual
-    // ANALYZE. Multi-valued (`CAST(… AS … ARRAY)`) indexes skip this warning.
-    let has_expr = parts
-        .iter()
-        .any(|part| matches!(part, IndexPart::Expression(_)));
-    let multi_valued = parts.iter().any(|part| match part {
-        IndexPart::Expression(expr) => expr.to_ascii_uppercase().contains("ARRAY"),
-        _ => false,
-    });
-    if has_expr && !multi_valued {
-        sealdb_expression::note_warning(
-            8265,
-            format!(
-                "Auto analyze is not effective for index '{index_name}', need analyze manually"
-            ),
-        );
-    }
+    // TiDB `buildIndexColumns`: the sum of all key parts must fit 3072 bytes
+    // (under the default strict mode the DDL fails instead of truncating).
+    let mut sum_length: i64 = 0;
     for (pos, part) in parts.iter().enumerate() {
         // TiDB `buildIndexInfo`: a key may not name the same column twice
         // (comparison is case-insensitive, the message keeps the spelling).
@@ -86,14 +72,26 @@ pub(crate) fn resolve_index_parts(
                     .iter()
                     .find(|c| !c.hidden && c.name.o().eq_ignore_ascii_case(name))
                     .ok_or_else(|| {
-                        Error::new(
-                            ERR_BAD_FIELD,
-                            format!("Unknown column '{name}' in index '{index_name}'"),
-                        )
+                        // TiDB `indexColumnsLen` / `buildIndexColumns`: a
+                        // missing PRIMARY key column reports the build
+                        // message, a secondary key the length-check message.
+                        if primary {
+                            Error::new(
+                                ERR_KEY_COLUMN_DOES_NOT_EXIST,
+                                format!("Key column '{name}' doesn't exist in table"),
+                            )
+                        } else {
+                            Error::new(
+                                ERR_KEY_COLUMN_DOES_NOT_EXIST,
+                                format!("column does not exist: {name}"),
+                            )
+                        }
                     })?;
                 let mut ic = IndexColumn::new(col.name.o(), col.offset);
                 ic.length = part.prefix_length();
                 check_index_part_length(col, ic.length)?;
+                sum_length += index_column_length(col, ic.length);
+                check_index_sum_length(sum_length, parts.len())?;
                 columns.push(ic);
             }
             IndexPart::Expression(text) => {
@@ -129,15 +127,54 @@ pub(crate) fn resolve_index_parts(
                 }
                 let offset = (info.columns.len() + hidden.len()) as i32;
                 let id = info.max_col_id + 1 + hidden.len() as i64;
-                let mut col = ColumnInfo::new(
-                    id,
-                    offset,
-                    name.clone(),
-                    expression_field_type(text, info, index_name)?,
-                );
+                let field_type = expression_field_type(text, info, index_name)?;
+                // A multi-valued index part (`CAST(json_col AS … ARRAY)`) stores
+                // array elements; the whole-part BLOB/TEXT/JSON rules do not
+                // apply to it.
+                let multi_valued_part = is_multi_valued_part(text);
+                // TiDB `checkIndexColumn`: a zero-width CHAR/VARCHAR result
+                // (e.g. `concat('')`) cannot be indexed by the engine.
+                if !multi_valued_part
+                    && field_type.flen == 0
+                    && matches!(
+                        field_type.tp,
+                        sealdb_types::field_type::TYPE_STRING
+                            | sealdb_types::field_type::TYPE_VARCHAR
+                            | sealdb_types::field_type::TYPE_VAR_STRING
+                    )
+                {
+                    // TiDB reports the hidden column's `GeneratedExprString`,
+                    // which carries `_utf8mb4` string introducers.
+                    let display = parse_expr(text)
+                        .map(|expr| expr.restore_string_generated())
+                        .unwrap_or_else(|_| text.to_string());
+                    return Err(Error::new(
+                        ERR_FUNCTIONAL_INDEX_ON_BLOB,
+                        format!("The used storage engine cannot index the expression '{display}'"),
+                    ));
+                }
+                // TiDB `checkIndexColumn` on the hidden generated column: JSON
+                // results are 3753, length-less BLOB/TEXT results are 3757.
+                if !multi_valued_part {
+                    if field_type.tp == sealdb_types::field_type::TYPE_JSON {
+                        return Err(Error::new(
+                            ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION,
+                            "Cannot create an expression index on a function that returns a JSON or GEOMETRY value",
+                        ));
+                    }
+                    if crate::create_table::is_lob_type(&field_type) {
+                        return Err(Error::new(
+                            ERR_FUNCTIONAL_INDEX_ON_BLOB_RESULT,
+                            "Cannot create an expression index on an expression that returns a BLOB or TEXT. Please consider using CAST",
+                        ));
+                    }
+                }
+                let mut col = ColumnInfo::new(id, offset, name.clone(), field_type);
                 col.generated_expr = Some(text.clone());
                 col.generated_stored = false;
                 col.hidden = true;
+                sum_length += index_column_length(&col, -1);
+                check_index_sum_length(sum_length, parts.len())?;
                 hidden.push(col);
                 columns.push(IndexColumn::new(name, offset));
             }
@@ -151,6 +188,24 @@ pub(crate) fn resolve_index_parts(
 /// a BLOB/TEXT column always needs a prefix (1170).
 fn check_index_part_length(col: &ColumnInfo, length: i32) -> Result<()> {
     let ft = &col.field_type;
+    // TiDB `checkIndexColumn`: a zero-width CHAR/VARCHAR/BINARY column cannot
+    // be indexed (1167).
+    if ft.flen == 0
+        && matches!(
+            ft.tp,
+            sealdb_types::field_type::TYPE_STRING
+                | sealdb_types::field_type::TYPE_VARCHAR
+                | sealdb_types::field_type::TYPE_VAR_STRING
+        )
+    {
+        return Err(Error::new(
+            ERR_WRONG_STORAGE_ENGINE_KEY,
+            format!(
+                "The used storage engine can't index column '{}'",
+                col.name.o()
+            ),
+        ));
+    }
     let blob = matches!(
         ft.tp,
         sealdb_types::field_type::TYPE_BLOB
@@ -209,6 +264,80 @@ fn charset_maxlen(charset: &str) -> i32 {
     }
 }
 
+/// TiDB `getIndexColumnLength`: bytes one index key part occupies. `prefix` is
+/// -1 when the whole column is indexed; `flen` is the declared char length for
+/// string types and the precision for decimals.
+fn index_column_length(col: &ColumnInfo, prefix: i32) -> i64 {
+    use sealdb_types::field_type::*;
+    let ft = &col.field_type;
+    let length = if prefix != -1 { prefix } else { ft.flen };
+    if length < 0 {
+        return 0;
+    }
+    let length = i64::from(length);
+    match ft.tp {
+        TYPE_BIT => (length + 7) >> 3,
+        TYPE_VARCHAR | TYPE_STRING | TYPE_VAR_STRING | TYPE_TINY_BLOB | TYPE_BLOB
+        | TYPE_MEDIUM_BLOB | TYPE_LONG_BLOB => i64::from(charset_maxlen(&ft.charset)) * length,
+        TYPE_TINY => 1,
+        TYPE_SHORT => 2,
+        TYPE_INT24 => 3,
+        TYPE_LONG => 4,
+        TYPE_LONG_LONG => 8,
+        // TiDB spills to the double length past 24 digits of precision.
+        TYPE_FLOAT => {
+            if length <= 24 {
+                4
+            } else {
+                8
+            }
+        }
+        TYPE_DOUBLE => 8,
+        TYPE_NEW_DECIMAL | TYPE_DECIMAL => {
+            // TiDB `calcBytesLengthForDecimal`.
+            (length / 9 * 4) + ((length % 9) + 1) / 2
+        }
+        TYPE_YEAR => 1,
+        TYPE_DATE | TYPE_DURATION => 3,
+        TYPE_DATETIME => 8,
+        TYPE_TIMESTAMP => 4,
+        TYPE_ENUM => 2,
+        TYPE_SET => 8,
+        _ => length,
+    }
+}
+
+/// Re-check every index on `info` after a column charset/type change. TiDB
+/// re-runs `buildIndexColumns`, so a widened key fails the DDL with 1071.
+pub(crate) fn revalidate_index_lengths(info: &TableInfo) -> Result<()> {
+    for index in &info.indices {
+        let mut sum = 0i64;
+        for ic in &index.columns {
+            if let Some(col) = info.columns.iter().find(|c| c.offset == ic.offset) {
+                sum += index_column_length(col, ic.length);
+            }
+        }
+        check_index_sum_length(sum, index.columns.len())?;
+    }
+    Ok(())
+}
+
+/// TiDB `buildIndexColumns`: a key longer than 3072 bytes fails the DDL under
+/// strict mode, or whenever it spans multiple key parts.
+fn check_index_sum_length(sum: i64, parts: usize) -> Result<()> {
+    if sum > 3072
+        && (parts > 1
+            || sealdb_expression::sql_mode_flag("STRICT_TRANS_TABLES")
+            || sealdb_expression::sql_mode_flag("STRICT_ALL_TABLES"))
+    {
+        return Err(Error::new(
+            ERR_TOO_LONG_KEY,
+            format!("Specified key was too long ({sum} bytes); max key length is 3072 bytes"),
+        ));
+    }
+    Ok(())
+}
+
 /// Field type TiDB derives for an expression index part.
 fn expression_field_type(text: &str, info: &TableInfo, index_name: &str) -> Result<FieldType> {
     let expr = parse_expr(text)?;
@@ -220,6 +349,49 @@ fn column_field_type<'a>(info: &'a TableInfo, name: &str) -> Option<&'a FieldTyp
         .iter()
         .find(|c| !c.hidden && c.name.o().eq_ignore_ascii_case(name))
         .map(|c| &c.field_type)
+}
+
+/// Maximum width of a string-valued argument when it is statically known: a
+/// visible column with a declared length, or a constant literal.
+fn known_string_flen(expr: &ExprNode, info: &TableInfo) -> Option<i32> {
+    match expr {
+        ExprNode::Column(c) => column_field_type(info, &c.name)
+            .map(|ft| ft.flen)
+            .filter(|flen| *flen > 0),
+        ExprNode::Value(v) => match &v.datum {
+            Datum::Bytes(bytes) => Some(bytes.len() as i32),
+            Datum::Null => Some(0),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Fractional-second precision of the temporal argument (`fsp`); 0 when the
+/// argument is missing or not temporal.
+fn arg_fsp(args: &[ExprNode], info: &TableInfo, index_name: &str, text: &str) -> i32 {
+    args.last()
+        .and_then(|arg| infer(arg, info, index_name, text).ok())
+        .filter(|ft| {
+            matches!(
+                ft.tp,
+                sealdb_types::field_type::TYPE_DATETIME
+                    | sealdb_types::field_type::TYPE_TIMESTAMP
+                    | sealdb_types::field_type::TYPE_DURATION
+            )
+        })
+        .map(|ft| ft.decimal.max(0))
+        .unwrap_or(0)
+}
+
+/// Is this index part a multi-valued one (`CAST(json_col AS … ARRAY)`)?
+/// Matching on the function name is not enough: builtins such as `json_array`
+/// contain `ARRAY` but produce a JSON value, not an array index part.
+pub(crate) fn is_multi_valued_part(text: &str) -> bool {
+    parse_expr(text).is_ok_and(|expr| match expr {
+        ExprNode::Cast(c) => c.target.trim().to_ascii_uppercase().ends_with("ARRAY"),
+        _ => false,
+    })
 }
 
 fn infer(expr: &ExprNode, info: &TableInfo, index_name: &str, text: &str) -> Result<FieldType> {
@@ -340,6 +512,34 @@ fn is_disallowed_function(name: &str) -> bool {
     )
 }
 
+/// Builtins whose result is JSON (TiDB `FieldType.TypeJSON`). An expression
+/// index over one of them is 3753.
+fn returns_json(name: &str) -> bool {
+    matches!(
+        name,
+        "json_extract"
+            | "json_array"
+            | "json_array_append"
+            | "json_array_insert"
+            | "json_object"
+            | "json_merge"
+            | "json_merge_preserve"
+            | "json_merge_patch"
+            | "json_set"
+            | "json_insert"
+            | "json_replace"
+            | "json_remove"
+            | "json_search"
+            | "json_keys"
+    )
+}
+
+/// Builtins whose result is a length-less TEXT/BLOB. An expression index over
+/// one of them is 3757 (`…returns a BLOB or TEXT. Please consider using CAST`).
+fn returns_blob(name: &str) -> bool {
+    matches!(name, "json_unquote" | "json_pretty")
+}
+
 fn function_field_type(
     name: &str,
     f: &sealdb_parser::ast::FuncCallExpr,
@@ -354,6 +554,22 @@ fn function_field_type(
         ));
     }
     let lower = name.to_ascii_lowercase();
+    // The hidden column mirrors the function's real result type; the index
+    // build then rejects JSON (3753) and TEXT/BLOB (3757) results.
+    if returns_json(&lower) {
+        return Ok(FieldType {
+            tp: sealdb_types::field_type::TYPE_JSON,
+            flen: -1,
+            ..FieldType::new_string()
+        });
+    }
+    if returns_blob(&lower) {
+        return Ok(FieldType {
+            tp: sealdb_types::field_type::TYPE_BLOB,
+            flen: -1,
+            ..FieldType::new_string()
+        });
+    }
     let ty = match lower.as_str() {
         // TiDB `tidb_shard` hashes into a 64-bit signed integer.
         "tidb_shard" => FieldType::new_longlong(),
@@ -363,21 +579,53 @@ fn function_field_type(
         | "trim" | "ltrim" | "rtrim" | "replace" | "left" | "right" | "repeat" | "reverse"
         | "insert" | "format" | "hex" | "to_base64" | "from_base64" => {
             let mut ty = FieldType::new_string();
-            // `upper(name)` keeps the operand's declared length when known.
-            if let Some(arg) = f.args.first()
-                && let Some(src) = column_field_type(
-                    info,
-                    match arg {
-                        ExprNode::Column(c) => &c.name,
-                        _ => "",
-                    },
-                )
-                && src.flen > 0
-            {
-                ty.flen = src.flen;
+            // `concat` adds the argument widths; the other string functions
+            // keep the width of their first argument. A known width is needed
+            // because a zero-width CHAR/VARCHAR result cannot be indexed
+            // (3761), while an unknown one is a length-less TEXT-like result.
+            let known = if lower == "concat" || lower == "concat_ws" {
+                let mut total = 0i32;
+                let mut all_known = true;
+                for arg in &f.args {
+                    match known_string_flen(arg, info) {
+                        Some(len) => total += len,
+                        None => {
+                            all_known = false;
+                            break;
+                        }
+                    }
+                }
+                all_known.then_some(total)
+            } else {
+                f.args.first().and_then(|arg| known_string_flen(arg, info))
+            };
+            if let Some(len) = known {
+                ty.flen = len;
             }
             ty
         }
+        // TiDB `json_quote`: `flen = arg_flen * 6 + 2` (worst-case escaping),
+        // which is what pushes a wide argument past the 3072-byte key limit.
+        "json_quote" => {
+            let mut ty = FieldType::new_string();
+            if let Some(arg) = f.args.first() {
+                let src = infer(arg, info, index_name, text)?;
+                ty.flen = if src.flen < 0 {
+                    src.flen
+                } else {
+                    src.flen * 6 + 2
+                };
+            }
+            ty
+        }
+        // TiDB `json_type`: 51-character string (the longest type name).
+        "json_type" => {
+            let mut ty = FieldType::new_string();
+            ty.flen = 51;
+            ty
+        }
+        // TiDB `json_storage_size` / `json_depth` / `json_length`: integers.
+        "json_storage_size" | "json_depth" | "json_length" => FieldType::new_longlong(),
         // TiDB `md5` returns a 32-byte hex string.
         "md5" => {
             let mut ty = FieldType::new_string();
@@ -396,6 +644,17 @@ fn function_field_type(
         },
         "length" | "char_length" | "character_length" | "octet_length" | "instr" | "locate"
         | "position" | "bit_length" | "unix_timestamp_of" => FieldType::new_longlong(),
+        // TiDB `TIMESTAMPADD(unit, interval, datetime_expr)`: a DATETIME. Its
+        // first argument is a unit keyword, so the fallback on the first
+        // argument would mis-type it as an (unindexable) string.
+        "timestampadd" => FieldType {
+            tp: sealdb_types::TYPE_DATETIME,
+            flen: 19,
+            decimal: arg_fsp(&f.args, info, index_name, text),
+            ..FieldType::default()
+        },
+        // TiDB `TIMESTAMPDIFF(unit, dt1, dt2)`: a signed integer.
+        "timestampdiff" => FieldType::new_longlong(),
         _ => {
             // Unknown function: fall back to its first argument's type, which is
             // what TiDB's `inferType4FuncCast` does for builtins returning

@@ -900,6 +900,11 @@ pub struct BinaryOpExpr {
 
 impl BinaryOpExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        // TiDB `RestoreBracketAroundBinaryOperation` (non-transactional DML
+        // split statements) wraps the whole operation in parentheses.
+        if ctx.brackets_binary() {
+            ctx.write_str("(");
+        }
         self.left.restore(ctx)?;
         // TiDB view restore writes `a=1` / `a+1` (no spaces) but keeps word
         // operators spaced (` AND ` / ` OR ` / ` XOR `).
@@ -914,7 +919,11 @@ impl BinaryOpExpr {
         if word || !ctx.in_view() {
             ctx.write_str(" ");
         }
-        self.right.restore(ctx)
+        self.right.restore(ctx)?;
+        if ctx.brackets_binary() {
+            ctx.write_str(")");
+        }
+        Ok(())
     }
 }
 

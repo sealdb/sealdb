@@ -1,21 +1,23 @@
 use sealdb_config::Config;
 use sealdb_domain::{Domain, SchemaSnap};
-use sealdb_errno::{Error, Result};
+use sealdb_errno::{ERR_BAD_FIELD, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_executor::{DDLExec, ExecutorBuilder, QueryResult};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::IsolationLevel;
 use sealdb_meta::{ClusteredIndexMode, with_clustered_index_mode, with_enable_check_constraint};
 use sealdb_parser::Parser;
 use sealdb_parser::ast::ddl::TableName;
-use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode};
+use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, ValueExpr};
 use sealdb_parser::ast::{
     CommonTableExpression, CteMaterialize, ExplainFormat, InsertStmt,
     IsolationLevel as AstIsolation, PrivilegeType, SelectStmt, SetVarScope, Statement,
     UserIdentity, WithClause,
 };
 use sealdb_parser::charset::Collation;
+use sealdb_parser::format::RestoreCtx;
 use sealdb_planner::{PartitionPruneMode, PhysicalPlan, PlanBuilder, normalize_prep_cache_key};
 use sealdb_sessiontxn::TxnManager;
+use sealdb_types::Datum;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -169,6 +171,9 @@ pub struct Session {
     enable_auto_increment_in_generated: Mutex<bool>,
     /// TiDB `tidb_enable_strict_not_null_check` (default ON).
     strict_not_null_check: Mutex<bool>,
+    /// TiDB `tidb_enable_strict_double_type_check` (default ON): `DOUBLE(M)`
+    /// without a decimal count is a syntax error.
+    strict_double_type_check: Mutex<bool>,
     /// TiDB `tidb_enable_external_ts_read` (default OFF): when ON, a new read
     /// snapshot is pinned at `tidb_external_ts`.
     enable_external_ts_read: Mutex<bool>,
@@ -230,6 +235,13 @@ pub struct Session {
     /// `SET RESOURCE GROUP` / `RESOURCE_GROUP()` hint: the group this session
     /// currently runs in (TiDB `sessionctx.Context.GetSessionVars().StmtCtx.ResourceGroupName`).
     resource_group: Mutex<String>,
+    /// TiDB `tidb_enable_legacy_instance_scope` (default ON): while set, a
+    /// `SET SESSION` on an instance-scope variable (`tidb_general_log`) is
+    /// redirected to `SET GLOBAL` with warning 8142.
+    enable_legacy_instance_scope: Mutex<bool>,
+    /// TiDB `tidb_tmp_table_max_size` (default 64MB): the session's cap on the
+    /// encoded size of a temporary table. `None` follows the global value.
+    tmp_table_max_size: Mutex<Option<u64>>,
 }
 
 impl Session {
@@ -287,6 +299,12 @@ impl Session {
             write_row_id: Mutex::new(false),
             enable_auto_increment_in_generated: Mutex::new(false),
             strict_not_null_check: Mutex::new(true),
+            strict_double_type_check: Mutex::new(
+                globals
+                    .overrides
+                    .get("tidb_enable_strict_double_type_check")
+                    .is_none_or(|value| !value.eq_ignore_ascii_case("OFF")),
+            ),
             enable_external_ts_read: Mutex::new(globals.enable_external_ts_read),
             external_ts: Mutex::new(None),
             cost_model_version: Mutex::new(2),
@@ -308,6 +326,8 @@ impl Session {
             sysvar_overrides: Mutex::new(HashMap::new()),
             stmt_sysvar_overrides: Mutex::new(HashMap::new()),
             resource_group: Mutex::new("default".to_string()),
+            enable_legacy_instance_scope: Mutex::new(true),
+            tmp_table_max_size: Mutex::new(None),
         }
     }
 
@@ -332,7 +352,8 @@ impl Session {
     /// separately from the matched account host).
     pub fn set_login_host(&self, host: impl Into<String>) {
         let host = host.into();
-        *self.login_host.lock().expect("session login_host lock") = (!host.is_empty()).then_some(host);
+        *self.login_host.lock().expect("session login_host lock") =
+            (!host.is_empty()).then_some(host);
     }
 
     /// Host to report in access-denied errors, falling back to the account host.
@@ -395,22 +416,8 @@ impl Session {
         if let Some(result) = self.show_bindings_result(sql) {
             return Ok(vec![result]);
         }
-        if let Some((inner, limit)) = split_batch_sql(sql) {
-            let mut results = self.execute_all(inner)?;
-            let mut result = results.pop().unwrap_or_else(empty_result);
-            let jobs = if result.affected_rows == 0 {
-                1
-            } else {
-                result.affected_rows.div_ceil(limit.max(1))
-            };
-            result.columns = vec!["number of jobs".to_string(), "job status".to_string()];
-            result.rows = vec![vec![
-                sealdb_types::Datum::I64(jobs as i64),
-                sealdb_types::Datum::Bytes(b"all succeeded".to_vec()),
-            ]];
-            result.affected_rows = 0;
-            result.info.clear();
-            return Ok(vec![result]);
+        if let Some(batch) = parse_batch_dml(sql) {
+            return self.execute_batch_dml(batch);
         }
         let mode = self.sql_mode.lock().expect("session sql_mode lock").clone();
         // `SHOW CREATE TABLE` quotes identifiers with `"` under `ANSI_QUOTES`.
@@ -471,7 +478,7 @@ impl Session {
         let single_stmt_text = (stmts.len() == 1).then(|| sql.trim().to_string());
         for stmt in stmts {
             // `/*+ SET_VAR(var=value) */` applies to this statement only.
-            let previous_sql_mode = self.begin_set_var_hint(sql);
+            let (set_var_state, set_var_warnings) = self.begin_set_var_hint(sql);
             *self
                 .current_stmt_sql
                 .lock()
@@ -496,7 +503,7 @@ impl Session {
             };
             // TiDB reports these while parsing: 8066 for a `/*+ … */` block in
             // a position MySQL does not accept, 8061 for an unknown hint name.
-            let hint_warnings = single_stmt_text
+            let mut hint_warnings = single_stmt_text
                 .as_deref()
                 .map(sealdb_parser::sqlparser_bridge::hint_warnings)
                 .unwrap_or_default();
@@ -527,15 +534,18 @@ impl Session {
                 }
                 result?
             };
-            self.end_set_var_hint(previous_sql_mode);
-            if !hint_warnings.is_empty() {
-                let mut warnings = hint_warnings;
+            self.end_set_var_hint(set_var_state);
+            {
+                let mut warnings = set_var_warnings;
+                warnings.append(&mut hint_warnings);
                 warnings.append(&mut result.warnings);
                 result.warnings = warnings;
             }
             if let Some(warning) = noop_warning {
                 result.warnings.push(warning);
             }
+            // TiDB resets the warning buffer at the start of every statement, so
+            // a statement that produced warnings replaces the previous list.
             if !result.warnings.is_empty() {
                 *self
                     .last_warnings
@@ -615,10 +625,14 @@ impl Session {
     /// (the parser/executor read it directly); `group_concat_max_len` rides the
     /// executor's thread-local; every other variable lands in
     /// [`Self::stmt_sysvar_overrides`] so `SELECT @@name` sees it.
-    fn begin_set_var_hint(&self, sql: &str) -> Option<SetVarHintState> {
+    ///
+    /// Mirrors TiDB's hint validation: an unknown variable is skipped with
+    /// warning 3128, a duplicated variable is ignored with warning 3126, and a
+    /// value the sysvar rejects is skipped with that sysvar's warning.
+    fn begin_set_var_hint(&self, sql: &str) -> (Option<SetVarHintState>, Vec<(i32, String)>) {
         let pairs = set_var_hint_pairs(sql);
         if pairs.is_empty() {
-            return None;
+            return (None, Vec::new());
         }
         SET_VAR_PREV_GCML.with(|c| c.set(Some(sealdb_executor::aggfuncs::group_concat_max_len())));
         let mut state = SetVarHintState {
@@ -626,6 +640,8 @@ impl Session {
             previous_overrides: Vec::new(),
         };
         let mut sql_mode = None;
+        let mut warnings = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         {
             let mut overrides = self
                 .stmt_sysvar_overrides
@@ -633,7 +649,32 @@ impl Session {
                 .expect("session stmt sysvar overrides lock");
             for (name, raw) in pairs {
                 let lname = name.trim().to_ascii_lowercase();
-                let value = raw.trim().trim_matches(|c| c == '\'' || c == '"');
+                let raw_value = raw.trim().trim_matches(|c| c == '\'' || c == '"');
+                // TiDB warns 3128 for a name that is not a known sysvar. Any
+                // `tidb_*` name is accepted: the table below only lists the
+                // variables with observable behaviour.
+                if show_variable_kind(&lname).is_none() && !lname.starts_with("tidb_") {
+                    warnings.push((3128, format!("Unresolved name '{lname}' for SET_VAR hint")));
+                    continue;
+                }
+                if seen.iter().any(|known| *known == lname) {
+                    warnings.push((
+                        3126,
+                        format!(
+                            "Hint SET_VAR({lname}={raw_value}) is ignored as conflicting/duplicated."
+                        ),
+                    ));
+                    continue;
+                }
+                seen.push(lname.clone());
+                let value = match validate_set_var_hint_value(&lname, raw_value) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => continue,
+                    Err(warning) => {
+                        warnings.push(warning);
+                        continue;
+                    }
+                };
                 match lname.as_str() {
                     "group_concat_max_len" => {
                         if let Ok(len) = value.parse::<usize>() {
@@ -641,11 +682,11 @@ impl Session {
                         }
                         continue;
                     }
-                    "sql_mode" => sql_mode = Some(value.to_string()),
+                    "sql_mode" => sql_mode = Some(value.clone()),
                     _ => {}
                 }
                 let kind = show_variable_kind(&lname).unwrap_or(VarKind::Text);
-                let shown = normalize_show_variable_value(kind, value);
+                let shown = normalize_show_variable_value(kind, &value);
                 state
                     .previous_overrides
                     .push((lname.clone(), overrides.insert(lname, shown)));
@@ -655,7 +696,7 @@ impl Session {
             let mut slot = self.sql_mode.lock().expect("session sql_mode lock");
             state.previous_sql_mode = Some(std::mem::replace(&mut *slot, mode));
         }
-        Some(state)
+        (Some(state), warnings)
     }
 
     fn end_set_var_hint(&self, state: Option<SetVarHintState>) {
@@ -684,12 +725,62 @@ impl Session {
         }
     }
 
+    /// Effective `tidb_tmp_table_max_size` for this session: an explicit
+    /// session value wins, otherwise the global value, otherwise TiDB's 64MB
+    /// default. Temporary-table inserts compare their encoded footprint to it.
+    fn tmp_table_max_size(&self) -> Option<u64> {
+        if let Some(value) = *self
+            .tmp_table_max_size
+            .lock()
+            .expect("session tmp table max size lock")
+        {
+            return Some(value);
+        }
+        read_session_sysvar(self, "tidb_tmp_table_max_size")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .or(Some(DEFAULT_TMP_TABLE_MAX_SIZE))
+    }
+
+    /// TiDB refuses `INDEX_MERGE` on a local temporary table (`indexmerge_path.go`
+    /// clears the hint and warns with 1105).
+    fn temp_index_merge_warnings(&self, stmt: &Statement, current_db: &str) -> Vec<(i32, String)> {
+        let hints = named_index_optimizer_hints(statement_hint_text(stmt), "use_index_merge");
+        if hints.is_empty() {
+            return Vec::new();
+        }
+        let db = current_db.to_ascii_lowercase();
+        let temps = self.temp_tables.lock().expect("session temp tables lock");
+        let globals = self
+            .temp_tables_on_commit_delete
+            .lock()
+            .expect("session temp tables on commit lock");
+        let hits_local_temp = hints.iter().any(|(table, _)| {
+            let key = (db.clone(), table.to_ascii_lowercase());
+            temps.contains_key(&key) && !globals.contains(&key)
+        });
+        if hits_local_temp {
+            vec![(
+                1105,
+                "IndexMerge is inapplicable or disabled. Cannot use IndexMerge on temporary table."
+                    .to_string(),
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// `CREATE TEMPORARY TABLE`: keep the definition session-local and give it
     /// a synthetic table id so its rows never collide with a catalog table.
     fn create_temporary_table(
         &self,
         create: &sealdb_parser::ast::ddl::CreateTableStmt,
     ) -> Result<QueryResult> {
+        // These session-local paths bypass the generic executor warning reset,
+        // so a fresh statement starts with an empty warning list.
+        self.last_warnings
+            .lock()
+            .expect("session last_warnings lock")
+            .clear();
         if create.select.is_some() {
             return Err(Error::unsupported("CREATE TEMPORARY TABLE ... AS SELECT"));
         }
@@ -749,8 +840,10 @@ impl Session {
                     def.id = next_temp_table_id();
                 }
             }
-            // Temporary tables cannot carry AFFINITY (TiDB drops it on LIKE).
+            // Temporary tables cannot carry AFFINITY (TiDB drops it on LIKE);
+            // they also never inherit the base table's placement policy.
             info.affinity.clear();
+            info.placement_policy = None;
             info
         } else {
             sealdb_ddl::build_table_info(create, next_temp_table_id())?
@@ -833,50 +926,108 @@ impl Session {
         Ok(result)
     }
 
-    /// `DROP TEMPORARY TABLE`: only session-local definitions are affected;
-    /// their rows are removed from storage.
+    /// `DROP [GLOBAL] TEMPORARY TABLE`: only the matching kind of session
+    /// temporary table is affected; the definition is removed and its rows are
+    /// deleted from storage. Like TiDB, the statement is all-or-nothing: a name
+    /// that is missing (or of the other temporary kind) fails the statement
+    /// without dropping anything.
     fn drop_temporary_tables(
         &self,
         drop: &sealdb_parser::ast::ddl::DropTableStmt,
     ) -> Result<QueryResult> {
+        // See `create_temporary_table`: reset the warning list here too.
+        self.last_warnings
+            .lock()
+            .expect("session last_warnings lock")
+            .clear();
         let current_db = self
             .current_db
             .lock()
             .expect("session current_db lock")
             .clone();
-        let mut removed = Vec::new();
-        for name in &drop.tables {
-            let (schema, table) = name.qualified(&current_db);
-            if schema.is_empty() {
-                if drop.if_exists {
+        let global = drop.global_temporary;
+        // TiDB preprocess `checkDropTemporaryTableGrammar`: `DROP GLOBAL
+        // TEMPORARY TABLE` refuses any existing table that is not a global
+        // temporary table (8007) before the missing-name handling runs.
+        if global {
+            let temps = self.temp_tables.lock().expect("session temp tables lock");
+            for name in &drop.tables {
+                let (schema, table) = name.qualified(&current_db);
+                if schema.is_empty() {
                     continue;
                 }
-                return Err(Error::new(sealdb_errno::ERR_NO_DB, "No database selected"));
-            }
-            let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
-            match self
-                .temp_tables
-                .lock()
-                .expect("session temp tables lock")
-                .remove(&key)
-            {
-                Some(info) => {
-                    self.temp_tables_on_commit_delete
-                        .lock()
-                        .expect("session temp tables on commit lock")
-                        .remove(&key);
-                    removed.push(info);
-                }
-                None if drop.if_exists => sealdb_expression::note_warning(
-                    sealdb_errno::ERR_BAD_TABLE,
-                    format!("Unknown table '{schema}.{table}'"),
-                ),
-                None => {
+                let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+                let non_global = match temps.get(&key) {
+                    Some(info) => !info.on_commit_delete_rows,
+                    None => self
+                        .domain
+                        .infoschema()
+                        .table_by_name(&schema, &table)
+                        .is_some(),
+                };
+                if non_global {
                     return Err(Error::new(
-                        sealdb_errno::ERR_BAD_TABLE,
-                        format!("Unknown table '{schema}.{table}'"),
+                        sealdb_errno::ERR_DROP_TABLE_ON_TEMPORARY_TABLE,
+                        "`drop global temporary table` can only drop global temporary table",
                     ));
                 }
+            }
+        }
+        let mut to_remove: Vec<((String, String), sealdb_meta::TableInfo)> = Vec::new();
+        let mut missing = Vec::new();
+        {
+            let temps = self.temp_tables.lock().expect("session temp tables lock");
+            for name in &drop.tables {
+                let (schema, table) = name.qualified(&current_db);
+                if schema.is_empty() {
+                    if drop.if_exists {
+                        continue;
+                    }
+                    return Err(Error::new(sealdb_errno::ERR_NO_DB, "No database selected"));
+                }
+                let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+                match temps.get(&key) {
+                    Some(info) if info.on_commit_delete_rows == global => {
+                        to_remove.push((key, info.clone()));
+                    }
+                    _ => missing.push(format!("{schema}.{table}")),
+                }
+            }
+        }
+        if !missing.is_empty() {
+            // TiDB reports every leftover name in one message, joined by
+            // commas: `Unknown table 'db.a,db.b'`. Nothing is dropped.
+            let joined = missing.join(",");
+            if drop.if_exists {
+                // The early-return temporary-table path bypasses the generic
+                // warning capture, so record the note on the result directly.
+                let mut result = empty_result();
+                result.warnings.push((
+                    sealdb_expression::NOTE_WARNING_BASE + sealdb_errno::ERR_BAD_TABLE,
+                    format!("Unknown table '{joined}'"),
+                ));
+                *self
+                    .last_warnings
+                    .lock()
+                    .expect("session last_warnings lock") = result.warnings.clone();
+                return Ok(result);
+            }
+            return Err(Error::new(
+                sealdb_errno::ERR_BAD_TABLE,
+                format!("Unknown table '{joined}'"),
+            ));
+        }
+        let mut removed = Vec::with_capacity(to_remove.len());
+        {
+            let mut temps = self.temp_tables.lock().expect("session temp tables lock");
+            let mut on_commit = self
+                .temp_tables_on_commit_delete
+                .lock()
+                .expect("session temp tables on commit lock");
+            for (key, info) in to_remove {
+                temps.remove(&key);
+                on_commit.remove(&key);
+                removed.push(info);
             }
         }
         let storage = self.domain.storage();
@@ -973,26 +1124,27 @@ impl Session {
 
     /// Add this session's temporary tables (those in `current_db`) to the
     /// planning catalog under their reserved schema.
-    fn overlay_temp_tables(&self, is: &mut InfoSchema, current_db: &str) {
-        let db = current_db.to_ascii_lowercase();
+    fn overlay_temp_tables(&self, is: &mut InfoSchema, _current_db: &str) {
         let temps = self.temp_tables.lock().expect("session temp tables lock");
-        for ((schema, _), info) in temps.iter() {
-            if *schema == db {
-                is.insert_temp_table(TEMP_TABLE_SCHEMA, info.clone());
-            }
+        // Every session temporary table is visible under the reserved schema:
+        // unqualified references to the session's current database and
+        // qualified references to other databases are both rewritten there.
+        for info in temps.values() {
+            is.insert_temp_table(TEMP_TABLE_SCHEMA, info.clone());
         }
     }
 
     /// Publish this session's temporary tables for `Domain::infoschema`, which
     /// executors consult while the statement runs.
-    fn publish_temp_tables(&self, current_db: &str) -> TempTablesGuard {
-        let db = current_db.to_ascii_lowercase();
+    fn publish_temp_tables(&self, _current_db: &str) -> TempTablesGuard {
         let temps = self.temp_tables.lock().expect("session temp tables lock");
         let mut map = HashMap::new();
-        for ((schema, name), info) in temps.iter() {
-            if *schema == db {
-                map.insert((TEMP_TABLE_SCHEMA.to_string(), name.clone()), info.clone());
-            }
+        // Temporary tables shadow same-named permanent tables inside their own
+        // database, so they are published under the reserved schema. Tables
+        // created in another database are published too: qualified references
+        // (`db2.tmp`) are rewritten to the reserved schema.
+        for ((_, name), info) in temps.iter() {
+            map.insert((TEMP_TABLE_SCHEMA.to_string(), name.clone()), info.clone());
         }
         sealdb_infoschema::infoschema::set_thread_temp_tables(map);
         TempTablesGuard
@@ -1129,6 +1281,89 @@ impl Session {
             && drop.temporary
         {
             return self.drop_temporary_tables(drop);
+        }
+        // `TRUNCATE TABLE` on a session temporary table clears its rows; the
+        // persisted DDL path cannot see the table, so handle it here.
+        if let Statement::TruncateTable(truncate) = stmt {
+            let current_db = self
+                .current_db
+                .lock()
+                .expect("session current_db lock")
+                .clone();
+            let (schema, table) = truncate.table.qualified(&current_db);
+            if !schema.is_empty() {
+                let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+                let info = self
+                    .temp_tables
+                    .lock()
+                    .expect("session temp tables lock")
+                    .get(&key)
+                    .cloned();
+                if let Some(info) = info {
+                    self.last_warnings
+                        .lock()
+                        .expect("session last_warnings lock")
+                        .clear();
+                    // Inside an explicit transaction the rows may still be
+                    // pending on this session's txn handle; delete through it
+                    // so the uncommitted insert disappears as well.
+                    let handle = self.txn.lock().expect("session txn lock").handle();
+                    match handle {
+                        Some(handle) => {
+                            handle.with_txn(|txn| {
+                                sealdb_ddl::clear_table_keys_in_txn(txn, &info.physical_ids())
+                            })?;
+                        }
+                        None => {
+                            sealdb_ddl::clear_table_keys(
+                                self.domain.storage().as_ref(),
+                                &info.physical_ids(),
+                            )?;
+                        }
+                    }
+                    return Ok(empty_result());
+                }
+            }
+        }
+        // TiDB rejects ALTER TABLE on a local temporary table (8200) and any
+        // placement option on a temporary table (8006). The persisted DDL path
+        // cannot see session temporary tables, so check them here.
+        if let Statement::AlterTable(alter) = stmt {
+            let current_db = self
+                .current_db
+                .lock()
+                .expect("session current_db lock")
+                .clone();
+            let (schema, table) = alter.table.qualified(&current_db);
+            if !schema.is_empty() {
+                let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+                let temp = self
+                    .temp_tables
+                    .lock()
+                    .expect("session temp tables lock")
+                    .get(&key)
+                    .cloned();
+                if let Some(info) = temp {
+                    if !info.on_commit_delete_rows {
+                        return Err(sealdb_errno::Error::new(
+                            sealdb_errno::ERR_UNSUPPORTED_DDL_OPERATION,
+                            "TiDB doesn't support ALTER TABLE for local temporary table",
+                        ));
+                    }
+                    if alter.specs.iter().any(|spec| {
+                        matches!(
+                            spec,
+                            sealdb_parser::ast::AlterTableSpec::TableOption { name, .. }
+                                if name.eq_ignore_ascii_case("PLACEMENT_POLICY")
+                        )
+                    }) {
+                        return Err(sealdb_errno::Error::new(
+                            sealdb_errno::ERR_OPT_ON_TEMPORARY_TABLE,
+                            "`placement` is unsupported on temporary tables.",
+                        ));
+                    }
+                }
+            }
         }
         match stmt {
             Statement::Use(use_stmt) => {
@@ -1613,6 +1848,9 @@ impl Session {
                 let using = resolve_exec_params(self, &exec.using)?;
                 let bound = bind_sql(&prepared.sql, &using)?;
                 let inner = self.parser.parse_one_stmt(&bound)?;
+                // A `SET_VAR` hint inside the prepared text applies to this
+                // execution only, exactly like an inline statement.
+                let (set_var_state, set_var_warnings) = self.begin_set_var_hint(&bound);
                 // MVB: still plan/execute the bound SQL, but cache under the
                 // unbound `?` template so different USING literals share one entry.
                 //
@@ -1658,6 +1896,13 @@ impl Session {
                     .lock()
                     .expect("session current stmt sql lock") = prepared.sql.clone();
                 let result = self.execute_one(&inner);
+                self.end_set_var_hint(set_var_state);
+                let result = result.map(|mut query_result| {
+                    let mut warnings = set_var_warnings;
+                    warnings.append(&mut query_result.warnings);
+                    query_result.warnings = warnings;
+                    query_result
+                });
                 *self
                     .current_stmt_sql
                     .lock()
@@ -1956,10 +2201,12 @@ impl Session {
         }
         // TiDB `DROP TABLE` drops a same-named session-local temporary table
         // (it shadows the permanent one); the remaining names keep the
-        // persisted DDL path.
+        // persisted DDL path. `DROP VIEW` always targets the permanent view:
+        // a temporary table never shadows the view namespace.
         let mut drop_owned = None;
         if let Statement::DropTable(drop) = stmt
             && !drop.temporary
+            && !drop.is_view
         {
             let mut remaining = Vec::new();
             let mut dropped = false;
@@ -2090,14 +2337,25 @@ impl Session {
             mdl_guard.active = false;
             return self.execute_one(&Statement::Insert(insert));
         }
+        // `@@global.x` / `@@session.x` must respect the variable's declared
+        // scope (TiDB 1238); done before substitution so the error surfaces
+        // instead of the reference collapsing to NULL.
+        if let Statement::Select(select) = &expanded {
+            check_sysvar_scopes(select)?;
+        }
         if needs_user_var_subst(&expanded) {
             expanded = subst_user_vars_in_stmt(self, &expanded);
-        }
-        // TiDB `init exec`: an uncorrelated scalar subquery is evaluated once
+        } // TiDB `init exec`: an uncorrelated scalar subquery is evaluated once
         // during optimization, so `EXPLAIN` shows its value instead of an
         // `Apply`.
         fold_explain_scalar_subqueries(self, &mut expanded, &is, &current_db)?;
+        // TiDB `TryAddExtraLimit`: `sql_select_limit` caps a top-level SELECT or
+        // set operation that carries no LIMIT of its own (so `SELECT * FROM t`
+        // returns at most @@sql_select_limit rows). Internal statements are not
+        // routed through here, matching TiDB's restricted-SQL exemption.
+        apply_sql_select_limit(self, &mut expanded);
         let stmt = &expanded;
+        let temp_hint_warnings = self.temp_index_merge_warnings(stmt, &current_db);
         if let Some(result) = try_eval_nextval(self, stmt, &current_db)? {
             drop(mdl_guard);
             return Ok(result);
@@ -2118,7 +2376,7 @@ impl Session {
         }
         check_group_by_ambiguity(stmt)?;
         check_only_full_group_by(self, stmt, &is)?;
-        if let Some(result) = system_var_result(self, stmt) {
+        if let Some(result) = system_var_result(self, stmt)? {
             *self
                 .last_warnings
                 .lock()
@@ -2422,10 +2680,15 @@ impl Session {
             .strict_not_null_check
             .lock()
             .expect("session strict not null lock");
+        let strict_double_type = *self
+            .strict_double_type_check
+            .lock()
+            .expect("session strict double type lock");
         let enable_check = *self
             .enable_check_constraint
             .lock()
             .expect("session check constraint lock");
+        let tmp_table_limit = self.tmp_table_max_size();
         let mut result = with_clustered_index_mode(clustered_index, || {
             with_enable_check_constraint(enable_check, || {
                 sealdb_expression::with_strict_dml(strict_dml, || {
@@ -2452,10 +2715,20 @@ impl Session {
                                                                 sealdb_expression::with_strict_not_null_check(
                                                                 strict_not_null,
                                                                 || {
+                                                                sealdb_expression::with_strict_double_type_check(
+                                                                    strict_double_type,
+                                                                    || {
                                                                     sealdb_expression::with_allow_write_row_id(
                                                                         allow_write_row_id,
-                                                                        || ExecutorBuilder::run(exec),
+                                                                        || {
+                                                                            sealdb_executor::insert::with_tmp_table_max_size(
+                                                                                tmp_table_limit,
+                                                                                || ExecutorBuilder::run(exec),
+                                                                            )
+                                                                        },
                                                                     )
+                                                                    },
+                                                                )
                                                                 },
                                                             )
                                                             },
@@ -2510,6 +2783,9 @@ impl Session {
                 let mut warnings = rg_warnings;
                 warnings.extend(qr.warnings.iter().cloned());
                 qr.warnings = warnings;
+            }
+            if !temp_hint_warnings.is_empty() {
+                qr.warnings.extend(temp_hint_warnings);
             }
             // INL_JOIN / INL_HASH_JOIN / TIDB_INLJ that cannot form an IndexJoin
             // (no equijoin key, outer-side force, or no usable index) → 1815.
@@ -2828,8 +3104,7 @@ impl Session {
                 if let Some(table) = tables.iter().find(|t| {
                     t.name
                         .eq_ignore_ascii_case(column.table.as_deref().unwrap_or_default())
-                        || t
-                            .resolve_name()
+                        || t.resolve_name()
                             .eq_ignore_ascii_case(column.table.as_deref().unwrap_or_default())
                 }) {
                     check_table_level(table)?;
@@ -2893,13 +3168,8 @@ impl Session {
                 ] {
                     require(&mgr, &user, &roles, &table, &current_db, privs)?;
                 }
-                if !mgr.request_verification_with_roles(
-                    &user,
-                    &roles,
-                    "",
-                    "",
-                    PrivilegeType::FILE,
-                ) {
+                if !mgr.request_verification_with_roles(&user, &roles, "", "", PrivilegeType::FILE)
+                {
                     return Err(specific_access_denied("FILE"));
                 }
             }
@@ -2958,24 +3228,19 @@ impl Session {
                     "user",
                     PrivilegeType::UPDATE,
                 );
-                let has_system_user = mgr
-                    .request_verification_with_roles(
+                let has_system_user =
+                    mgr.request_verification_with_roles(
                         &user,
                         &roles,
                         "",
                         "",
                         PrivilegeType::SYSTEM_USER,
-                    )
-                    || mgr.request_dynamic_verification_with_roles(
-                        &user,
-                        &roles,
-                        "SYSTEM_USER",
-                    )
-                    || mgr.request_dynamic_verification_with_roles(
-                        &user,
-                        &roles,
-                        "RESTRICTED_USER_ADMIN",
-                    );
+                    ) || mgr.request_dynamic_verification_with_roles(&user, &roles, "SYSTEM_USER")
+                        || mgr.request_dynamic_verification_with_roles(
+                            &user,
+                            &roles,
+                            "RESTRICTED_USER_ADMIN",
+                        );
                 let mut system_target = false;
                 for spec in &alter.users {
                     let is_self = spec.user.username == user.username
@@ -3077,12 +3342,7 @@ impl Session {
                     if let Some(host) = self.login_host() {
                         err_user.hostname = host;
                     }
-                    return Err(access_denied(
-                        "mysql",
-                        "",
-                        PrivilegeType::SUPER,
-                        &err_user,
-                    ));
+                    return Err(access_denied("mysql", "", PrivilegeType::SUPER, &err_user));
                 }
             }
             Statement::GrantRole(_)
@@ -3337,13 +3597,7 @@ impl Session {
                         _ => None,
                     };
                     if let Some((privilege, label)) = gate
-                        && !mgr.request_verification_with_roles(
-                            &user,
-                            &roles,
-                            "",
-                            "",
-                            privilege,
-                        )
+                        && !mgr.request_verification_with_roles(&user, &roles, "", "", privilege)
                     {
                         return Err(specific_access_denied(label));
                     }
@@ -3430,9 +3684,8 @@ impl Session {
                     .map(|with| with.ctes.iter().map(|cte| cte.name.clone()).collect())
                     .unwrap_or_default();
                 let is_cte_qualifier = |qualifier: Option<&str>| {
-                    qualifier.is_some_and(|q| {
-                        cte_names.iter().any(|name| name.eq_ignore_ascii_case(q))
-                    })
+                    qualifier
+                        .is_some_and(|q| cte_names.iter().any(|name| name.eq_ignore_ascii_case(q)))
                 };
                 if let Some(target) = update.list.iter().find_map(|assign| {
                     let qualifier = assign.table.as_deref()?;
@@ -3725,19 +3978,24 @@ impl Session {
                 let is = self.infoschema();
                 let tables: Vec<&TableName> = create.select.join_tables();
                 let select = &create.select;
-                let star = select.fields.iter().any(|field| {
-                    field.expr.is_star_marker() || expr_mentions_star(&field.expr)
-                });
+                let star = select
+                    .fields
+                    .iter()
+                    .any(|field| field.expr.is_star_marker() || expr_mentions_star(&field.expr));
                 if star {
                     for table in &tables {
-                        require(&mgr, &user, &roles, table, &current_db, PrivilegeType::SELECT)?;
+                        require(
+                            &mgr,
+                            &user,
+                            &roles,
+                            table,
+                            &current_db,
+                            PrivilegeType::SELECT,
+                        )?;
                     }
                 } else {
-                    let mut exprs: Vec<&ExprNode> = select
-                        .fields
-                        .iter()
-                        .map(|field| &field.expr)
-                        .collect();
+                    let mut exprs: Vec<&ExprNode> =
+                        select.fields.iter().map(|field| &field.expr).collect();
                     exprs.extend(select.selection.iter());
                     exprs.extend(select.group_by.iter());
                     exprs.extend(select.having.iter());
@@ -3762,9 +4020,7 @@ impl Session {
                                 &column,
                                 PrivilegeType::SELECT,
                             ) {
-                                return Err(column_access_denied(
-                                    "SELECT", &column, &table, &user,
-                                ));
+                                return Err(column_access_denied("SELECT", &column, &table, &user));
                             }
                         }
                     }
@@ -3853,13 +4109,8 @@ impl Session {
             Statement::Do(_) if sealdb_parser::sqlparser_bridge::peek_admin_op() => {
                 // All `ADMIN` commands require the SUPER privilege (TiDB
                 // `buildAdmin` visitInfo).
-                if !mgr.request_verification_with_roles(
-                    &user,
-                    &roles,
-                    "",
-                    "",
-                    PrivilegeType::SUPER,
-                ) {
+                if !mgr.request_verification_with_roles(&user, &roles, "", "", PrivilegeType::SUPER)
+                {
                     return Err(sealdb_errno::Error::new(
                         8121,
                         "privilege check for 'Super' fail",
@@ -4034,9 +4285,7 @@ fn expr_mentions_star(expr: &sealdb_parser::ast::ExprNode) -> bool {
         ExprNode::Cast(c) => expr_mentions_star(&c.expr),
         ExprNode::InList(i) => expr_mentions_star(&i.expr) || i.list.iter().any(expr_mentions_star),
         ExprNode::Between(b) => {
-            expr_mentions_star(&b.expr)
-                || expr_mentions_star(&b.low)
-                || expr_mentions_star(&b.high)
+            expr_mentions_star(&b.expr) || expr_mentions_star(&b.low) || expr_mentions_star(&b.high)
         }
         ExprNode::Like(l) => expr_mentions_star(&l.expr) || expr_mentions_star(&l.pattern),
         ExprNode::IsNull(i) => expr_mentions_star(&i.expr),
@@ -4050,7 +4299,10 @@ fn expr_mentions_star(expr: &sealdb_parser::ast::ExprNode) -> bool {
         ExprNode::Window(w) => {
             w.args.iter().any(expr_mentions_star)
                 || w.spec.partition_by.iter().any(expr_mentions_star)
-                || w.spec.order_by.iter().any(|item| expr_mentions_star(&item.expr))
+                || w.spec
+                    .order_by
+                    .iter()
+                    .any(|item| expr_mentions_star(&item.expr))
         }
         ExprNode::Row(r) => r.exprs.iter().any(expr_mentions_star),
         ExprNode::Exists(_)
@@ -4124,10 +4376,7 @@ fn resolve_update_column(
 }
 
 /// Scope of a `GRANT`/`REVOKE` statement, resolved against the current DB.
-fn level_names(
-    level: &sealdb_parser::ast::GrantLevel,
-    current_db: &str,
-) -> (String, String) {
+fn level_names(level: &sealdb_parser::ast::GrantLevel, current_db: &str) -> (String, String) {
     use sealdb_parser::ast::GrantLevelType;
     match level.level {
         GrantLevelType::Global => (String::new(), String::new()),
@@ -4152,9 +4401,7 @@ fn level_names(
 
 /// Table named by `IMPORT INTO <table> [PARTITION …] FROM …` (the statement is
 /// kept as raw SQL). Returns `None` when no identifier follows `INTO`.
-fn import_into_table(
-    raw_sql: &str,
-) -> Option<sealdb_parser::ast::TableName> {
+fn import_into_table(raw_sql: &str) -> Option<sealdb_parser::ast::TableName> {
     let lower = raw_sql.to_ascii_lowercase();
     let pos = lower.find("import")?;
     let mut rest = raw_sql[pos + "import".len()..].trim_start();
@@ -4322,11 +4569,42 @@ fn split_region_result(raw_sql: &str) -> QueryResult {
     }
 }
 
-/// `BATCH [ON shard] LIMIT n <DML>`: TiDB non-transactional DML. The shard
-/// execution strategy is not implemented; the statement runs once and reports
-/// a single (or row-count/limit) successful job, which is enough for the
-/// MySQL-compatible result shape.
-fn split_batch_sql(sql: &str) -> Option<(&str, u64)> {
+/// How a `BATCH … DRY RUN` statement reports its plan instead of executing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchDryRun {
+    /// `DRY RUN`: print the first and last split DML statements.
+    Split,
+    /// `DRY RUN QUERY`: print the shard-value query.
+    Query,
+}
+
+/// Parsed `BATCH [ON shard] LIMIT n [DRY RUN [QUERY]] <DML>` statement.
+struct BatchDml {
+    /// Raw `ON` target as written: `[db.][table.]column`.
+    shard: Option<String>,
+    limit: u64,
+    dry_run: Option<BatchDryRun>,
+    inner: String,
+}
+
+/// One table referenced by the inner DML (`FROM`/`JOIN`, target or both).
+struct BatchSource {
+    schema: String,
+    table: String,
+    alias: Option<String>,
+}
+
+/// Result of resolving the shard column: the table it belongs to and the
+/// column reference exactly as the generated statements must print it.
+struct BatchShard {
+    source: BatchSource,
+    name: String,
+    column: Option<sealdb_meta::ColumnInfo>,
+    reference: ColumnNameExpr,
+}
+
+/// `BATCH [ON shard] LIMIT n <DML>`: parse the non-transactional DML prefix.
+fn parse_batch_dml(sql: &str) -> Option<BatchDml> {
     let s = sql.trim().trim_end_matches(';').trim();
     if !s.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("batch"))
         || s.as_bytes().get(5).is_some_and(u8::is_ascii_alphanumeric)
@@ -4338,9 +4616,9 @@ fn split_batch_sql(sql: &str) -> Option<(&str, u64)> {
     let mut search = 0;
     let pos = loop {
         let found = search + lower.get(search..)?.find("limit")?;
-        let before_ok = found > 0
-            && !after.as_bytes()[found - 1].is_ascii_alphanumeric()
-            && after.as_bytes()[found - 1] != b'_';
+        let before_ok = found == 0
+            || (!after.as_bytes()[found - 1].is_ascii_alphanumeric()
+                && after.as_bytes()[found - 1] != b'_');
         let end = found + 5;
         let after_ok = after
             .as_bytes()
@@ -4352,21 +4630,730 @@ fn split_batch_sql(sql: &str) -> Option<(&str, u64)> {
         search = end;
     };
     let shard = after[..pos].trim();
-    if !shard.is_empty() && !shard.to_ascii_lowercase().starts_with("on ") {
-        return None;
-    }
+    let shard = if shard.is_empty() {
+        None
+    } else {
+        let rest = shard[2..].trim();
+        if !shard.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("on"))
+            || rest.is_empty()
+            || !shard.as_bytes()[2].is_ascii_whitespace()
+        {
+            return None;
+        }
+        Some(rest.to_string())
+    };
     let rest = after[pos + 5..].trim_start();
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
     if digits == 0 {
         return None;
     }
     let limit = rest[..digits].parse::<u64>().ok()?;
-    let inner = rest[digits..].trim_start();
-    let first = inner.split_whitespace().next()?.to_ascii_lowercase();
+    let mut rest = rest[digits..].trim_start();
+    let mut dry_run = None;
+    if rest.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("dry")) {
+        let after_dry = rest[3..].trim_start();
+        if !after_dry
+            .get(..3)
+            .is_some_and(|p| p.eq_ignore_ascii_case("run"))
+        {
+            return None;
+        }
+        let after_run = after_dry[3..].trim_start();
+        if after_run
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("query"))
+            && after_run
+                .as_bytes()
+                .get(5)
+                .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+        {
+            dry_run = Some(BatchDryRun::Query);
+            rest = after_run[5..].trim_start();
+        } else {
+            dry_run = Some(BatchDryRun::Split);
+            rest = after_run;
+        }
+    }
+    let first = rest.split_whitespace().next()?.to_ascii_lowercase();
     if !matches!(first.as_str(), "delete" | "update" | "insert" | "replace") {
         return None;
     }
-    Some((inner, limit))
+    Some(BatchDml {
+        shard,
+        limit,
+        dry_run,
+        inner: rest.to_string(),
+    })
+}
+
+/// Split `[db.][table.]column` into its path components (backquotes stripped).
+fn batch_shard_spec(spec: &str) -> Vec<String> {
+    spec.split('.')
+        .map(|part| part.trim().trim_matches('`').to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn restore_batch_expr(expr: &ExprNode) -> Result<String> {
+    let mut ctx = RestoreCtx::default();
+    expr.restore(&mut ctx)?;
+    Ok(ctx.into_string())
+}
+
+/// Render a shard boundary value as the SQL literal the split statements use.
+fn batch_value_literal(datum: &Datum) -> Result<String> {
+    restore_batch_expr(&ExprNode::Value(ValueExpr {
+        datum: datum.clone(),
+    }))
+}
+
+fn restore_batch_column(column: &ColumnNameExpr) -> Result<String> {
+    restore_batch_expr(&ExprNode::Column(column.clone()))
+}
+
+/// The `WHERE` fragment selecting one job's shard range (TiDB restore shape).
+fn batch_job_condition(column: &ColumnNameExpr, start: &Datum, end: &Datum) -> Result<String> {
+    let col = restore_batch_column(column)?;
+    if *start == Datum::Null {
+        if *end == Datum::Null {
+            return Ok(format!("{col} IS NULL"));
+        }
+        let end = batch_value_literal(end)?;
+        return Ok(format!("(({col} <= {end}) OR {col} IS NULL)"));
+    }
+    let start = batch_value_literal(start)?;
+    let end = batch_value_literal(end)?;
+    Ok(format!("{col} BETWEEN {start} AND {end}"))
+}
+
+/// Resolve one table reference of the inner DML.
+fn batch_source(table: &TableName, current_db: &str) -> BatchSource {
+    let schema = table
+        .schema
+        .clone()
+        .filter(|schema| !schema.is_empty())
+        .unwrap_or_else(|| current_db.to_string());
+    BatchSource {
+        schema,
+        table: table.resolve_name().to_string(),
+        alias: table.physical.as_ref().map(|_| table.name.clone()),
+    }
+}
+
+impl BatchSource {
+    /// Name the statement uses to refer to this source (alias wins).
+    fn reference_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.table)
+    }
+}
+
+fn batch_no_such_table(schema: &str, name: &str) -> Error {
+    Error::new(
+        ERR_NO_SUCH_TABLE,
+        format!("Table '{schema}.{name}' doesn't exist"),
+    )
+}
+
+/// The optional hint comment of the original inner statement. TiDB restores it
+/// in the split statements too (after the leading DML keyword).
+fn batch_hint(sql: &str) -> Option<String> {
+    let start = sql.find("/*+")?;
+    let end = start + sql[start..].find("*/")? + 2;
+    Some(sql[start..end].to_string())
+}
+
+/// Normalize a hint the way TiDB's hint restore prints it: index names are
+/// back-quoted and the argument list keeps a trailing space
+/// (`USE_INDEX(`t` )`).
+fn normalize_batch_hint(hint: &str) -> String {
+    let body = hint.trim_start_matches("/*+").trim_end_matches("*/").trim();
+    let hint = match (body.find('('), body.rfind(')')) {
+        (Some(open), Some(close)) if close > open => {
+            let head = &body[..=open];
+            let args = body[open + 1..close]
+                .split(',')
+                .map(|arg| format!("`{}`", arg.trim().trim_matches('`')))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{head}{args} )")
+        }
+        _ => body.to_string(),
+    };
+    format!("/*+ {hint}*/")
+}
+
+impl Session {
+    /// Execute `BATCH [ON shard] LIMIT n <DML>` as TiDB non-transactional DML:
+    /// split the shard column range into batches of `n` rows and run the DML
+    /// once per batch, reporting the number of jobs.
+    fn execute_batch_dml(&self, batch: BatchDml) -> Result<Vec<QueryResult>> {
+        let current_db = self
+            .current_db
+            .lock()
+            .expect("session current_db lock")
+            .clone();
+        let autocommit = *self.autocommit.lock().expect("session autocommit lock");
+        let in_txn = self.txn.lock().expect("session txn lock").is_explicit();
+        if !autocommit || in_txn {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!(
+                    "non-transactional DML can only run in auto-commit mode. auto-commit:{autocommit}, inTxn:{in_txn}"
+                ),
+            ));
+        }
+        let stmts = self.parser.parse_sql(&batch.inner)?;
+        if stmts.len() != 1 {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                "Non-transactional DML, expecting exactly one statement",
+            ));
+        }
+        let mut stmt = stmts.into_iter().next().expect("checked length");
+        let current_db = if current_db.is_empty() {
+            match &stmt {
+                Statement::Update(update) => update
+                    .table
+                    .schema
+                    .clone()
+                    .filter(|schema| !schema.is_empty()),
+                Statement::Delete(delete) => delete
+                    .table
+                    .schema
+                    .clone()
+                    .filter(|schema| !schema.is_empty()),
+                Statement::Insert(insert) => insert
+                    .table
+                    .schema
+                    .clone()
+                    .filter(|schema| !schema.is_empty()),
+                _ => None,
+            }
+            .ok_or_else(|| Error::new(ERR_NO_DB, "No database selected"))?
+        } else {
+            current_db
+        };
+        let is = self.domain.infoschema();
+
+        // Collect the table sources and the original condition of the DML.
+        let mut sources: Vec<BatchSource> = Vec::new();
+        let original_condition: Option<ExprNode> = match &stmt {
+            Statement::Update(update) => {
+                sources.push(batch_source(&update.table, &current_db));
+                if let Some(join) = &update.join {
+                    sources.push(batch_source(&join.right, &current_db));
+                }
+                for join in &update.additional_joins {
+                    sources.push(batch_source(&join.right, &current_db));
+                }
+                if update.limit.is_some() {
+                    return Err(Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        "Non-transactional statements don't support limit",
+                    ));
+                }
+                if !update.order_by.is_empty() {
+                    return Err(Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        "Non-transactional statements don't support order by",
+                    ));
+                }
+                update.selection.clone()
+            }
+            Statement::Delete(delete) => {
+                sources.push(batch_source(&delete.table, &current_db));
+                if let Some(join) = &delete.join {
+                    sources.push(batch_source(&join.right, &current_db));
+                }
+                for join in &delete.additional_joins {
+                    sources.push(batch_source(&join.right, &current_db));
+                }
+                if delete.limit.is_some() {
+                    return Err(Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        "Non-transactional statements don't support limit",
+                    ));
+                }
+                if !delete.order_by.is_empty() {
+                    return Err(Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        "Non-transactional statements don't support order by",
+                    ));
+                }
+                delete.selection.clone()
+            }
+            Statement::Insert(insert) => {
+                let select = insert.select.as_ref().ok_or_else(|| {
+                    Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        "Non-transactional insert supports insert select stmt only",
+                    )
+                })?;
+                for table in select.join_tables() {
+                    sources.push(batch_source(table, &current_db));
+                }
+                if select.limit.is_some() {
+                    return Err(Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        "Non-transactional statements don't support limit",
+                    ));
+                }
+                if !select.order_by.is_empty() {
+                    return Err(Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        "Non-transactional statements don't support order by",
+                    ));
+                }
+                select.selection.clone()
+            }
+            _ => {
+                return Err(Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    "Unsupported DML type for non-transactional DML",
+                ));
+            }
+        };
+        if sources.is_empty() {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                "Non-transactional DML, no tables found in table refs",
+            ));
+        }
+        let source_infos = sources
+            .iter()
+            .map(|source| {
+                is.table_by_name(&source.schema, &source.table)
+                    .cloned()
+                    .ok_or_else(|| batch_no_such_table(&source.schema, &source.table))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Resolve the shard column, mirroring TiDB `selectShardColumn`.
+        let shard = self.resolve_batch_shard(&batch, &sources, &source_infos, &current_db)?;
+        if let Some(column) = &shard.column
+            && matches!(
+                column.field_type.tp,
+                sealdb_types::field_type::TYPE_ENUM | sealdb_types::field_type::TYPE_SET
+            )
+        {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                "Failed to restore the DML statement, probably because of unsupported type of the shard column",
+            ));
+        }
+
+        // The shard column of an UPDATE/INSERT cannot be assigned.
+        match &stmt {
+            Statement::Update(update) => {
+                check_batch_shard_assignment(&update.list, &shard, &sources, true)?
+            }
+            Statement::Insert(insert) => {
+                check_batch_shard_assignment(&insert.on_duplicate, &shard, &sources, false)?
+            }
+            _ => {}
+        }
+
+        // Shard values are read from the shard table with the DML condition.
+        let condition_sql = match &original_condition {
+            Some(expr) => {
+                let mut ctx = RestoreCtx::new_batch(&current_db);
+                expr.restore(&mut ctx)?;
+                ctx.into_string()
+            }
+            None => "TRUE".to_string(),
+        };
+        let shard_name = shard.name.clone();
+        let shard_table = format!("`{}`.`{}`", shard.source.schema, shard.source.table);
+        let query_sql = format!(
+            "SELECT `{shard_name}` FROM {shard_table} WHERE {condition_sql} ORDER BY IF(ISNULL(`{shard_name}`),0,1),`{shard_name}`"
+        );
+        if batch.dry_run == Some(BatchDryRun::Query) {
+            return Ok(vec![QueryResult {
+                columns: vec!["query statement".to_string()],
+                rows: vec![vec![Datum::Bytes(query_sql.into_bytes())]],
+                warnings: Vec::new(),
+                affected_rows: 0,
+                info: String::new(),
+            }]);
+        }
+        let values = with_restricted_sql(|| self.execute_stmt(&query_sql))?;
+        let values: Vec<Datum> = values
+            .rows
+            .into_iter()
+            .filter_map(|mut row| row.drain(..).next())
+            .collect();
+
+        // Group the ordered shard values into jobs like TiDB `buildShardJobs`:
+        // a job closes when it holds at least `limit` rows and the next value
+        // differs from the current range end (so equal runs stay one job).
+        let batch_size = batch.limit.max(1) as usize;
+        let mut jobs: Vec<(Datum, Datum)> = Vec::new();
+        let mut job_start = Datum::Null;
+        let mut job_end = Datum::Null;
+        let mut job_size = 0usize;
+        for value in values {
+            if job_size == 0 {
+                job_start = value.clone();
+            }
+            if job_size >= batch_size && value != job_end {
+                jobs.push((job_start.clone(), job_end.clone()));
+                job_start = value.clone();
+                job_size = 0;
+            }
+            job_end = value;
+            job_size += 1;
+        }
+        if job_size > 0 {
+            jobs.push((job_start, job_end));
+        }
+
+        let hint = batch_hint(&batch.inner).map(|hint| normalize_batch_hint(&hint));
+        let mut split_sqls = Vec::with_capacity(jobs.len());
+        let mut job_warnings: Vec<(i32, String)> = Vec::new();
+        for (index, (start, end)) in jobs.iter().enumerate() {
+            let mut condition = batch_job_condition(&shard.reference, start, end)?;
+            if let Some(original) = &original_condition {
+                let mut ctx = RestoreCtx::new_batch(&current_db);
+                original.restore(&mut ctx)?;
+                condition = format!("{condition} AND {}", ctx.into_string());
+            }
+            let mut sql = batch_split_sql(&mut stmt, &condition, &current_db)?;
+            if let Some(hint) = &hint {
+                sql = insert_batch_hint(&sql, hint);
+            }
+            if batch.dry_run == Some(BatchDryRun::Split) {
+                if index == 0 || index + 1 == jobs.len() {
+                    split_sqls.push(sql);
+                }
+            } else {
+                if std::env::var_os("SEALDB_ITEST_TRACE").is_some() {
+                    eprintln!("[trace]   split: {sql}");
+                }
+                // TiDB surfaces each job statement's warnings (e.g. `DELETE
+                // IGNORE` foreign-key 1451) on the batch result.
+                let result = with_restricted_sql(|| self.execute_stmt(&sql))?;
+                job_warnings.extend(result.warnings);
+            }
+        }
+
+        if batch.dry_run == Some(BatchDryRun::Split) {
+            return Ok(vec![QueryResult {
+                columns: vec!["split statement examples".to_string()],
+                rows: split_sqls
+                    .into_iter()
+                    .map(|sql| vec![Datum::Bytes(sql.into_bytes())])
+                    .collect(),
+                warnings: Vec::new(),
+                affected_rows: 0,
+                info: String::new(),
+            }]);
+        }
+
+        Ok(vec![QueryResult {
+            columns: vec!["number of jobs".to_string(), "job status".to_string()],
+            rows: vec![vec![
+                Datum::I64(jobs.len() as i64),
+                Datum::Bytes(b"all succeeded".to_vec()),
+            ]],
+            warnings: job_warnings,
+            affected_rows: 0,
+            info: String::new(),
+        }])
+    }
+
+    /// Resolve `BATCH ON …` / the automatic shard column to a table column.
+    fn resolve_batch_shard(
+        &self,
+        batch: &BatchDml,
+        sources: &[BatchSource],
+        source_infos: &[sealdb_meta::TableInfo],
+        current_db: &str,
+    ) -> Result<BatchShard> {
+        if let Some(spec) = &batch.shard {
+            let parts = batch_shard_spec(spec);
+            if parts.is_empty() {
+                return Err(Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    "Non-transactional DML, shard column not found",
+                ));
+            }
+            if sources.len() == 1 {
+                let name = parts.last().expect("checked non-empty").clone();
+                // TiDB keeps the reference exactly as written and resolves it
+                // against the split statement, where an aliased table is only
+                // reachable by its alias (`Unknown column … in 'where clause'`).
+                let visible = sources[0].reference_name();
+                let qualifier_ok = match parts.len() {
+                    1 => true,
+                    2 => parts[0].eq_ignore_ascii_case(visible),
+                    _ => {
+                        parts[0].eq_ignore_ascii_case(&sources[0].schema)
+                            && parts[1].eq_ignore_ascii_case(visible)
+                    }
+                };
+                if !qualifier_ok {
+                    return Err(Error::new(
+                        ERR_BAD_FIELD,
+                        format!("Unknown column '{}' in 'where clause'", parts.join(".")),
+                    ));
+                }
+                let column = batch_shard_column(&source_infos[0], &name)?;
+                let reference = batch_shard_reference(&parts, &name);
+                return Ok(BatchShard {
+                    source: clone_batch_source(&sources[0]),
+                    name,
+                    column,
+                    reference,
+                });
+            }
+            if parts.len() < 3 {
+                return Err(Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    "Non-transactional DML, shard column must be fully specified (i.e. `BATCH ON dbname.tablename.colname`) when multiple tables are involved",
+                ));
+            }
+            let (db, table, name) = (parts[0].clone(), parts[1].clone(), parts[2].clone());
+            let position = sources.iter().position(|source| {
+                source.schema.eq_ignore_ascii_case(&db)
+                    && source.reference_name().eq_ignore_ascii_case(&table)
+            });
+            let Some(position) = position else {
+                return Err(Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    format!(
+                        "Non-transactional DML, shard column {}.{}.{} is not in the tables involved in the join",
+                        db.to_ascii_lowercase(),
+                        table.to_ascii_lowercase(),
+                        name.to_ascii_lowercase()
+                    ),
+                ));
+            };
+            let column = batch_shard_column(&source_infos[position], &name)?;
+            let reference = ColumnNameExpr {
+                schema: Some(db),
+                table: Some(table),
+                name: name.clone(),
+            };
+            return Ok(BatchShard {
+                source: clone_batch_source(&sources[position]),
+                name,
+                column,
+                reference,
+            });
+        }
+
+        // No `ON`: auto-detect from the leftmost table (TiDB
+        // `selectShardColumnAutomatically`).
+        let info = &source_infos[0];
+        let (name, column) = if info.pk_is_handle || info.common_handle {
+            let primary = info
+                .indices
+                .iter()
+                .find(|index| index.primary)
+                .ok_or_else(|| {
+                    Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        "Non-transactional DML, the clustered index is not found",
+                    )
+                })?;
+            if primary.columns.len() != 1 {
+                return Err(Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    "Non-transactional DML, the clustered index contains multiple columns. Please specify a shard column",
+                ));
+            }
+            let name = primary.columns[0].name.o().to_string();
+            let column = info
+                .columns
+                .iter()
+                .find(|column| !column.hidden && column.name.l() == name.to_ascii_lowercase())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        format!("shard column {} not found", name.to_ascii_lowercase()),
+                    )
+                })?;
+            (name, Some(column))
+        } else {
+            ("_tidb_rowid".to_string(), None)
+        };
+        let source = clone_batch_source(&sources[0]);
+        let reference = ColumnNameExpr {
+            schema: Some(source.schema.clone()),
+            table: Some(source.reference_name().to_string()),
+            name: name.clone(),
+        };
+        let _ = current_db;
+        Ok(BatchShard {
+            source,
+            name,
+            column,
+            reference,
+        })
+    }
+}
+
+fn clone_batch_source(source: &BatchSource) -> BatchSource {
+    BatchSource {
+        schema: source.schema.clone(),
+        table: source.table.clone(),
+        alias: source.alias.clone(),
+    }
+}
+
+/// Column lookup + indexed check for a given shard column.
+fn batch_shard_column(
+    info: &sealdb_meta::TableInfo,
+    name: &str,
+) -> Result<Option<sealdb_meta::ColumnInfo>> {
+    if name.eq_ignore_ascii_case("_tidb_rowid") {
+        if !info.pk_is_handle && !info.common_handle {
+            return Ok(None);
+        }
+        return Err(Error::new(
+            ERR_UNKNOWN_ERROR,
+            format!("shard column {} not found", name.to_ascii_lowercase()),
+        ));
+    }
+    let column = info
+        .columns
+        .iter()
+        .find(|column| !column.hidden && column.name.l() == name.to_ascii_lowercase())
+        .cloned();
+    let Some(column) = column else {
+        return Err(Error::new(
+            ERR_UNKNOWN_ERROR,
+            format!("shard column {} not found", name.to_ascii_lowercase()),
+        ));
+    };
+    let indexed = (info.pk_is_handle
+        && info.indices.iter().any(|index| {
+            index.primary
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|part| part.name.l() == name.to_ascii_lowercase())
+        }))
+        || info.indices.iter().any(|index| {
+            !index.invisible
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|part| part.name.l() == name.to_ascii_lowercase())
+        });
+    if !indexed {
+        return Err(Error::new(
+            ERR_UNKNOWN_ERROR,
+            format!(
+                "Non-transactional DML, shard column {} is not indexed",
+                name.to_ascii_lowercase()
+            ),
+        ));
+    }
+    Ok(Some(column))
+}
+
+/// Build the shard column reference, preserving however the user wrote it.
+fn batch_shard_reference(parts: &[String], name: &str) -> ColumnNameExpr {
+    match parts.len() {
+        1 => ColumnNameExpr {
+            schema: None,
+            table: None,
+            name: name.to_string(),
+        },
+        2 => ColumnNameExpr {
+            schema: None,
+            table: Some(parts[0].clone()),
+            name: name.to_string(),
+        },
+        _ => ColumnNameExpr {
+            schema: Some(parts[0].clone()),
+            table: Some(parts[1].clone()),
+            name: name.to_string(),
+        },
+    }
+}
+
+/// TiDB `checkUpdateShardColumn`: the shard column cannot be assigned.
+fn check_batch_shard_assignment(
+    assignments: &[sealdb_parser::ast::Assignment],
+    shard: &BatchShard,
+    sources: &[BatchSource],
+    is_update: bool,
+) -> Result<()> {
+    let mut aliased = shard.source.table.clone();
+    for source in sources {
+        if source.table.eq_ignore_ascii_case(&aliased) {
+            if let Some(alias) = &source.alias {
+                aliased = alias.clone();
+            }
+        }
+    }
+    for assignment in assignments {
+        let same_table = assignment
+            .table
+            .as_deref()
+            .is_some_and(|table| table.eq_ignore_ascii_case(&aliased))
+            || (is_update && sources.len() == 1);
+        if same_table && assignment.column.eq_ignore_ascii_case(&shard.name) {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                "Non-transactional DML, shard column cannot be updated",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Place the restored hint after the DML keyword, as TiDB hint restore does.
+fn insert_batch_hint(sql: &str, hint: &str) -> String {
+    for keyword in ["SELECT ", "UPDATE ", "DELETE "] {
+        if let Some(position) = sql.find(keyword) {
+            let at = position + keyword.len();
+            return format!("{}{} {}", &sql[..at], hint, &sql[at..]);
+        }
+    }
+    sql.to_string()
+}
+
+/// Restore the inner DML with `condition` substituted for its `WHERE` clause.
+fn batch_split_sql(stmt: &mut Statement, condition: &str, current_db: &str) -> Result<String> {
+    const MARKER: &str = "__sealdb_batch_where";
+    let marker = ExprNode::Column(ColumnNameExpr {
+        schema: None,
+        table: None,
+        name: MARKER.to_string(),
+    });
+    let mut ctx = RestoreCtx::new_batch(current_db);
+    match stmt {
+        Statement::Update(update) => {
+            update.selection = Some(marker);
+            update.restore(&mut ctx)?;
+        }
+        Statement::Delete(delete) => {
+            delete.selection = Some(marker);
+            delete.restore(&mut ctx)?;
+        }
+        Statement::Insert(insert) => {
+            let select = insert.select.as_mut().ok_or_else(|| {
+                Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    "Non-transactional insert supports insert select stmt only",
+                )
+            })?;
+            select.selection = Some(marker);
+            insert.restore(&mut ctx)?;
+        }
+        _ => {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                "Unsupported DML type for non-transactional DML",
+            ));
+        }
+    }
+    let sql = ctx.into_string();
+    Ok(sql.replace(&format!("`{MARKER}`"), condition))
 }
 
 fn show_warnings_result(session: &Session) -> QueryResult {
@@ -6150,6 +7137,91 @@ fn is_system_var_column(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -
     col.name.starts_with("@@") || col.table.as_deref().is_some_and(|t| t.starts_with('@'))
 }
 
+/// Reject `@@global.<session-only>` / `@@session.<global-only>` references with
+/// TiDB's 1238 message. A bare `@@name` is always allowed: it reads the session
+/// value, falling back to the global one.
+fn check_sysvar_scopes(select: &sealdb_parser::ast::SelectStmt) -> Result<()> {
+    fn walk(expr: &ExprNode) -> Result<()> {
+        match expr {
+            ExprNode::Column(col) if is_system_var_column(col) => {
+                let qualifier = col
+                    .table
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim_start_matches('@')
+                    .to_ascii_lowercase();
+                if matches!(qualifier.as_str(), "global" | "session" | "local") {
+                    let global = qualifier == "global";
+                    let name = col.name.trim_start_matches('@').to_ascii_lowercase();
+                    let scope = sysvar_scope(&name);
+                    if global && !scope.has_global() {
+                        return Err(sealdb_errno::Error::new(
+                            sealdb_errno::ERR_VAR_CANT_BE_READ,
+                            format!("Variable '{name}' is a SESSION variable"),
+                        ));
+                    }
+                    if !global && !scope.has_session() {
+                        return Err(sealdb_errno::Error::new(
+                            sealdb_errno::ERR_VAR_CANT_BE_READ,
+                            format!("Variable '{name}' is a GLOBAL variable"),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            ExprNode::Binary(b) => {
+                walk(&b.left)?;
+                walk(&b.right)
+            }
+            ExprNode::Unary(u) => walk(&u.expr),
+            ExprNode::Func(f) => {
+                for arg in &f.args {
+                    walk(arg)?;
+                }
+                Ok(())
+            }
+            ExprNode::Cast(c) => walk(&c.expr),
+            ExprNode::InList(i) => {
+                walk(&i.expr)?;
+                for item in &i.list {
+                    walk(item)?;
+                }
+                Ok(())
+            }
+            ExprNode::Between(b) => {
+                walk(&b.expr)?;
+                walk(&b.low)?;
+                walk(&b.high)
+            }
+            ExprNode::Like(l) => {
+                walk(&l.expr)?;
+                walk(&l.pattern)
+            }
+            ExprNode::IsNull(i) => walk(&i.expr),
+            _ => Ok(()),
+        }
+    }
+    for field in &select.fields {
+        walk(&field.expr)?;
+    }
+    if let Some(selection) = &select.selection {
+        walk(selection)?;
+    }
+    for group in &select.group_by {
+        walk(group)?;
+    }
+    if let Some(having) = &select.having {
+        walk(having)?;
+    }
+    for order in &select.order_by {
+        walk(&order.expr)?;
+    }
+    for join in &select.joins {
+        walk(&join.on)?;
+    }
+    Ok(())
+}
+
 /// TiDB-style select-list name for expressions that mention session vars.
 fn session_var_field_name(expr: &ExprNode) -> String {
     match expr {
@@ -6725,11 +7797,40 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
             warnings.append(&mut global_warnings);
             continue;
         }
-        if is_global_only_var(&name) {
-            return Err(sealdb_errno::Error::new(
-                sealdb_errno::ERR_GLOBAL_VARIABLE,
-                format!("Variable '{name}' is a GLOBAL variable and should be set with SET GLOBAL"),
-            ));
+        match sysvar_scope(&name) {
+            SysVarScope::Global => {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_GLOBAL_VARIABLE,
+                    format!(
+                        "Variable '{name}' is a GLOBAL variable and should be set with SET GLOBAL"
+                    ),
+                ));
+            }
+            SysVarScope::Instance => {
+                // TiDB's legacy compatibility: an instance-scope variable can
+                // still be assigned through SET SESSION, but the write goes to
+                // the global scope and reports 8142.
+                let legacy = *session
+                    .enable_legacy_instance_scope
+                    .lock()
+                    .expect("session legacy instance scope lock");
+                if !legacy {
+                    return Err(sealdb_errno::Error::new(
+                        sealdb_errno::ERR_GLOBAL_VARIABLE,
+                        format!(
+                            "Variable '{name}' is a GLOBAL variable and should be set with SET GLOBAL"
+                        ),
+                    ));
+                }
+                let mut global_warnings = apply_set_global(session, &name, &value)?;
+                warnings.push((
+                    8142,
+                    format!("modifying {name} will require SET GLOBAL in a future version of TiDB"),
+                ));
+                warnings.append(&mut global_warnings);
+                continue;
+            }
+            SysVarScope::Session | SysVarScope::Both => {}
         }
         match name.as_str() {
             // TiDB rejects assignments to the transaction timestamp.
@@ -6832,6 +7933,20 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     expand_sql_mode_alias(&value)
                 };
                 *session.sql_mode.lock().expect("session sql_mode lock") = mode;
+            }
+            "tidb_tmp_table_max_size" => {
+                let (clamped, truncated) = clamp_tmp_table_max_size(&value)?;
+                if truncated {
+                    warnings.push((
+                        1292,
+                        format!("Truncated incorrect tidb_tmp_table_max_size value: '{value}'"),
+                    ));
+                }
+                *session
+                    .tmp_table_max_size
+                    .lock()
+                    .expect("session tmp table max size lock") = Some(clamped);
+                record_value = clamped.to_string();
             }
             "tidb_partition_prune_mode" => {
                 // `SET … = DEFAULT` resets to TiDB's default (dynamic).
@@ -7097,6 +8212,17 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .strict_not_null_check
                     .lock()
                     .expect("session strict not null lock") = on;
+            }
+            "tidb_enable_strict_double_type_check" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    true
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .strict_double_type_check
+                    .lock()
+                    .expect("session strict double type lock") = on;
             }
             "foreign_key_checks" => {
                 let on = if value.eq_ignore_ascii_case("DEFAULT") {
@@ -7379,6 +8505,18 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     overrides.insert("tidb_session_alias".to_string(), alias);
                 }
             }
+            // Instance-scope compatibility switch (TiDB default ON).
+            "tidb_enable_legacy_instance_scope" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    true
+                } else {
+                    parse_sysvar_flag("tidb_enable_legacy_instance_scope", &value)?
+                };
+                *session
+                    .enable_legacy_instance_scope
+                    .lock()
+                    .expect("session legacy instance scope lock") = on;
+            }
             // Fast analyze was removed in TiDB v7.5: the assignment is
             // accepted but reports the deprecation on every non-default value.
             "tidb_enable_fast_analyze" => {
@@ -7434,13 +8572,54 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
     Ok(warnings)
 }
 
-/// Variables that TiDB exposes only at `GLOBAL` scope; assigning them through
-/// `SET SESSION` is rejected with `ER_GLOBAL_VARIABLE` (1229).
-fn is_global_only_var(name: &str) -> bool {
-    matches!(
-        name,
-        "tidb_memory_usage_alarm_ratio" | "tidb_memory_usage_alarm_keep_record_num"
-    )
+/// TiDB `SysVar` scope bits. `Instance` variables are global-only unless
+/// `tidb_enable_legacy_instance_scope` redirects a session assignment.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SysVarScope {
+    Session,
+    Global,
+    Both,
+    Instance,
+}
+
+impl SysVarScope {
+    fn has_session(self) -> bool {
+        matches!(self, SysVarScope::Session | SysVarScope::Both)
+    }
+
+    fn has_global(self) -> bool {
+        matches!(
+            self,
+            SysVarScope::Global | SysVarScope::Both | SysVarScope::Instance
+        )
+    }
+}
+
+/// Scope for the system variables that have a non-default scope. Everything
+/// else is exposed at both scopes, which matches the overwhelmingly common
+/// `ScopeGlobal | ScopeSession` case in TiDB's sysvar table.
+fn sysvar_scope(name: &str) -> SysVarScope {
+    match name {
+        "warning_count"
+        | "error_count"
+        | "last_insert_id"
+        | "identity"
+        | "insert_id"
+        | "last_plan_from_cache"
+        | "last_plan_from_binding"
+        | "last_sql_use_alloc"
+        | "tidb_current_ts"
+        | "tidb_snapshot"
+        | "tidb_txn_read_ts" => SysVarScope::Session,
+        "max_connections"
+        | "tidb_tso_client_batch_max_wait_time"
+        | "tidb_enable_tso_follower_proxy"
+        | "pd_enable_follower_handle_region"
+        | "tidb_memory_usage_alarm_ratio"
+        | "tidb_memory_usage_alarm_keep_record_num" => SysVarScope::Global,
+        "tidb_general_log" | "tidb_enable_ddl" => SysVarScope::Instance,
+        _ => SysVarScope::Both,
+    }
 }
 
 /// `tidb_enable_noop_functions` state: ON silences a TiDB noop feature, WARN
@@ -7566,6 +8745,26 @@ fn render_sysvar_float(value: f64) -> String {
     }
 }
 
+/// TiDB `tidb_tmp_table_max_size` bounds (TypeUnsigned, MinValue 1MB,
+/// MaxValue 128GB) and default (64MB).
+const DEFAULT_TMP_TABLE_MAX_SIZE: u64 = 64 << 20;
+const MIN_TMP_TABLE_MAX_SIZE: i64 = 1 << 20;
+const MAX_TMP_TABLE_MAX_SIZE: i64 = 1 << 37;
+
+/// Parse a `tidb_tmp_table_max_size` operand, clamping to TiDB's declared
+/// range. The flag reports whether clamping truncated the operand (warning
+/// 1292).
+fn clamp_tmp_table_max_size(value: &str) -> Result<(u64, bool)> {
+    let parsed: i64 = value.trim().parse().map_err(|_| {
+        sealdb_errno::Error::new(
+            1232,
+            "Incorrect argument type to variable 'tidb_tmp_table_max_size'",
+        )
+    })?;
+    let clamped = parsed.clamp(MIN_TMP_TABLE_MAX_SIZE, MAX_TMP_TABLE_MAX_SIZE);
+    Ok((clamped as u64, clamped != parsed))
+}
+
 /// Domain-shared `SET GLOBAL` for the MVB variable set.
 fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i32, String)>> {
     let mut warnings = Vec::new();
@@ -7620,6 +8819,61 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
                 session
                     .domain
                     .set_global_override(name, Some(clamped.to_string()));
+                return Ok(warnings);
+            }
+        }
+        // Temporary-table memory cap: unsigned with a 1MB floor / 128GB
+        // ceiling; out-of-range operands are clamped with warning 1292.
+        "tidb_tmp_table_max_size" => {
+            if !value.eq_ignore_ascii_case("DEFAULT") {
+                let (clamped, truncated) = clamp_tmp_table_max_size(value)?;
+                if truncated {
+                    warnings.push((
+                        1292,
+                        format!("Truncated incorrect tidb_tmp_table_max_size value: '{value}'"),
+                    ));
+                }
+                session
+                    .domain
+                    .set_global_override(name, Some(clamped.to_string()));
+                return Ok(warnings);
+            }
+        }
+        // PD dynamic option: float seconds clamped to [0, 10] (TiDB type
+        // `TypeFloat, MinValue: 0, MaxValue: 10`).
+        "tidb_tso_client_batch_max_wait_time" => {
+            if !value.eq_ignore_ascii_case("DEFAULT") {
+                let parsed: f64 = value.trim().parse().map_err(|_| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!(
+                            "Variable 'tidb_tso_client_batch_max_wait_time' can't be set to the value of '{value}'"
+                        ),
+                    )
+                })?;
+                let clamped = parsed.clamp(0.0, 10.0);
+                if clamped != parsed {
+                    warnings.push((
+                        1292,
+                        format!(
+                            "Truncated incorrect tidb_tso_client_batch_max_wait_time value: '{value}'"
+                        ),
+                    ));
+                }
+                session
+                    .domain
+                    .set_global_override(name, Some(render_sysvar_float(clamped)));
+                return Ok(warnings);
+            }
+        }
+        // PD dynamic option booleans: stored as 1/0 because `@@name` reports the
+        // typed integer value.
+        "tidb_enable_tso_follower_proxy" | "pd_enable_follower_handle_region" => {
+            if !value.eq_ignore_ascii_case("DEFAULT") {
+                let on = parse_sysvar_flag(name, value)?;
+                session
+                    .domain
+                    .set_global_override(name, Some(if on { "1" } else { "0" }.to_string()));
                 return Ok(warnings);
             }
         }
@@ -7714,7 +8968,19 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
         }
         // Accepted for compatibility; only the session value gates DML.
         "allow_auto_random_explicit_insert" => {}
-        // FK feature gate: SealDB always accepts FK DDL, so the flag is a no-op.
+        // DDL-owner switch: TiDB refuses to stop when this is the only TiDB
+        // instance (nothing else could campaign); SealDB is single-node, so a
+        // disable attempt always reports 8246. Enabling stays a no-op.
+        "tidb_enable_ddl" => {
+            let on = parse_sysvar_flag("tidb_enable_ddl", value)?;
+            if !on {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_DDL_SETTING,
+                    "Error happened when disabling DDL: can not disable ddl owner when it is the only one tidb instance",
+                ));
+            }
+        }
+        // Foreign-key feature gate: SealDB always accepts FK DDL, so the flag is a no-op.
         "tidb_enable_foreign_key" => {}
         "tidb_enable_auto_increment_in_generated" => {}
         "tidb_enable_strict_not_null_check" => {}
@@ -7897,12 +9163,12 @@ fn select_touches_overlong(
     false
 }
 
-fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult> {
+fn system_var_result(session: &Session, stmt: &Statement) -> Result<Option<QueryResult>> {
     let Statement::Select(select) = stmt else {
-        return None;
+        return Ok(None);
     };
     if select.from.is_some() || !select.joins.is_empty() || select.from_item.is_some() {
-        return None;
+        return Ok(None);
     }
     // Only a bare constant list (`SELECT 1`, `SELECT @@version`) may skip the
     // planner: a filter/group/order/limit changes the row set (`SELECT 1 WHERE 0`
@@ -7916,7 +9182,7 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
         || select.distinct
         || select.with.is_some()
     {
-        return None;
+        return Ok(None);
     }
     let mut columns = Vec::new();
     let mut row = Vec::new();
@@ -7998,27 +9264,58 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
                     .map(|t| t.trim_start_matches('@').eq_ignore_ascii_case("global"))
                     .unwrap_or(false);
                 let name = col.name.trim_start_matches('@').to_ascii_lowercase();
+                // `@@global.x` / `@@session.x` must respect the variable's
+                // declared scope (TiDB 1238); a bare `@@x` reads the session
+                // value, which follows the global one when unset.
+                let has_scope_qualifier = col.table.as_deref().is_some_and(|t| {
+                    let t = t.trim_start_matches('@');
+                    t.eq_ignore_ascii_case("global")
+                        || t.eq_ignore_ascii_case("session")
+                        || t.eq_ignore_ascii_case("local")
+                });
+                if has_scope_qualifier {
+                    let scope = sysvar_scope(&name);
+                    if global && !scope.has_global() {
+                        return Err(sealdb_errno::Error::new(
+                            sealdb_errno::ERR_VAR_CANT_BE_READ,
+                            format!("Variable '{name}' is a SESSION variable"),
+                        ));
+                    }
+                    if !global && !scope.has_session() {
+                        return Err(sealdb_errno::Error::new(
+                            sealdb_errno::ERR_VAR_CANT_BE_READ,
+                            format!("Variable '{name}' is a GLOBAL variable"),
+                        ));
+                    }
+                }
                 let value = if global {
-                    read_global_sysvar(session, &name)?
+                    read_global_sysvar(session, &name)
                 } else {
-                    read_session_sysvar(session, &name)?
+                    read_session_sysvar(session, &name)
                 };
-                row.push(sealdb_types::Datum::Bytes(value.into_bytes()));
+                match value {
+                    // `SELECT @@flag` reports the typed bit value (`0`/`1`),
+                    // while `SHOW VARIABLES` keeps the textual `OFF`/`ON`.
+                    Some(value) => row.push(sealdb_types::Datum::Bytes(
+                        sysvar_select_value(&name, value).into_bytes(),
+                    )),
+                    None => row.push(sealdb_types::Datum::Null),
+                }
             }
             // Binary / func mixes (e.g. `@b + "123"`) fall through to planner.
-            _ => return None,
+            _ => return Ok(None),
         }
     }
     if columns.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(QueryResult {
+    Ok(Some(QueryResult {
         columns,
         rows: vec![row],
         warnings,
         affected_rows: 0,
         info: String::new(),
-    })
+    }))
 }
 
 fn literal_field_name(datum: &sealdb_types::Datum) -> String {
@@ -8166,6 +9463,13 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
             .expect("session collation lock")
             .charset
             .clone(),
+        "tidb_tmp_table_max_size" => {
+            return session
+                .tmp_table_max_size
+                .lock()
+                .expect("session tmp table max size lock")
+                .map(|value| value.to_string());
+        }
         "tidb_partition_prune_mode" => session
             .partition_prune_mode
             .lock()
@@ -8289,6 +9593,17 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
                 .strict_not_null_check
                 .lock()
                 .expect("session strict not null lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        "tidb_enable_strict_double_type_check" => {
+            if *session
+                .strict_double_type_check
+                .lock()
+                .expect("session strict double type lock")
             {
                 "1".into()
             } else {
@@ -8514,7 +9829,9 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
         VarKind::Flag,
     ),
     ("tidb_enable_strict_not_null_check", "ON", VarKind::Flag),
+    ("tidb_enable_strict_double_type_check", "ON", VarKind::Flag),
     ("tidb_enable_clustered_index", "ON", VarKind::Text),
+    ("tidb_enable_ddl", "ON", VarKind::Flag),
     ("tidb_enable_external_ts_read", "OFF", VarKind::Flag),
     ("tidb_enable_list_partition", "ON", VarKind::Flag),
     ("tidb_enable_non_prepared_plan_cache", "OFF", VarKind::Flag),
@@ -8703,6 +10020,44 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("tidb_runtime_filter_mode", "OFF", VarKind::Text),
     ("tidb_stats_load_sync_wait", "100", VarKind::Text),
     ("tidb_store_batch_size", "4", VarKind::Text),
+    // MySQL / TiDB variables quoted by `SET_VAR` and `@@name` fixtures.
+    ("max_connections", "0", VarKind::Text),
+    ("performance_schema_max_mutex_classes", "200", VarKind::Text),
+    ("tidb_general_log", "OFF", VarKind::Flag),
+    ("tidb_enable_legacy_instance_scope", "ON", VarKind::Flag),
+    ("tidb_tso_client_batch_max_wait_time", "0", VarKind::Text),
+    ("tidb_tmp_table_max_size", "67108864", VarKind::Text),
+    ("tidb_enable_tso_follower_proxy", "OFF", VarKind::Flag),
+    ("pd_enable_follower_handle_region", "OFF", VarKind::Flag),
+    ("bulk_insert_buffer_size", "8388608", VarKind::Text),
+    ("default_tmp_storage_engine", "InnoDB", VarKind::Text),
+    ("div_precision_increment", "4", VarKind::Text),
+    ("end_markers_in_json", "OFF", VarKind::Flag),
+    ("eq_range_index_dive_limit", "200", VarKind::Text),
+    ("join_buffer_size", "262144", VarKind::Text),
+    ("max_error_count", "64", VarKind::Text),
+    ("max_heap_table_size", "16777216", VarKind::Text),
+    ("max_join_size", "18446744073709551615", VarKind::Text),
+    ("max_length_for_sort_data", "1024", VarKind::Text),
+    ("max_points_in_geometry", "65536", VarKind::Text),
+    ("max_seeks_for_key", "18446744073709551615", VarKind::Text),
+    ("max_sort_length", "1024", VarKind::Text),
+    ("optimizer_prune_level", "1", VarKind::Text),
+    ("optimizer_search_depth", "62", VarKind::Text),
+    ("range_alloc_block_size", "4096", VarKind::Text),
+    ("read_buffer_size", "131072", VarKind::Text),
+    ("read_rnd_buffer_size", "262144", VarKind::Text),
+    ("sort_buffer_size", "262144", VarKind::Text),
+    ("sql_auto_is_null", "OFF", VarKind::Flag),
+    ("sql_big_selects", "ON", VarKind::Flag),
+    ("sql_buffer_result", "OFF", VarKind::Text),
+    ("sql_safe_updates", "OFF", VarKind::Flag),
+    ("sql_select_limit", "18446744073709551615", VarKind::Text),
+    ("tikv_client_read_timeout", "0", VarKind::Text),
+    ("tmp_table_size", "16777216", VarKind::Text),
+    ("unique_checks", "ON", VarKind::Flag),
+    ("updatable_views_with_limit", "YES", VarKind::Text),
+    ("windowing_use_high_precision", "ON", VarKind::Flag),
 ];
 
 /// Value of a sysvar when selected through `@@name` (boolean flags render as
@@ -8745,6 +10100,86 @@ fn normalize_show_variable_value(kind: VarKind, value: &str) -> String {
         }
         VarKind::Text => value.to_string(),
     }
+}
+
+/// Type validation of a `SET_VAR(name=value)` hint operand. `Ok(None)` keeps
+/// the variable out of the statement scope (TiDB silently normalizes it away),
+/// `Err` carries the warning TiDB reports before skipping the hint.
+fn validate_set_var_hint_value(
+    name: &str,
+    value: &str,
+) -> std::result::Result<Option<String>, (i32, String)> {
+    match name {
+        // TiDB's noop-function validation forces `sql_auto_is_null` back to OFF
+        // unless `tidb_enable_noop_functions = ON`.
+        "sql_auto_is_null" => Ok(Some("OFF".to_string())),
+        // `TypeInt, MinValue: 0`: a negative operand clamps to 0 with 1292; a
+        // non-numeric operand is rejected with 1232 and the hint is ignored.
+        "tikv_client_read_timeout" => match value.trim().parse::<i64>() {
+            Ok(number) if number >= 0 => Ok(Some(number.to_string())),
+            Ok(_) => Ok(Some("0".to_string())),
+            Err(_) => Err((
+                sealdb_errno::ERR_WRONG_ARGUMENTS,
+                format!("Variable '{name}' can't be set to the value of '{value}'"),
+            )),
+        },
+        _ => Ok(Some(value.to_string())),
+    }
+}
+
+/// TiDB `TryAddExtraLimit`: when `sql_select_limit` is below `u64::MAX`, add a
+/// LIMIT to a top-level SELECT / set operation that has none. A statement with
+/// its own LIMIT (`… LIMIT 2`, `… UNION … LIMIT 2`) is left untouched, and
+/// `EXPLAIN` applies the rule to its inner statement.
+fn apply_sql_select_limit(session: &Session, stmt: &mut Statement) {
+    fn add_limit(stmt: &mut Statement, limit: u64) {
+        match stmt {
+            Statement::Select(select) => {
+                if select.limit.is_none() {
+                    select.limit = Some(limit);
+                }
+            }
+            Statement::SetOpr(set) => {
+                if set.limit.is_none() {
+                    set.limit = Some(limit);
+                }
+            }
+            Statement::Explain(explain) => add_limit(&mut explain.stmt, limit),
+            _ => {}
+        }
+    }
+    if RESTRICTED_SQL.with(|flag| flag.get()) {
+        return;
+    }
+    let Some(raw) = read_session_sysvar(session, "sql_select_limit") else {
+        return;
+    };
+    let Ok(limit) = raw.trim().parse::<u64>() else {
+        return;
+    };
+    if limit == u64::MAX {
+        return;
+    }
+    add_limit(stmt, limit);
+}
+
+thread_local! {
+    /// TiDB `InRestrictedSQL`: session-internal statements (non-transactional
+    /// DML shard enumeration and split execution) never take `sql_select_limit`.
+    static RESTRICTED_SQL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` as TiDB restricted SQL, restoring the previous scope on exit.
+fn with_restricted_sql<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RESTRICTED_SQL.with(|flag| flag.set(self.0));
+        }
+    }
+    let previous = RESTRICTED_SQL.with(|flag| flag.replace(true));
+    let _restore = Restore(previous);
+    f()
 }
 
 /// Record a successful `SET <name> = <value>` for `SHOW VARIABLES` / `@@name`.
@@ -11805,15 +13240,22 @@ fn rewrite_temp_table_name(
     temps: &HashMap<(String, String), sealdb_meta::TableInfo>,
     current_db: &str,
 ) -> bool {
-    // An explicitly qualified name (`db.t`) is not shadowed: VIEW bodies rely
-    // on this, and TiDB resolves them against the permanent catalog.
-    if table.schema.is_some() || table.name.eq_ignore_ascii_case("dual") {
+    if table.name.eq_ignore_ascii_case("dual") {
         return false;
     }
-    let key = (
-        current_db.to_ascii_lowercase(),
-        table.resolve_name().to_ascii_lowercase(),
-    );
+    // VIEW bodies are expanded after this rewrite, so they keep resolving their
+    // qualified table references against the permanent catalog.
+    let key = match &table.schema {
+        Some(schema) if !schema.eq_ignore_ascii_case(TEMP_TABLE_SCHEMA) => (
+            schema.to_ascii_lowercase(),
+            table.resolve_name().to_ascii_lowercase(),
+        ),
+        Some(_) => return false,
+        None => (
+            current_db.to_ascii_lowercase(),
+            table.resolve_name().to_ascii_lowercase(),
+        ),
+    };
     if temps.contains_key(&key) {
         table.schema = Some(TEMP_TABLE_SCHEMA.to_string());
         return true;

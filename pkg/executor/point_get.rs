@@ -26,6 +26,8 @@ pub struct PointGetExec {
     txn: Arc<TxnHandle>,
     lock: RowLock,
     wait: LockWait,
+    /// Project TiDB's `_tidb_rowid` (the heap table handle) as a hidden column.
+    with_rowid: bool,
     schema: Vec<String>,
     row: Option<Vec<Datum>>,
     emitted: bool,
@@ -44,6 +46,7 @@ impl PointGetExec {
         txn: Arc<TxnHandle>,
         lock: RowLock,
         wait: LockWait,
+        with_rowid: bool,
     ) -> Self {
         Self {
             domain,
@@ -56,6 +59,7 @@ impl PointGetExec {
             txn,
             lock,
             wait,
+            with_rowid,
             schema: Vec::new(),
             row: None,
             emitted: false,
@@ -144,24 +148,31 @@ impl Executor for PointGetExec {
         } else {
             info.physical_ids()
         };
+        let expose_rowid = self.with_rowid && !info.pk_is_handle;
+        if expose_rowid {
+            self.schema.push("\u{1}_tidb_rowid".to_string());
+        }
         self.row = self.txn.with_txn(|txn| {
             for physical_id in physical_ids {
                 let key = encode_row_key_with_handle(physical_id, handle);
                 let raw = txn.get_locked(key.as_bytes(), self.lock, self.wait)?;
                 if let Some(raw) = raw {
                     let decoded = decode_row(&raw, &info.col_field_types());
-                    return Ok(Some(
-                        info.columns
-                            .iter()
-                            .map(|col| {
-                                decoded
-                                    .iter()
-                                    .find(|(id, _)| *id == col.id)
-                                    .map(|(_, v)| v.clone())
-                                    .unwrap_or(Datum::Null)
-                            })
-                            .collect(),
-                    ));
+                    let mut row: Vec<Datum> = info
+                        .columns
+                        .iter()
+                        .map(|col| {
+                            decoded
+                                .iter()
+                                .find(|(id, _)| *id == col.id)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(Datum::Null)
+                        })
+                        .collect();
+                    if expose_rowid {
+                        row.push(Datum::I64(handle));
+                    }
+                    return Ok(Some(row));
                 }
             }
             Ok(None)

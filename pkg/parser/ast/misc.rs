@@ -657,6 +657,9 @@ pub enum ShowStmtKind {
     Grants,
     CreateTable,
     CreateView,
+    /// `SHOW CREATE SEQUENCE <name>`: permanent sequence DDL. Temporary
+    /// tables never shadow the sequence namespace.
+    CreateSequence,
     CreateDatabase,
     Index,
     Charset,
@@ -669,6 +672,8 @@ pub enum ShowStmtKind {
     StatsLocked,
     /// `SHOW STATS_TOPN [WHERE …]`
     StatsTopN,
+    /// `SHOW STATS_HISTOGRAMS [WHERE …]`
+    StatsHistograms,
     /// `SHOW WARNINGS`
     Warnings,
     /// `SHOW [GLOBAL|SESSION] VARIABLES [LIKE …|WHERE …]`
@@ -766,6 +771,12 @@ impl ShowStmt {
                     table.restore(ctx)?;
                 }
             }
+            ShowStmtKind::CreateSequence => {
+                ctx.write_str("SHOW CREATE SEQUENCE ");
+                if let Some(table) = &self.table {
+                    table.restore(ctx)?;
+                }
+            }
             ShowStmtKind::CreateDatabase => {
                 ctx.write_str("SHOW CREATE DATABASE ");
                 if let Some(db) = &self.db_name {
@@ -784,6 +795,7 @@ impl ShowStmt {
             ShowStmtKind::Bindings => ctx.write_str("SHOW BINDINGS"),
             ShowStmtKind::StatsLocked => ctx.write_str("SHOW STATS_LOCKED"),
             ShowStmtKind::StatsTopN => ctx.write_str("SHOW STATS_TOPN"),
+            ShowStmtKind::StatsHistograms => ctx.write_str("SHOW STATS_HISTOGRAMS"),
             ShowStmtKind::Warnings => ctx.write_str("SHOW WARNINGS"),
             ShowStmtKind::Variables => {
                 ctx.write_str("SHOW ");

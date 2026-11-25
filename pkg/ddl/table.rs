@@ -1,13 +1,13 @@
 use crate::create_table::{
     affinity_setting, build_table_info_with_defaults, build_table_info_with_like,
-    columns_from_select, referenced_by_foreign_key, validate_ttl,
+    columns_from_select, referenced_by_foreign_key, resolve_qualified_column_name, validate_ttl,
 };
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_TABLE, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS,
     ERR_TTL_FK_REFERENCED, ERR_UNKNOWN_ERROR, ERR_WRONG_OBJECT, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
-use sealdb_kv::Storage;
+use sealdb_kv::{Storage, Transaction};
 use sealdb_meta::{Mutator, TableInfo};
 use sealdb_parser::ast::{CreateTableStmt, DropTableStmt, TableName, TruncateTableStmt};
 use sealdb_tablecodec::{encode_table_prefix, next_prefix};
@@ -19,15 +19,6 @@ pub fn create_table(
     current_db: &str,
 ) -> Result<TableInfo> {
     let (schema, table) = resolve_name(&stmt.table, current_db)?;
-    if let Some(existing) = is.table_by_name(&schema, &table) {
-        if stmt.if_not_exists {
-            return Ok(existing.clone());
-        }
-        return Err(Error::new(
-            ERR_TABLE_EXISTS,
-            format!("Table '{schema}.{table}' already exists"),
-        ));
-    }
     let db = is
         .schema_by_name(&schema)
         .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
@@ -47,6 +38,10 @@ pub fn create_table(
             && let Some(select) = built.select.as_deref()
         {
             built.cols = columns_from_select(is, select, current_db)?;
+        }
+        // TiDB `checkContainDotColumn`: `[db.]table.column` must name this table.
+        for col in &mut built.cols {
+            col.name = resolve_qualified_column_name(&col.name, &schema, &table)?;
         }
         let mut info = build_table_info_with_defaults(
             &built,
@@ -95,6 +90,18 @@ pub fn create_table(
         }
         info
     };
+    // TiDB builds the table info (validating generated columns / expression
+    // indexes) before the DDL job checks that the name is free, so a bad
+    // definition wins over "already exists".
+    if let Some(existing) = is.table_by_name(&schema, &table) {
+        if stmt.if_not_exists {
+            return Ok(existing.clone());
+        }
+        return Err(Error::new(
+            ERR_TABLE_EXISTS,
+            format!("Table '{schema}.{table}' already exists"),
+        ));
+    }
     meta.create_table_or_view(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(info)
@@ -225,6 +232,14 @@ pub fn clear_table_keys(storage: &dyn Storage, physical_ids: &[i64]) -> Result<(
         return Ok(());
     }
     let mut txn = storage.begin()?;
+    clear_table_keys_in_txn(txn.as_mut(), physical_ids)?;
+    txn.commit()
+}
+
+/// Delete every row/index key of `physical_ids` through `txn`, so a statement
+/// running inside an explicit transaction discards the rows it has not
+/// committed yet (`TRUNCATE` on a session temporary table).
+pub fn clear_table_keys_in_txn(txn: &mut dyn Transaction, physical_ids: &[i64]) -> Result<()> {
     for id in physical_ids {
         let start = encode_table_prefix(*id);
         let end = next_prefix(start.as_bytes());
@@ -233,7 +248,7 @@ pub fn clear_table_keys(storage: &dyn Storage, physical_ids: &[i64]) -> Result<(
             txn.delete(&key)?;
         }
     }
-    txn.commit()
+    Ok(())
 }
 
 pub(crate) fn resolve_name(name: &TableName, current_db: &str) -> Result<(String, String)> {

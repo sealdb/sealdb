@@ -6,7 +6,7 @@ use crate::reorg::{INDEX_REORG_STATES, is_write_reorg};
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_ENTRY, ERR_DUP_KEYNAME, ERR_NO_SUCH_TABLE,
-    ERR_UNSUPPORTED_ON_CACHE_TABLE, Error, Result,
+    ERR_TOO_MANY_KEYS, ERR_UNSUPPORTED_ON_CACHE_TABLE, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -50,6 +50,7 @@ pub fn create_index(
             clustered: false,
             invisible: stmt.invisible,
             where_clause: None,
+            fulltext: false,
         },
         stmt.if_not_exists,
         current_db,
@@ -84,6 +85,7 @@ pub fn add_index(
     current_db: &str,
     storage: &dyn Storage,
 ) -> Result<()> {
+    crate::create_table::check_index_name(&index.name, index.primary)?;
     let (schema, name) = resolve_name(table, current_db)?;
     let (db_id, mut info) = load_table(is, &schema, &name)?;
     if info
@@ -128,8 +130,14 @@ pub fn add_index(
             format!("Duplicate key name '{}'", index.name),
         ));
     }
+    if info.indices.len() >= 64 {
+        return Err(Error::new(
+            ERR_TOO_MANY_KEYS,
+            "Too many keys specified; max 64 keys allowed",
+        ));
+    }
     let (idx_cols, hidden) =
-        crate::expr_index::resolve_index_parts(&info, &index.name, &index.columns)?;
+        crate::expr_index::resolve_index_parts(&info, &index.name, &index.columns, index.primary)?;
     // Expression parts add hidden VIRTUAL columns; rows written before this
     // index lack them, so they are backfilled before the index backfill runs.
     if !hidden.is_empty() {
@@ -194,7 +202,7 @@ pub fn remove_index(
         }
         return Err(Error::new(
             ERR_CANT_DROP_FIELD_OR_KEY,
-            format!("Can't DROP '{index_name}'; check that column/key exists"),
+            format!("index {index_name} doesn't exist"),
         ));
     };
     let idx_id = info.indices[pos].id;

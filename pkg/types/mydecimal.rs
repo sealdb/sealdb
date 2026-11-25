@@ -40,6 +40,33 @@ impl MyDecimal {
         } else {
             (false, s.strip_prefix('+').unwrap_or(s))
         };
+        // TiDB's `MyDecimal.FromString` accepts a scientific-notation suffix
+        // (`1e2` is 100, `1.5e-3` is 0.0015) and applies the exponent as a
+        // decimal shift after parsing the mantissa.
+        let (rest, exponent) = match rest.find(['e', 'E']) {
+            Some(index) => {
+                let (mantissa, exp_text) = rest.split_at(index);
+                let exp_text = &exp_text[1..];
+                let (exp_negative, exp_digits) = if let Some(rest) = exp_text.strip_prefix('-') {
+                    (true, rest)
+                } else if let Some(rest) = exp_text.strip_prefix('+') {
+                    (false, rest)
+                } else {
+                    (false, exp_text)
+                };
+                if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(Error::new(
+                        ERR_TRUNCATED_WRONG_VALUE,
+                        format!("invalid decimal {s}"),
+                    ));
+                }
+                let magnitude: i64 = exp_digits.parse().map_err(|_| {
+                    Error::new(ERR_TRUNCATED_WRONG_VALUE, format!("invalid decimal {s}"))
+                })?;
+                (mantissa, if exp_negative { -magnitude } else { magnitude })
+            }
+            None => (rest, 0),
+        };
         if !rest.chars().all(|c| c.is_ascii_digit() || c == '.')
             || rest.chars().filter(|c| *c == '.').count() > 1
             || rest.is_empty()
@@ -57,12 +84,44 @@ impl MyDecimal {
         };
         let int_part = int_part.trim_start_matches('0');
         let int_part = if int_part.is_empty() { "0" } else { int_part };
-        let is_zero =
-            int_part == "0" && frac_part.is_none_or(|frac| frac.bytes().all(|b| b == b'0'));
-        let digits = match frac_part {
-            Some(frac) => format!("{int_part}.{frac}"),
-            None => int_part.to_string(),
+        let digits = if exponent == 0 {
+            match frac_part {
+                Some(frac) => format!("{int_part}.{frac}"),
+                None => int_part.to_string(),
+            }
+        } else {
+            // `scale` is the number of fractional digits after the shift; a
+            // negative scale means the value gained trailing integer zeros.
+            let frac = frac_part.unwrap_or("");
+            let scale = frac.len() as i64 - exponent;
+            if scale.unsigned_abs() > MAX_DECIMAL_EXPANSION {
+                return Err(Error::new(
+                    ERR_TRUNCATED_WRONG_VALUE,
+                    format!("decimal exponent out of range in {s}"),
+                ));
+            }
+            // Concatenate the mantissa digits and strip leading zeros; the
+            // scale (not the digit count) fixes the decimal point.
+            let mut combined: String = format!("{int_part}{frac}");
+            let trimmed = combined.trim_start_matches('0');
+            combined = if trimmed.is_empty() {
+                "0".to_string()
+            } else {
+                trimmed.to_string()
+            };
+            if scale <= 0 {
+                combined.push_str(&"0".repeat((-scale) as usize));
+                combined
+            } else {
+                let scale = scale as usize;
+                if combined.len() <= scale {
+                    combined.insert_str(0, &"0".repeat(scale - combined.len() + 1));
+                }
+                let split = combined.len() - scale;
+                format!("{}.{}", &combined[..split], &combined[split..])
+            }
         };
+        let is_zero = digits.bytes().all(|b| b == b'0' || b == b'.');
         Ok(Self {
             negative: negative && !is_zero,
             digits,
@@ -70,6 +129,10 @@ impl MyDecimal {
     }
 
     /// Unary minus on the decimal value (zero stays unsigned zero).
+    pub fn is_negative(&self) -> bool {
+        self.negative
+    }
+
     pub fn negated(&self) -> Self {
         let mut out = self.clone();
         if out.digits != "0" && out.digits != "0.0" {
@@ -427,6 +490,11 @@ fn decimal_abs_cmp(a: &str, b: &str) -> Ordering {
 /// MySQL's maximum `DECIMAL` scale.
 pub const MAX_DECIMAL_SCALE: usize = 30;
 
+/// Largest scientific-notation shift `parse` expands. MySQL's `DECIMAL`
+/// carries at most 65 digits, so anything wider is an overflow anyway; the
+/// bound keeps a hostile exponent from allocating unbounded strings.
+const MAX_DECIMAL_EXPANSION: u64 = 1024;
+
 fn strip_leading_zeros(s: &str) -> String {
     let trimmed = s.trim_start_matches('0');
     if trimmed.is_empty() {
@@ -550,6 +618,18 @@ mod arith_tests {
         assert_eq!(big.to_string(), "2.000000000000000000000000000000");
         let p = d("0.5999991229316").checked_mul(&d("0.918755041726043"));
         assert_eq!(p.with_frac(17).to_string(), "0.55125221922461136");
+    }
+
+    #[test]
+    fn scientific_notation_shifts_scale() {
+        assert_eq!(d("1e2").to_string(), "100");
+        assert_eq!(d("1.5e2").to_string(), "150");
+        assert_eq!(d("1.5e-3").to_string(), "0.0015");
+        assert_eq!(d("1.50e1").to_string(), "15.0");
+        assert_eq!(d("-2.5e1").to_string(), "-25");
+        assert_eq!(d("0.5e1").to_string(), "5");
+        assert_eq!(d("0e-3").to_string(), "0.000");
+        assert_eq!(d("1E2").to_string(), "100");
     }
 
     #[test]

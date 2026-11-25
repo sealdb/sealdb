@@ -559,13 +559,15 @@ fn run_statement(
     txn: &Arc<TxnHandle>,
 ) -> Result<QueryResult> {
     let stats = domain.stats();
-    let plan = PlanBuilder::new().build_with_schema(
-        stmt,
-        Some(&domain.infoschema()),
-        current_db,
-        Some(stats.as_ref()),
-        sealdb_planner::PartitionPruneMode::Dynamic,
-    )?;
+    let plan = crate::builder::with_txn_dirty_tables(txn, || {
+        PlanBuilder::new().build_with_schema(
+            stmt,
+            Some(&domain.infoschema()),
+            current_db,
+            Some(stats.as_ref()),
+            sealdb_planner::PartitionPruneMode::Dynamic,
+        )
+    })?;
     let exec =
         ExecutorBuilder::build(&plan, stmt, Arc::clone(domain), current_db, Arc::clone(txn))?;
     ExecutorBuilder::run(exec)

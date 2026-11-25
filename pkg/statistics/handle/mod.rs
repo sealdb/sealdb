@@ -1,7 +1,8 @@
 /// in-memory stats Handle (TiDB `statistics/handle`).
 /// Persists under Storage key `mstats` (mysql.stats_* equivalent).
 use crate::table::{
-    ColumnStats, Histogram, HistogramBucket, IndexBucket, IndexHistogram, IndexStats, Table, TopN,
+    ColumnStats, Histogram, HistogramBucket, IndexBucket, IndexHistogram, IndexStats,
+    PartitionStats, Table, TopN,
 };
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use serde::{Deserialize, Serialize};
@@ -181,57 +182,31 @@ impl Handle {
                 indices: stats
                     .indices
                     .iter()
-                    .map(|(name, idx)| PersistIndex {
-                        name: name.clone(),
-                        ndv: idx.ndv,
-                        null_count: idx.null_count,
-                        histogram: idx.histogram.as_ref().map(|h| PersistIndexHist {
-                            ndv: h.ndv,
-                            buckets: h
-                                .buckets
-                                .iter()
-                                .map(|b| PersistIndexBucket {
-                                    lower: b.lower.clone(),
-                                    upper: b.upper.clone(),
-                                    count: b.count,
-                                    repeats: b.repeats,
-                                    ndv: b.ndv,
-                                })
-                                .collect(),
-                        }),
-                        topn: idx.topn.clone(),
-                        cm_sketch: idx.cm_sketch.clone(),
-                        stats_ver: idx.stats_ver,
-                        placeholder: idx.placeholder,
-                    })
+                    .map(|(name, idx)| persist_index(name, idx))
                     .collect(),
                 columns: stats
                     .columns
                     .iter()
-                    .map(|(name, col)| PersistColumn {
-                        name: name.clone(),
-                        ndv: col.ndv,
-                        null_count: col.null_count,
-                        histogram: col.histogram.as_ref().map(|h| PersistHist {
-                            buckets: h
-                                .buckets
-                                .iter()
-                                .map(|b| PersistBucket {
-                                    lower: b.lower.clone(),
-                                    upper: b.upper.clone(),
-                                    count: b.count,
-                                    repeats: b.repeats,
-                                    ndv: b.ndv,
-                                })
-                                .collect(),
-                        }),
-                        topn: col.topn.as_ref().map(|t| t.items.clone()),
-                        value_counts: col.value_counts.clone(),
-                        tot_col_size: col.tot_col_size,
-                        part_tot_col_size: col.part_tot_col_size.clone(),
-                    })
+                    .map(|(name, col)| persist_column(name, col))
                     .collect(),
                 part_counts: stats.part_counts.clone(),
+                partitions: stats
+                    .partitions
+                    .iter()
+                    .map(|part| PersistPartition {
+                        id: part.id,
+                        columns: part
+                            .columns
+                            .iter()
+                            .map(|(name, col)| persist_column(name, col))
+                            .collect(),
+                        indices: part
+                            .indices
+                            .iter()
+                            .map(|(name, idx)| persist_index(name, idx))
+                            .collect(),
+                    })
+                    .collect(),
             })
             .collect();
         serde_json::to_vec(&snap)
@@ -246,67 +221,15 @@ impl Handle {
             .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("decode stats: {e}")))?;
         let mut map = HashMap::new();
         for t in snap {
-            let columns = t
-                .columns
+            let columns = t.columns.into_iter().map(load_column).collect();
+            let indices = t.indices.into_iter().map(load_index).collect();
+            let partitions = t
+                .partitions
                 .into_iter()
-                .map(|c| {
-                    (
-                        c.name,
-                        ColumnStats {
-                            ndv: c.ndv,
-                            null_count: c.null_count,
-                            histogram: c.histogram.map(|h| Histogram {
-                                ndv: c.ndv,
-                                buckets: h
-                                    .buckets
-                                    .into_iter()
-                                    .map(|b| HistogramBucket {
-                                        lower: b.lower,
-                                        upper: b.upper,
-                                        count: b.count,
-                                        repeats: b.repeats,
-                                        ndv: b.ndv,
-                                    })
-                                    .collect(),
-                            }),
-                            topn: c.topn.map(|items| TopN { items }),
-                            value_counts: c.value_counts,
-                            tot_col_size: c.tot_col_size,
-                            part_tot_col_size: c.part_tot_col_size,
-                            ci: false,
-                        },
-                    )
-                })
-                .collect();
-            let indices = t
-                .indices
-                .into_iter()
-                .map(|i| {
-                    (
-                        i.name,
-                        IndexStats {
-                            ndv: i.ndv,
-                            null_count: i.null_count,
-                            histogram: i.histogram.map(|h| IndexHistogram {
-                                ndv: h.ndv,
-                                buckets: h
-                                    .buckets
-                                    .into_iter()
-                                    .map(|b| IndexBucket {
-                                        lower: b.lower,
-                                        upper: b.upper,
-                                        count: b.count,
-                                        repeats: b.repeats,
-                                        ndv: b.ndv,
-                                    })
-                                    .collect(),
-                            }),
-                            topn: i.topn,
-                            cm_sketch: i.cm_sketch,
-                            stats_ver: i.stats_ver,
-                            placeholder: i.placeholder,
-                        },
-                    )
+                .map(|part| PartitionStats {
+                    id: part.id,
+                    columns: part.columns.into_iter().map(load_column).collect(),
+                    indices: part.indices.into_iter().map(load_index).collect(),
                 })
                 .collect();
             map.insert(
@@ -317,6 +240,7 @@ impl Handle {
                     columns,
                     indices,
                     part_counts: t.part_counts,
+                    partitions,
                     version: t.version,
                 },
             );
@@ -354,6 +278,125 @@ struct PersistTable {
     columns: Vec<PersistColumn>,
     #[serde(default)]
     part_counts: Vec<(i64, u64)>,
+    #[serde(default)]
+    partitions: Vec<PersistPartition>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistPartition {
+    id: i64,
+    columns: Vec<PersistColumn>,
+    indices: Vec<PersistIndex>,
+}
+
+fn persist_index(name: &str, idx: &IndexStats) -> PersistIndex {
+    PersistIndex {
+        name: name.to_string(),
+        ndv: idx.ndv,
+        null_count: idx.null_count,
+        histogram: idx.histogram.as_ref().map(|h| PersistIndexHist {
+            ndv: h.ndv,
+            buckets: h
+                .buckets
+                .iter()
+                .map(|b| PersistIndexBucket {
+                    lower: b.lower.clone(),
+                    upper: b.upper.clone(),
+                    count: b.count,
+                    repeats: b.repeats,
+                    ndv: b.ndv,
+                })
+                .collect(),
+        }),
+        topn: idx.topn.clone(),
+        cm_sketch: idx.cm_sketch.clone(),
+        stats_ver: idx.stats_ver,
+        placeholder: idx.placeholder,
+    }
+}
+
+fn load_index(i: PersistIndex) -> (String, IndexStats) {
+    (
+        i.name,
+        IndexStats {
+            ndv: i.ndv,
+            null_count: i.null_count,
+            histogram: i.histogram.map(|h| IndexHistogram {
+                ndv: h.ndv,
+                buckets: h
+                    .buckets
+                    .into_iter()
+                    .map(|b| IndexBucket {
+                        lower: b.lower,
+                        upper: b.upper,
+                        count: b.count,
+                        repeats: b.repeats,
+                        ndv: b.ndv,
+                    })
+                    .collect(),
+            }),
+            topn: i.topn,
+            cm_sketch: i.cm_sketch,
+            stats_ver: i.stats_ver,
+            placeholder: i.placeholder,
+        },
+    )
+}
+
+fn persist_column(name: &str, col: &ColumnStats) -> PersistColumn {
+    PersistColumn {
+        name: name.to_string(),
+        ndv: col.ndv,
+        null_count: col.null_count,
+        correlation: col.correlation,
+        histogram: col.histogram.as_ref().map(|h| PersistHist {
+            buckets: h
+                .buckets
+                .iter()
+                .map(|b| PersistBucket {
+                    lower: b.lower.clone(),
+                    upper: b.upper.clone(),
+                    count: b.count,
+                    repeats: b.repeats,
+                    ndv: b.ndv,
+                })
+                .collect(),
+        }),
+        topn: col.topn.as_ref().map(|t| t.items.clone()),
+        value_counts: col.value_counts.clone(),
+        tot_col_size: col.tot_col_size,
+        part_tot_col_size: col.part_tot_col_size.clone(),
+    }
+}
+
+fn load_column(c: PersistColumn) -> (String, ColumnStats) {
+    (
+        c.name,
+        ColumnStats {
+            ndv: c.ndv,
+            null_count: c.null_count,
+            histogram: c.histogram.map(|h| Histogram {
+                ndv: c.ndv,
+                buckets: h
+                    .buckets
+                    .into_iter()
+                    .map(|b| HistogramBucket {
+                        lower: b.lower,
+                        upper: b.upper,
+                        count: b.count,
+                        repeats: b.repeats,
+                        ndv: b.ndv,
+                    })
+                    .collect(),
+            }),
+            topn: c.topn.map(|items| TopN { items }),
+            value_counts: c.value_counts,
+            tot_col_size: c.tot_col_size,
+            part_tot_col_size: c.part_tot_col_size,
+            ci: false,
+            correlation: c.correlation,
+        },
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -395,6 +438,8 @@ struct PersistColumn {
     name: String,
     ndv: u64,
     null_count: u64,
+    #[serde(default)]
+    correlation: f64,
     #[serde(default)]
     histogram: Option<PersistHist>,
     #[serde(default)]

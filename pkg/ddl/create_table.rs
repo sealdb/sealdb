@@ -1,23 +1,28 @@
 use sealdb_errno::{
     ERR_AFFINITY, ERR_BAD_FIELD, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_CANNOT_ADD_FOREIGN,
-    ERR_DUP_FIELDNAME, ERR_DUPLICATED_VALUE_IN_TYPE, ERR_FK_DUP_NAME,
+    ERR_DUP_FIELDNAME, ERR_DUP_KEYNAME, ERR_DUPLICATED_VALUE_IN_TYPE, ERR_FK_DUP_NAME,
     ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED, ERR_GENERATED_COLUMN_REF_AUTO_INC,
-    ERR_INVALID_DEFAULT, ERR_NO_SUCH_TABLE, ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN,
-    ERR_TTL_UNSUPPORTED_PK_TYPE, ERR_VIEW_WRONG_LIST, ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, Error,
-    Result,
+    ERR_INVALID_DEFAULT, ERR_INVALID_ON_UPDATE, ERR_M_BIGGER_THAN_D, ERR_MULTIPLE_PRI_KEY,
+    ERR_NO_SUCH_TABLE, ERR_OPT_ON_TEMPORARY_TABLE, ERR_PRIMARY_CANT_HAVE_NULL,
+    ERR_TABLE_MUST_HAVE_COLUMNS, ERR_TOO_BIG_DISPLAYWIDTH, ERR_TOO_BIG_PRECISION,
+    ERR_TOO_MANY_FIELDS, ERR_TOO_MANY_KEYS, ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE,
+    ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED_DDL_OPERATION, ERR_VIEW_WRONG_LIST,
+    ERR_WARN_TABLE_TYPE_NOT_SUPPORT_FULLTEXT, ERR_WRONG_AUTO_KEY, ERR_WRONG_COLUMN_NAME,
+    ERR_WRONG_DB_NAME, ERR_WRONG_FK_DEF, ERR_WRONG_NAME_FOR_INDEX,
+    ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, ERR_WRONG_TABLE_NAME, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
 use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, ValueExpr};
-use sealdb_parser::ast::{ColumnDef, CreateTableStmt, ForeignKeyDef, SelectStmt};
+use sealdb_parser::ast::{ColumnDef, CreateTableStmt, ForeignKeyDef, IndexPart, SelectStmt};
 use sealdb_parser::model::CIStr;
 use sealdb_types::Datum;
 use sealdb_types::EvalType;
 use sealdb_types::field_type::{
-    FieldType, TYPE_BIT, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_DURATION,
-    TYPE_ENUM, TYPE_FLOAT, TYPE_INT24, TYPE_JSON, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG,
-    TYPE_MEDIUM_BLOB, TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP,
-    TYPE_TINY, TYPE_TINY_BLOB, TYPE_VAR_STRING, TYPE_YEAR,
+    FieldType, TYPE_BIT, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DECIMAL, TYPE_DOUBLE,
+    TYPE_DURATION, TYPE_ENUM, TYPE_FLOAT, TYPE_INT24, TYPE_JSON, TYPE_LONG, TYPE_LONG_BLOB,
+    TYPE_LONG_LONG, TYPE_MEDIUM_BLOB, TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING,
+    TYPE_TIMESTAMP, TYPE_TINY, TYPE_TINY_BLOB, TYPE_VAR_STRING, TYPE_YEAR,
 };
 use std::collections::HashMap;
 
@@ -124,17 +129,10 @@ const UNSAFE_DEFAULT_FUNCS: &[&str] = &[
     "row_count",
 ];
 
-/// `DEFAULT (expr)` (parenthesized form only) must not call a function whose
-/// value can change between the primary and a replica (TiDB 1674).
-pub(crate) fn validate_default_expr(default: &str) -> Result<()> {
-    if !default.trim().starts_with('(') {
-        return Ok(());
-    }
-    validate_default_expr_any(default)
-}
-
 /// `ALTER TABLE … ADD COLUMN … DEFAULT …` rejects unsafe functions in either
 /// spelling: TiDB validates every added-column default, parenthesized or not.
+/// `CREATE TABLE` deliberately does not: `DEFAULT (uuid())` is legal there and
+/// generates a fresh value per inserted row.
 pub(crate) fn validate_default_expr_any(default: &str) -> Result<()> {
     let lower = default.to_ascii_lowercase();
     for func in UNSAFE_DEFAULT_FUNCS {
@@ -228,6 +226,14 @@ pub(crate) fn validate_generated_expr(col_name: &str, expr: &str) -> Result<()> 
     // A builtin called with the wrong parameter count (e.g. `lower(a, 2)`)
     // fails while the expression is built, exactly as in TiDB (1582).
     if let Ok(parsed) = sealdb_parser::sqlparser_bridge::lower::parse_expr(expr) {
+        // TiDB `checkIllegalFn4Generated`: grouping() and every aggregate
+        // function are rejected with 1111 before other ALTER checks run.
+        if expr_has_aggregate(&parsed) {
+            return Err(Error::new(
+                sealdb_errno::ERR_INVALID_GROUP_FUNC_USE,
+                "Invalid use of group function",
+            ));
+        }
         check_builtin_arg_counts(&parsed)?;
     }
     Ok(())
@@ -331,7 +337,11 @@ pub(crate) fn validate_generated_column_refs(
     columns: &[ColumnInfo],
     changed: Option<&str>,
 ) -> Result<()> {
-    let known: Vec<String> = columns.iter().map(|c| c.name.o().to_string()).collect();
+    let known: Vec<String> = columns
+        .iter()
+        .filter(|c| !c.hidden)
+        .map(|c| c.name.o().to_string())
+        .collect();
     for col in columns {
         if let Some(changed) = changed
             && !col.name.o().eq_ignore_ascii_case(changed)
@@ -342,16 +352,86 @@ pub(crate) fn validate_generated_column_refs(
             continue;
         };
         let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
+        // TiDB `checkIllegalFn4Generated`: grouping() and every aggregate
+        // function are rejected with 1111.
+        if expr_has_aggregate(&expr) {
+            return Err(Error::new(
+                sealdb_errno::ERR_INVALID_GROUP_FUNC_USE,
+                "Invalid use of group function",
+            ));
+        }
         for (_table, name) in expr.referenced_columns() {
             if !known.iter().any(|k| k.eq_ignore_ascii_case(&name)) {
+                // TiDB reports the lower-cased identifier (`ColumnName.L`).
                 return Err(Error::new(
                     ERR_BAD_FIELD,
-                    format!("Unknown column '{name}' in 'generated column function'"),
+                    format!(
+                        "Unknown column '{}' in 'generated column function'",
+                        name.to_ascii_lowercase()
+                    ),
                 ));
             }
         }
     }
     Ok(())
+}
+
+/// `true` when `expr` calls `grouping()` or an aggregate function anywhere in
+/// the tree (TiDB `illegalFunctionChecker.hasAggFunc`).
+fn expr_has_aggregate(expr: &ExprNode) -> bool {
+    fn is_agg_name(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "grouping"
+                | "count"
+                | "sum"
+                | "avg"
+                | "min"
+                | "max"
+                | "group_concat"
+                | "bit_and"
+                | "bit_or"
+                | "bit_xor"
+                | "std"
+                | "stddev"
+                | "stddev_pop"
+                | "stddev_samp"
+                | "variance"
+                | "var_pop"
+                | "var_samp"
+                | "json_arrayagg"
+                | "json_objectagg"
+                | "any_value"
+                | "approx_count_distinct"
+        )
+    }
+    match expr {
+        ExprNode::Func(f) => is_agg_name(&f.name) || f.args.iter().any(expr_has_aggregate),
+        ExprNode::Binary(b) => expr_has_aggregate(&b.left) || expr_has_aggregate(&b.right),
+        ExprNode::Unary(u) => expr_has_aggregate(&u.expr),
+        ExprNode::Cast(c) => expr_has_aggregate(&c.expr),
+        ExprNode::InList(i) => expr_has_aggregate(&i.expr) || i.list.iter().any(expr_has_aggregate),
+        ExprNode::Between(b) => {
+            expr_has_aggregate(&b.expr) || expr_has_aggregate(&b.low) || expr_has_aggregate(&b.high)
+        }
+        ExprNode::Like(l) => expr_has_aggregate(&l.expr) || expr_has_aggregate(&l.pattern),
+        ExprNode::IsNull(i) => expr_has_aggregate(&i.expr),
+        ExprNode::Case(c) => {
+            c.operand.as_deref().is_some_and(expr_has_aggregate)
+                || c.when_then
+                    .iter()
+                    .any(|(when, then)| expr_has_aggregate(when) || expr_has_aggregate(then))
+                || c.else_expr.as_deref().is_some_and(expr_has_aggregate)
+        }
+        ExprNode::Row(r) => r.exprs.iter().any(expr_has_aggregate),
+        ExprNode::Window(w) => w.args.iter().any(expr_has_aggregate),
+        ExprNode::InSubquery(i) => expr_has_aggregate(&i.expr),
+        ExprNode::QuantifiedCmp(q) => expr_has_aggregate(&q.expr),
+        ExprNode::Value(_)
+        | ExprNode::Column(_)
+        | ExprNode::Exists(_)
+        | ExprNode::ScalarSubquery(_) => false,
+    }
 }
 
 /// A generated column may not reference an AUTO_INCREMENT column unless
@@ -391,6 +471,58 @@ pub(crate) fn validate_generated_auto_increment(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// TiDB `ColumnOptionOnUpdate`: `ON UPDATE` is only valid on TIMESTAMP /
+/// DATETIME columns and only with `CURRENT_TIMESTAMP`, whose fsp must equal the
+/// column's (1294).
+pub(crate) fn validate_on_update(
+    name: &str,
+    field_type: &FieldType,
+    on_update: Option<&str>,
+) -> Result<()> {
+    let Some(expr) = on_update else {
+        return Ok(());
+    };
+    let invalid = || {
+        Error::new(
+            ERR_INVALID_ON_UPDATE,
+            format!("Invalid ON UPDATE clause for '{name}' column"),
+        )
+    };
+    if !matches!(field_type.tp, TYPE_TIMESTAMP | TYPE_DATETIME) {
+        return Err(invalid());
+    }
+    let lower = expr.trim().to_ascii_lowercase();
+    let Some(func) = ["current_timestamp", "now"]
+        .iter()
+        .find(|func| lower.starts_with(**func))
+    else {
+        return Err(invalid());
+    };
+    let rest = lower[func.len()..].trim();
+    let fsp = if rest.is_empty() {
+        0
+    } else if let Some(inner) = rest
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            0
+        } else {
+            match inner.parse::<i32>() {
+                Ok(n) => n,
+                Err(_) => return Err(invalid()),
+            }
+        }
+    } else {
+        return Err(invalid());
+    };
+    if fsp != field_type.decimal {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -492,6 +624,148 @@ pub(crate) fn validate_display_width(name: &str, field_type: &FieldType) -> Resu
     Ok(())
 }
 
+/// TiDB `checkColumnAttributes`: `FLOAT/DOUBLE/DECIMAL(M,D)` requires `M >= D`
+/// (1427), and a temporal fsp above 6 is 1426.
+pub(crate) fn check_column_attributes(name: &str, field_type: &FieldType) -> Result<()> {
+    match field_type.tp {
+        TYPE_NEW_DECIMAL | TYPE_DECIMAL | TYPE_DOUBLE | TYPE_FLOAT
+            if field_type.flen < field_type.decimal =>
+        {
+            Err(Error::new(
+                ERR_M_BIGGER_THAN_D,
+                format!(
+                    "For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '{name}')."
+                ),
+            ))
+        }
+        TYPE_DATETIME | TYPE_DURATION | TYPE_TIMESTAMP if field_type.decimal > 6 => {
+            Err(Error::new(
+                ERR_TOO_BIG_PRECISION,
+                format!(
+                    "Too big precision {} specified for column '{name}'. Maximum is 6.",
+                    field_type.decimal
+                ),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// TiDB `checkColumnDefaultValue`: `NO_ZERO_DATE` together with strict mode
+/// makes a temporal default that evaluates to `0000-00-00 00:00:00` invalid
+/// (1067). Outside strict mode the mode is advisory and the default is kept.
+fn is_zero_temporal_default(field_type: &FieldType, default: &str) -> bool {
+    if !matches!(field_type.tp, TYPE_DATE | TYPE_DATETIME | TYPE_TIMESTAMP)
+        || !sealdb_expression::sql_mode_flag("NO_ZERO_DATE")
+        || !(sealdb_expression::sql_mode_flag("STRICT_TRANS_TABLES")
+            || sealdb_expression::sql_mode_flag("STRICT_ALL_TABLES"))
+    {
+        return false;
+    }
+    let text = default.trim();
+    let text = text
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap_or(text)
+        .trim();
+    if text.is_empty() {
+        return false;
+    }
+    // A bare numeric zero (`DEFAULT 0`) evaluates to the zero time.
+    if text.bytes().all(|b| matches!(b, b'0' | b'.' | b'+' | b'-')) {
+        return true;
+    }
+    let time = sealdb_types::parse_datetime_literal(text)
+        .or_else(|_| sealdb_types::parse_datetime_literal(&format!("{text} 00:00:00")))
+        .or_else(|_| sealdb_types::parse_date_literal(text));
+    match time {
+        Ok(t) => {
+            t.year == 0
+                && t.month == 0
+                && t.day == 0
+                && t.hour == 0
+                && t.minute == 0
+                && t.second == 0
+                && t.micro == 0
+        }
+        Err(_) => false,
+    }
+}
+
+fn is_decimal_type(field_type: &FieldType) -> bool {
+    matches!(field_type.tp, TYPE_NEW_DECIMAL | TYPE_DECIMAL)
+}
+
+/// A `DECIMAL(precision, scale)` default fits when the value rounded to the
+/// column scale keeps at most `precision - scale` integer digits.
+fn decimal_default_fits(text: &str, field_type: &FieldType) -> bool {
+    let precision = field_type.flen.clamp(1, 65);
+    let scale = field_type.decimal.clamp(0, 30);
+    let Ok(value) = sealdb_types::MyDecimal::parse(text) else {
+        return false;
+    };
+    // Rounding can carry into the integer part (`9999999999.5` on
+    // `DECIMAL(10,0)` is out of range).
+    let rounded = value.with_frac(scale).to_string();
+    let integer_digits = rounded
+        .trim_start_matches('-')
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('0')
+        .len();
+    integer_digits <= (precision - scale).max(0) as usize
+}
+
+/// Temporal functions TiDB evaluates to a `types.Time`. A column that cannot
+/// hold a time (`DOUBLE DEFAULT now()`) fails the cast and reports 1067.
+const TEMPORAL_DEFAULT_FUNCS: &[&str] = &[
+    "now",
+    "current_timestamp",
+    "localtimestamp",
+    "localtime",
+    "sysdate",
+    "curdate",
+    "current_date",
+    "curtime",
+    "current_time",
+    "utc_timestamp",
+    "utc_date",
+    "utc_time",
+];
+
+/// A bare (unparenthesized) temporal function call in `DEFAULT` position.
+fn is_bare_temporal_function(default: &str) -> bool {
+    let lower = default.trim().to_ascii_lowercase();
+    if lower.starts_with('(') {
+        return false;
+    }
+    TEMPORAL_DEFAULT_FUNCS
+        .iter()
+        .any(|func| calls_function(&lower, func))
+}
+
+/// Column types whose zero value is representable by the empty string, so
+/// `DEFAULT ''` is accepted (string families, blobs, `ENUM`/`SET`, `BIT`).
+fn empty_default_allowed(field_type: &FieldType) -> bool {
+    !matches!(
+        field_type.tp,
+        TYPE_TINY
+            | TYPE_SHORT
+            | TYPE_INT24
+            | TYPE_LONG
+            | TYPE_LONG_LONG
+            | TYPE_FLOAT
+            | TYPE_DOUBLE
+            | TYPE_DECIMAL
+            | TYPE_NEW_DECIMAL
+            | TYPE_DATE
+            | TYPE_DATETIME
+            | TYPE_TIMESTAMP
+            | TYPE_DURATION
+    )
+}
+
 /// TiDB `checkDefaultValue` on a quoted literal: the value must convert to the
 /// column type with truncation/overflow errors raised (`GetColDefaultValue`
 /// evaluates with `LevelError`, so this is independent of `sql_mode`).
@@ -504,6 +778,19 @@ pub(crate) fn validate_default_literal(
         return Ok(());
     };
     let trimmed = default.trim();
+    // An explicit `DEFAULT NULL` carries no value to convert; the caller
+    // separately rejects it on a NOT NULL / primary-key column.
+    if trimmed.eq_ignore_ascii_case("null") {
+        return Ok(());
+    }
+    // TiDB `checkColumnDefaultValue`: in strict mode with `NO_ZERO_DATE`, a
+    // DATE/DATETIME/TIMESTAMP default that evaluates to the zero time is 1067.
+    if is_zero_temporal_default(field_type, trimmed) {
+        return Err(Error::new(
+            ERR_INVALID_DEFAULT,
+            format!("Invalid default value for '{name}'"),
+        ));
+    }
     if field_type.tp == TYPE_BIT {
         // `b'111'` on `BIT(2)`: the bit-string's value must fit the width.
         if let Some(bits) = bit_literal_bits(trimmed) {
@@ -533,16 +820,43 @@ pub(crate) fn validate_default_literal(
         }
         return Ok(());
     }
-    let Some(inner) = trimmed
+    let quoted = trimmed
         .strip_prefix('\'')
-        .and_then(|rest| rest.strip_suffix('\''))
-    else {
+        .and_then(|rest| rest.strip_suffix('\''));
+    // `DOUBLE DEFAULT now()`: the temporal function is evaluated to a time and
+    // then cast to the column type with error-level truncation (1067).
+    if quoted.is_none()
+        && !matches!(
+            field_type.tp,
+            TYPE_DATE | TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_DURATION
+        )
+        && is_bare_temporal_function(trimmed)
+    {
+        return Err(Error::new(
+            ERR_INVALID_DEFAULT,
+            format!("Invalid default value for '{name}'"),
+        ));
+    }
+    // A bare numeric default only needs the `DECIMAL` range check: the other
+    // numeric families normalize to a literal of their own family.
+    if quoted.is_none() && !is_decimal_type(field_type) {
         return Ok(());
-    };
-    let value = inner.replace("''", "'");
+    }
+    let value = quoted
+        .map(|inner| inner.replace("''", "'"))
+        .unwrap_or_else(|| trimmed.to_string());
     let text = value.trim();
+    // `GetColDefaultValue` casts the literal to the column type with
+    // error-level truncation: an empty string is only representable by the
+    // string-like families (an `INT DEFAULT ''` is 1067).
     if text.is_empty() {
-        return Ok(());
+        if empty_default_allowed(field_type) {
+            return Ok(());
+        }
+        return Err(Error::new(
+            ERR_INVALID_DEFAULT,
+            format!("Invalid default value for '{name}'"),
+        ));
     }
     let fits = if let Some((low, high)) = integer_bounds(field_type) {
         let parsed = text
@@ -552,6 +866,12 @@ pub(crate) fn validate_default_literal(
         parsed.is_some_and(|v| v >= low && v <= high)
     } else {
         match field_type.tp {
+            // TiDB `GetColDefaultValue` converts with error-level truncation:
+            // a value whose integer digits exceed `precision - scale` is 1067.
+            TYPE_NEW_DECIMAL | TYPE_DECIMAL => decimal_default_fits(text, field_type),
+            // `DOUBLE DEFAULT 'abc'`: the cast from a string fails (1067),
+            // while `'1.5'` is a plain value.
+            TYPE_FLOAT | TYPE_DOUBLE => text.parse::<f64>().is_ok(),
             // A `DATE` default may carry a time part (`'2024-10-24 12:20'`),
             // which is truncated; a bare `'2024-10'` is not a valid date.
             TYPE_DATE => {
@@ -565,6 +885,13 @@ pub(crate) fn validate_default_literal(
             TYPE_DURATION => {
                 normalize_duration_default(text, field_type.decimal.clamp(0, 6)).is_some()
             }
+            // A default wider than the declared `VARCHAR`/`CHAR` is 1067: the
+            // default is evaluated with error-level truncation regardless of
+            // `sql_mode`. A normalized `BINARY(N)` default is padded with
+            // literal `\0` escapes (`'t\0\0…'`), so compare decoded length.
+            TYPE_STRING | TYPE_VAR_STRING if field_type.flen >= 0 => {
+                literal_char_len(text) <= field_type.flen as usize
+            }
             _ => true,
         }
     };
@@ -575,6 +902,22 @@ pub(crate) fn validate_default_literal(
         ));
     }
     Ok(())
+}
+
+/// Number of characters a MySQL string literal body decodes to: an escape
+/// (`\0`, `\'`, `\\`, …) is one character. `BINARY(N)` defaults carry padded
+/// `\0` escapes after normalization, so a raw `chars().count()` overstates the
+/// value width.
+fn literal_char_len(text: &str) -> usize {
+    let mut count = 0usize;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        count += 1;
+        if ch == '\\' {
+            let _ = chars.next();
+        }
+    }
+    count
 }
 
 /// Normalize a quoted literal default to the column type, the way TiDB does at
@@ -1026,13 +1369,72 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
 
 /// `build_table_info` with the enclosing database's charset/collation as the
 /// fallback for a table (and its columns) that names neither.
+/// TiDB `buildColumnAndConstraint` / `checkTooLongColumn`: a column may not be
+/// called `_tidb_rowid`, nor end with a space (1166).
+pub(crate) fn validate_column_name(name: &str) -> Result<()> {
+    let lower = name.to_lowercase();
+    if lower == "_tidb_rowid" || name.is_empty() || name.ends_with(' ') {
+        return Err(Error::new(
+            ERR_WRONG_COLUMN_NAME,
+            format!("Incorrect column name '{lower}'"),
+        ));
+    }
+    Ok(())
+}
+
+/// TiDB `checkContainDotColumn` / `ChangeColumn` / `ModifyColumn`: a column
+/// name written as `[db.]table.column` must name the statement's target table
+/// (1102 wrong database, 1103 wrong table). Returns the bare column name.
+pub(crate) fn resolve_qualified_column_name(
+    name: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String> {
+    let sep = sealdb_parser::sqlparser_bridge::lower::QUALIFIED_COLUMN_SEP;
+    if !name.contains(sep) {
+        return Ok(name.to_string());
+    }
+    let parts: Vec<&str> = name.split(sep).collect();
+    let (schema_part, table_part, column) = match parts.as_slice() {
+        [schema_part, table_part, column] => (Some(*schema_part), *table_part, *column),
+        [table_part, column] => (None, *table_part, *column),
+        _ => return Ok(name.to_string()),
+    };
+    if let Some(schema_part) = schema_part
+        && !schema_part.eq_ignore_ascii_case(schema)
+    {
+        return Err(Error::new(
+            ERR_WRONG_DB_NAME,
+            format!("Incorrect database name '{schema_part}'"),
+        ));
+    }
+    if !table_part.eq_ignore_ascii_case(table) {
+        return Err(Error::new(
+            ERR_WRONG_TABLE_NAME,
+            format!("Incorrect table name '{table_part}'"),
+        ));
+    }
+    Ok(column.to_string())
+}
+
 pub fn build_table_info_with_defaults(
     stmt: &CreateTableStmt,
     table_id: i64,
     schema_defaults: Option<(String, String)>,
 ) -> Result<TableInfo> {
+    // TiDB `checkCreateTableGrammar`: temporary tables cannot carry placement
+    // policy options (8006).
+    if (stmt.temporary || stmt.on_commit_delete_rows) && stmt.placement_policy.is_some() {
+        return Err(Error::new(
+            ERR_OPT_ON_TEMPORARY_TABLE,
+            "`PLACEMENT` is unsupported on temporary tables.",
+        ));
+    }
     if stmt.cols.is_empty() {
-        return Err(Error::unsupported("CREATE TABLE without columns"));
+        return Err(Error::new(
+            ERR_TABLE_MUST_HAVE_COLUMNS,
+            "A table must have at least 1 column",
+        ));
     }
     // Table-level `DEFAULT CHARSET` / `COLLATE` is the default charset of every
     // character column that does not name one (MySQL/TiDB semantics). A table
@@ -1040,6 +1442,19 @@ pub fn build_table_info_with_defaults(
     let table_defaults = table_charset_and_collation(stmt).or(schema_defaults);
     let mut columns = Vec::with_capacity(stmt.cols.len());
     for (offset, col) in stmt.cols.iter().enumerate() {
+        // TiDB `buildColumnAndConstraint`: unusable column names are 1166.
+        validate_column_name(&col.name)?;
+        // TiDB `checkCreateTableGrammar`: column names are unique
+        // case-insensitively (1060).
+        if columns
+            .iter()
+            .any(|c: &ColumnInfo| c.name.o().eq_ignore_ascii_case(&col.name))
+        {
+            return Err(Error::new(
+                ERR_DUP_FIELDNAME,
+                format!("Duplicate column name '{}'", col.name),
+            ));
+        }
         let mut info = ColumnInfo::new(
             (offset as i64) + 1,
             offset as i32,
@@ -1075,9 +1490,6 @@ pub fn build_table_info_with_defaults(
             info.generated_stored = generated.stored;
         }
         validate_enum_set_members(&info.name.o().to_string(), &info.field_type)?;
-        if let Some(default) = col.default.as_deref() {
-            validate_default_expr(default)?;
-        }
         let default = col.default.as_deref().map(|default| {
             normalize_expression_default(&normalize_default(&info.field_type, default))
         });
@@ -1123,10 +1535,67 @@ pub fn build_table_info_with_defaults(
             &info.field_type,
             info.default_expr.as_deref(),
         )?;
+        validate_on_update(info.name.o(), &info.field_type, col.on_update.as_deref())?;
+        // TiDB `checkPriKeyConstraint` / `checkDefaultValue`: `DEFAULT NULL` is
+        // only legal on a nullable column. On a primary key column the error
+        // depends on how the key was declared (1067 inline, 1171 table-level);
+        // an explicit `NULL` on a key column is always 1171.
+        let in_primary_key = stmt.indices.iter().any(|idx| {
+            idx.primary
+                && idx.columns.iter().any(|part| {
+                    part.column_name()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&col.name))
+                })
+        });
+        let default_is_null = info
+            .default_expr
+            .as_deref()
+            .is_some_and(|default| default.eq_ignore_ascii_case("null"));
+        if default_is_null && in_primary_key {
+            return Err(if col.inline_primary_key {
+                Error::new(
+                    ERR_INVALID_DEFAULT,
+                    format!("Invalid default value for '{}'", info.name.o()),
+                )
+            } else {
+                Error::new(
+                    ERR_PRIMARY_CANT_HAVE_NULL,
+                    "All parts of a PRIMARY KEY must be NOT NULL; if you need NULL in a key, \
+                     use UNIQUE instead",
+                )
+            });
+        }
+        if default_is_null && col.not_null {
+            return Err(Error::new(
+                ERR_INVALID_DEFAULT,
+                format!("Invalid default value for '{}'", info.name.o()),
+            ));
+        }
+        if col.explicit_null && in_primary_key {
+            return Err(Error::new(
+                ERR_PRIMARY_CANT_HAVE_NULL,
+                "All parts of a PRIMARY KEY must be NOT NULL; if you need NULL in a key, \
+                 use UNIQUE instead",
+            ));
+        }
         if col.not_null {
             info.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
         }
+        check_column_attributes(info.name.o(), &info.field_type)?;
         columns.push(info);
+    }
+    // TiDB `checkTooManyColumns`: at most 1017 columns per table (1117).
+    if columns.len() > 1017 {
+        return Err(Error::new(ERR_TOO_MANY_FIELDS, "Too many columns"));
+    }
+    // TiDB `checkAutoIncrement` (a preprocess-time check): only one column may
+    // be declared `AUTO_INCREMENT` (1075).
+    if columns.iter().filter(|c| c.auto_increment).count() > 1 {
+        return Err(Error::new(
+            ERR_WRONG_AUTO_KEY,
+            "Incorrect table definition; there can be only one auto column and it must be \
+             defined as a key",
+        ));
     }
     validate_generated_auto_increment(&columns, None)?;
     validate_generated_column_refs(&columns, None)?;
@@ -1149,14 +1618,71 @@ pub fn build_table_info_with_defaults(
     if let Some(regions) = stmt.pre_split_regions {
         info.pre_split_regions = regions as u8;
     }
+    // TiDB `AUTO_ID_CACHE`: the value must fit int64 (1105 otherwise, reported
+    // with the whole DDL as a plain unknown error).
+    if let Some(raw) = &stmt.auto_id_cache {
+        info.auto_id_cache = Some(parse_auto_id_cache(raw)?);
+    }
     // Table-level `DEFAULT CHARSET` / `COLLATE` (TiDB `TableInfo.Charset/Collate`).
     if let Some((charset, collate)) = table_defaults {
         info.charset = charset;
         info.collate = collate;
     }
     for index in stmt.indices.iter() {
-        let (idx_cols, hidden) =
-            crate::expr_index::resolve_index_parts(&info, &index.name, &index.columns)?;
+        // TiDB's InnoDB cannot store a FULLTEXT index: the definition is
+        // dropped with warning 1214 instead of being created.
+        if index.fulltext {
+            sealdb_expression::note_warning(
+                ERR_WARN_TABLE_TYPE_NOT_SUPPORT_FULLTEXT,
+                "The used table type doesn't support FULLTEXT indexes",
+            );
+            continue;
+        }
+        check_index_name(&index.name, index.primary)?;
+        // TiDB `checkAndBuildIndexInfo`: a repeated index name is 1061, or 1068
+        // when the new key is another PRIMARY KEY.
+        if info
+            .indices
+            .iter()
+            .any(|idx| idx.name.o().eq_ignore_ascii_case(&index.name))
+        {
+            return Err(if index.primary {
+                Error::new(ERR_MULTIPLE_PRI_KEY, "Multiple primary key defined")
+            } else {
+                Error::new(
+                    ERR_DUP_KEYNAME,
+                    format!("Duplicate key name '{}'", index.name),
+                )
+            });
+        }
+        let (idx_cols, hidden) = crate::expr_index::resolve_index_parts(
+            &info,
+            &index.name,
+            &index.columns,
+            index.primary,
+        )?;
+        // TiDB `checkGlobalIndexes` → `validateGlobalIndexWithGeneratedColumns`:
+        // auto analyze cannot collect a GLOBAL index that keeps prefix columns
+        // or virtual generated columns, so the DDL asks for a manual ANALYZE
+        // (8265). The warning is emitted at CREATE TABLE only; `ALTER TABLE …
+        // ADD INDEX` accepts the same definition silently.
+        let multi_valued = index.columns.iter().any(|part| match part {
+            IndexPart::Expression(expr) => crate::expr_index::is_multi_valued_part(expr),
+            _ => false,
+        });
+        if index.global && !multi_valued {
+            let special =
+                !hidden.is_empty() || index.columns.iter().any(|part| part.prefix_length() > 0);
+            if special {
+                sealdb_expression::note_warning(
+                    8265,
+                    format!(
+                        "Auto analyze is not effective for index '{}', need analyze manually",
+                        index.name
+                    ),
+                );
+            }
+        }
         // TiDB `buildTableInfoWithCheck`: a virtual generated column cannot be
         // a primary key (3106).
         if index.primary {
@@ -1193,6 +1719,14 @@ pub fn build_table_info_with_defaults(
                 info.common_handle = true;
             }
         }
+        // TiDB `BuildTableInfo`: a clustered index cannot be a global index
+        // (8200), whether or not the table ends up partitioned.
+        if index.primary && index.global && (info.pk_is_handle || info.common_handle) {
+            return Err(Error::new(
+                ERR_UNSUPPORTED_DDL_OPERATION,
+                "Unsupported create an index that is both a global index and a clustered index",
+            ));
+        }
         let pk_col_offsets: Vec<i32> = if index.primary {
             idx_cols.iter().map(|ic| ic.offset).collect()
         } else {
@@ -1220,6 +1754,13 @@ pub fn build_table_info_with_defaults(
             }
         }
     }
+    // TiDB `checkTooManyIndexes`: at most 64 keys per table (1069).
+    if info.indices.len() > 64 {
+        return Err(Error::new(
+            ERR_TOO_MANY_KEYS,
+            "Too many keys specified; max 64 keys allowed",
+        ));
+    }
     // TiDB `BuildTableInfo`: AUTO_INCREMENT implies NOT NULL.
     for c in &mut info.columns {
         if c.auto_increment {
@@ -1243,6 +1784,18 @@ pub fn build_table_info_with_defaults(
     Ok(info)
 }
 
+/// TiDB `checkIndexInfo`: a secondary index (or FK constraint) may not carry
+/// the reserved name `PRIMARY` (1280).
+pub(crate) fn check_index_name(name: &str, primary: bool) -> Result<()> {
+    if !primary && name.eq_ignore_ascii_case("primary") {
+        return Err(Error::new(
+            ERR_WRONG_NAME_FOR_INDEX,
+            format!("Incorrect index name '{name}'"),
+        ));
+    }
+    Ok(())
+}
+
 /// TiDB `BuildTableInfo` / `AlterTableAddForeignKey`: append one FOREIGN KEY,
 /// materialising the implicit index over its local columns and rejecting a
 /// constraint name already used by the table (`ErrFkDupName`, 1826).
@@ -1256,6 +1809,16 @@ pub(crate) fn add_foreign_key(
     } else {
         fk.name.clone()
     };
+    check_index_name(&name, false)?;
+    // TiDB `buildFKInfo`: every referenced column must pair with a local one.
+    if fk.columns.len() != fk.ref_columns.len() {
+        return Err(Error::new(
+            ERR_WRONG_FK_DEF,
+            format!(
+                "Incorrect foreign key definition for '{name}': Key reference and table reference don't match"
+            ),
+        ));
+    }
     if info
         .foreign_keys
         .iter()
@@ -1472,6 +2035,9 @@ fn push_select_column(
         auto_increment: false,
         auto_random: None,
         not_null,
+        explicit_null: false,
+        inline_primary_key: false,
+        on_update: None,
         charset: None,
         collate: None,
         comment: None,
@@ -1669,7 +2235,20 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             }
         }
         "DOUBLE" | "REAL" => {
-            let (flen, decimal) = parse_flen_decimal_float(type_name).unwrap_or((22, -1));
+            let parsed = parse_flen_decimal_float(type_name);
+            let (flen, decimal) = parsed.unwrap_or((22, -1));
+            // TiDB parser config `EnableStrictDoubleTypeCheck`: `DOUBLE(M)`
+            // without a decimal count is a syntax error (the FLOAT form only
+            // widens to DOUBLE with an unspecified length, so it never hits
+            // this).
+            if parsed.is_some_and(|(_, decimal)| decimal == -1)
+                && sealdb_expression::strict_double_type_check()
+            {
+                return Err(Error::new(
+                    sealdb_errno::ERR_SYNTAX,
+                    "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use",
+                ));
+            }
             FieldType {
                 tp: TYPE_DOUBLE,
                 flen,
@@ -2069,4 +2648,18 @@ mod precise_type_tests {
         let u2 = field_type_from_name("BIGINT").unwrap();
         assert!(!u2.is_unsigned());
     }
+}
+
+/// Parse the `AUTO_ID_CACHE` table option. TiDB stores it as an `int64`, so a
+/// larger value is 1105 `table option auto_id_cache overflows int64`.
+pub(crate) fn parse_auto_id_cache(raw: &str) -> Result<i64> {
+    raw.trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .parse::<i64>()
+        .map_err(|_| {
+            Error::new(
+                ERR_UNKNOWN_ERROR,
+                "table option auto_id_cache overflows int64",
+            )
+        })
 }

@@ -428,6 +428,9 @@ pub struct IndexMergeExecutor {
     partitions: Vec<i64>,
     pushed: Option<ExprNode>,
     selection: Option<ExprNode>,
+    /// Merge-root residual applied to the rows the probe read back
+    /// (`Selection(Probe)` under `TableRowIDScan` in EXPLAIN).
+    probe_selection: Option<ExprNode>,
     /// Planner-built partial paths; empty for the legacy union shape that
     /// derives arms from `selection` at execution time.
     paths: Vec<sealdb_planner::core::physical_plans::IndexMergePath>,
@@ -454,6 +457,7 @@ impl IndexMergeExecutor {
         partitions: Vec<i64>,
         pushed: Option<ExprNode>,
         selection: Option<ExprNode>,
+        probe_selection: Option<ExprNode>,
         paths: Vec<sealdb_planner::core::physical_plans::IndexMergePath>,
         keep_order: bool,
         order_column: Option<String>,
@@ -470,6 +474,7 @@ impl IndexMergeExecutor {
             partitions,
             pushed,
             selection,
+            probe_selection,
             paths,
             keep_order,
             order_column,
@@ -660,6 +665,16 @@ impl Executor for IndexMergeExecutor {
             self.pushed.as_ref(),
             Some(&info),
         )?;
+        // The merge root's residual (`Selection(Probe)`) filters the row IDs the
+        // table lookup read back, not just the access-path arms.
+        if let Some(filter) = self.probe_selection.clone() {
+            self.rows = filter_rows(
+                std::mem::take(&mut self.rows),
+                &self.schema,
+                Some(&filter),
+                Some(&info),
+            )?;
+        }
         // An arm-ordered merge (`keep order:true`) yields the ORDER BY order;
         // a DESC order sorts the merged result backwards.
         if self.keep_order

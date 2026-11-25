@@ -13,8 +13,8 @@ pub use ddl::{
     AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
     ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
     CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt,
-    ForeignKeyDef, GeneratedColumn, IndexDef, IndexPart, ListInEntry, ListLiteral, PartitionDef,
-    PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt,
+    ForeignKeyDef, GeneratedColumn, IndexDef, IndexPart, IndexUpdate, ListInEntry, ListLiteral,
+    PartitionDef, PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt,
 };
 pub use dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, FromItem, InsertStmt,
@@ -28,18 +28,17 @@ pub use expressions::{
 };
 pub use misc::{
     AddQueryWatchStmt, AlterInstanceStmt, AlterUserStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt,
-    BinlogStmt,
-    CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt,
-    CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt, CreateRoleStmt,
-    CreateUserStmt, DeallocateStmt, DistributeTableStmt, DoStmt, DropBindingStmt,
+    BinlogStmt, CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt,
+    CompactTableStmt, CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt,
+    CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt, DoStmt, DropBindingStmt,
     DropPlacementPolicyStmt, DropQueryWatchStmt, DropRoleStmt, DropStatsStmt, DropUserStmt,
     ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt, FlashBackToTimestampStmt, FlushStmt,
     FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt, ImportIntoStmt,
     IsolationLevel, KillStmt, LoadStatsStmt, LockStatsStmt, LockTablesStmt, OptimizeTableStmt,
     PlanReplayerStmt, PrepareStmt, PrivElem, PrivilegeType, RecommendIndexStmt, RecoverTableStmt,
     ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt, RevokeRoleStmt, RevokeStmt,
-    RollbackStmt, SavepointStmt, SetAssignment, SetBindingStmt, SetDefaultRoleStmt, SetPwdStmt, SetResourceGroupStmt,
-    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind,
-    ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt, TableLockItem, TableLockType,
-    TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
+    RollbackStmt, SavepointStmt, SetAssignment, SetBindingStmt, SetDefaultRoleStmt, SetPwdStmt,
+    SetResourceGroupStmt, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt,
+    ShowStmtKind, ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt, TableLockItem,
+    TableLockType, TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
 };

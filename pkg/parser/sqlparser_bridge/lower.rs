@@ -3,8 +3,9 @@ use crate::ast::ddl::{
     AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
     ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
     CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt,
-    ForeignKeyDef, GeneratedColumn, IndexDef, IndexPart, ListInEntry, ListLiteral, PartitionDef,
-    PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt, TtlInfo,
+    ForeignKeyDef, GeneratedColumn, IndexDef, IndexPart, IndexUpdate, ListInEntry, ListLiteral,
+    PartitionDef, PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt,
+    TtlInfo,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -19,22 +20,20 @@ use crate::ast::expressions::{
 };
 use crate::ast::misc::{
     AddQueryWatchStmt, AlterInstanceStmt, AlterResourceGroupStmt, AlterUserStmt, AnalyzeTableStmt,
-    BRIEStmt,
-    BeginStmt, BinlogStmt, CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt,
-    CompactTableStmt, CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt,
-    CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt, DoStmt, DropBindingStmt,
-    DropPlacementPolicyStmt, DropQueryWatchStmt, DropResourceGroupStmt, DropRoleStmt,
-    DropStatsStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
-    FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt,
-    GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt, LockStatsStmt,
-    LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt, PrivElem, PrivilegeType,
-    RecommendIndexStmt, RecoverTableStmt, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt,
-    RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetBindingStmt,
-    SetDefaultRoleStmt, SetPwdStmt, SetResourceGroupStmt, SetRoleKind, SetRoleStmt, SetStmt,
-    SetTxnStmt, SetVarScope,
-    ShowStmt, ShowStmtKind, ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt,
-    TableLockItem, TableLockType, TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec,
-    UserToUser,
+    BRIEStmt, BeginStmt, BinlogStmt, CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt,
+    CommitStmt, CompactTableStmt, CreateBindingStmt, CreatePlacementPolicyStmt,
+    CreateResourceGroupStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt,
+    DoStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt, DropResourceGroupStmt,
+    DropRoleStmt, DropStatsStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt,
+    FlashBackTableStmt, FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel,
+    GrantLevelType, GrantRoleStmt, GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt,
+    LoadStatsStmt, LockStatsStmt, LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt,
+    PrivElem, PrivilegeType, RecommendIndexStmt, RecoverTableStmt, ReleaseSavepointStmt,
+    RenameUserStmt, RepairTableStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt,
+    SetAssignment, SetBindingStmt, SetDefaultRoleStmt, SetPwdStmt, SetResourceGroupStmt,
+    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind,
+    ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt, TableLockItem, TableLockType,
+    TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
@@ -47,6 +46,10 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static PENDING_PRE_SPLIT_REGIONS: std::cell::Cell<Option<u32>> =
         const { std::cell::Cell::new(None) };
+    /// TiDB `AUTO_ID_CACHE` table option, kept as its raw digits so an
+    /// out-of-range value reports 1105 instead of a parse error.
+    static PENDING_AUTO_ID_CACHE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
     /// TiDB partial-index predicates (`UNIQUE KEY idx (c) WHERE b > 2`):
     /// `strip_tidb_create_table_options` drops the predicate from the SQL text
     /// sqlparser sees and records it here, keyed by index name.
@@ -70,6 +73,11 @@ thread_local! {
     /// `CHECK (expr) [NOT] ENFORCED` stripped from CREATE TABLE, one slot per
     /// CREATE so DDL can attach them to `TableInfo.checks`.
     static PENDING_CREATE_CHECKS: std::cell::RefCell<Vec<Vec<(String, bool)>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// `DROP GLOBAL TEMPORARY TABLE` is rewritten to `DROP TEMPORARY TABLE`
+    /// (sqlparser has no GLOBAL form); one flag per temporary DROP records
+    /// whether the original named GLOBAL.
+    static PENDING_DROP_GLOBAL_TEMP: std::cell::RefCell<Vec<bool>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -142,20 +150,21 @@ fn take_partial_index_predicate(name: &str) -> Option<String> {
 }
 
 /// Take the TiDB table options seen by the last option-stripping pass.
-fn take_tidb_table_options() -> (Option<u32>, Option<u32>) {
+fn take_tidb_table_options() -> (Option<u32>, Option<u32>, Option<String>) {
     (
         PENDING_SHARD_ROW_ID_BITS.with(|cell| cell.replace(None)),
         PENDING_PRE_SPLIT_REGIONS.with(|cell| cell.replace(None)),
+        PENDING_AUTO_ID_CACHE.with(|cell| cell.borrow_mut().take()),
     )
 }
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_COLLATION_CHARSET_MISMATCH, ERR_CONFLICTING_DECLARATIONS,
     ERR_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST, ERR_DUP_FIELDNAME, ERR_ILLEGAL_VALUE_FOR_TYPE,
     ERR_INCORRECT_USAGE, ERR_PARSE_ERROR, ERR_PRIMARY_KEY_ON_EXPR_COLUMN,
-    ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED, ERR_TABLE_OPTION_UNION_UNSUPPORTED,
-    ERR_TOO_BIG_PRECISION, ERR_TTL_MULTI_SCHEMA_CHANGE, ERR_TTL_NO_CONFIG, ERR_TTL_TEMPORARY_TABLE,
-    ERR_UNKNOWN_CHARACTER_SET, ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED, ERR_UNSUPPORTED_DDL_OPERATION,
-    Error, Result,
+    ERR_TABLE_MUST_HAVE_COLUMNS, ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED,
+    ERR_TABLE_OPTION_UNION_UNSUPPORTED, ERR_TOO_BIG_PRECISION, ERR_TTL_MULTI_SCHEMA_CHANGE,
+    ERR_TTL_NO_CONFIG, ERR_TTL_TEMPORARY_TABLE, ERR_UNKNOWN_CHARACTER_SET, ERR_UNKNOWN_ERROR,
+    ERR_UNSUPPORTED, ERR_UNSUPPORTED_DDL_OPERATION, Error, Result,
 };
 use sealdb_types::{Datum, parse_date_literal, parse_time_literal, parse_timestamp_literal};
 use sqlparser::ast::{
@@ -192,6 +201,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // TiDB `/*T![clustered_index] clustered */` → keyword before MySQL version
     // comments are expanded (the "T" comment is otherwise an ordinary comment).
     let rewritten = rewrite_tidb_clustered_comment(&rewritten);
+    let rewritten = rewrite_tidb_global_index_comment(&rewritten);
     let rewritten = rewrite_tidb_affinity_comment(&rewritten);
     // Expand MySQL `/*!50100 ... */` version comments so PARTITION/options parse.
     let rewritten = rewrite_mysql_version_comments(&rewritten);
@@ -203,8 +213,13 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_zerofill(&rewritten);
     // TiDB `REAL(M,D)` is `DOUBLE(M,D)`; sqlparser's `REAL` takes no precision.
     let rewritten = rewrite_real_type_precision(&rewritten);
+    // MySQL binary literal `0b101`: sqlparser only knows `0x…`, so spell the
+    // bit string as the equivalent hex byte literal.
+    let rewritten = rewrite_mysql_bit_literals(&rewritten);
     // MySQL column `CHARSET gbk`: sqlparser's column option is `CHARACTER SET`.
     let rewritten = rewrite_mysql_column_charset(&rewritten);
+    // TiDB `db.table.column` column names in CREATE TABLE / ALTER … MODIFY.
+    let rewritten = rewrite_qualified_column_names(&rewritten);
     // `ENUM("a", "b")` / `SET("a", "b")`: double-quoted members are MySQL
     // string literals, but sqlparser only accepts single quotes there.
     let rewritten = rewrite_enum_set_double_quotes(&rewritten);
@@ -218,13 +233,16 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_mysql_cast_charset(&rewritten);
     // `ALTER INDEX name [IN]VISIBLE` must precede option stripping below, which
     // would otherwise drop the trailing visibility keyword.
-    let rewritten = rewrite_alter_index_visibility(&rewritten);
+    let rewritten = rewrite_alter_index_visibility(&rewritten)?;
+    // `DROP GLOBAL TEMPORARY TABLE` → `DROP TEMPORARY TABLE` + GLOBAL marker.
+    let rewritten = rewrite_drop_global_temporary(&rewritten);
     let rewritten = rewrite_auto_random_option(&rewritten);
     let rewritten = rewrite_primary_key_nonclustered(&rewritten);
     // TiDB `CREATE TABLE (... PRIMARY KEY (c) CLUSTERED) pre_split_regions=2`:
     // drop index-option/table-option clauses sqlparser rejects.
     PENDING_SHARD_ROW_ID_BITS.with(|cell| cell.set(None));
     PENDING_PRE_SPLIT_REGIONS.with(|cell| cell.set(None));
+    PENDING_AUTO_ID_CACHE.with(|cell| *cell.borrow_mut() = None);
     PENDING_PARTIAL_INDEX_PREDICATES.with(|cell| cell.borrow_mut().clear());
     PENDING_GROUP_BY_ORDER.with(|cell| cell.set(false));
     let rewritten = strip_tidb_create_table_options(&rewritten)?;
@@ -244,6 +262,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_weight_string_padding(&rewritten);
     // MySQL `FROM (t)` / `FROM (t1, t2)` — sqlparser only allows NestedJoin with JOIN.
     let rewritten = rewrite_mysql_paren_from(&rewritten);
+    let rewritten = rewrite_delete_star_targets(&rewritten);
     let rewritten = rewrite_dml_ignore(&rewritten);
     let rewritten = rewrite_update_comma_join(&rewritten)?;
     let rewritten = rewrite_show_grants(&rewritten)?;
@@ -259,6 +278,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_bindings(&rewritten);
     let rewritten = rewrite_show_warnings(&rewritten);
     let rewritten = rewrite_show_stats_topn(&rewritten);
+    let rewritten = rewrite_show_stats_histograms(&rewritten);
     // MySQL/TiDB `DROP TABLES …` (plural object keyword).
     let rewritten = rewrite_drop_tables(&rewritten);
     let rewritten = rewrite_alter_add_columns_paren(&rewritten);
@@ -272,6 +292,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, ttls, create_affinities) = extract_create_table_ttl(&rewritten)?;
     let (rewritten, create_checks) = extract_create_table_checks(&rewritten)?;
     let (rewritten, create_placement) = extract_create_table_placement(&rewritten)?;
+    // TiDB `CREATE DATABASE ... PLACEMENT POLICY <p>` (no sqlparser grammar).
+    let rewritten = rewrite_create_database_placement(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let (rewritten, alter_parts) = extract_alter_partitions(&rewritten)?;
     // sqlparser rejects MySQL `GRANT/REVOKE role TO/FROM user` (no ON).
@@ -360,6 +382,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             decode_show_bindings(show);
             decode_show_warnings(show);
             decode_show_stats_topn(show);
+            decode_show_stats_histograms(show);
         }
         if let Statement::CreateTable(create) = &mut lowered {
             create.ttl = ttls.next().flatten();
@@ -408,8 +431,14 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                     ));
                     let _ = bound;
                 }
-                AlterPartOp::Repartition(option) => {
-                    alter.specs.push(AlterTableSpec::Repartition(option));
+                AlterPartOp::Repartition {
+                    option,
+                    update_indexes,
+                } => {
+                    alter.specs.push(AlterTableSpec::Repartition {
+                        option,
+                        update_indexes,
+                    });
                 }
                 AlterPartOp::Drop { if_exists, names } => {
                     alter
@@ -431,6 +460,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                 }
                 AlterPartOp::Ttl(spec) => alter.specs.push(spec),
                 AlterPartOp::Cache(cached) => alter.specs.push(AlterTableSpec::Cache { cached }),
+                AlterPartOp::ConvertCharset { charset, collate } => {
+                    alter
+                        .specs
+                        .push(AlterTableSpec::ConvertCharset { charset, collate });
+                }
                 AlterPartOp::Affinity(value) => {
                     alter.specs.push(AlterTableSpec::SetAffinity(value));
                 }
@@ -1272,15 +1306,19 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     name: object_name_last(name)?,
                 }))
             }
-            ObjectType::Table => Ok(Statement::DropTable(DropTableStmt {
-                if_exists: *if_exists,
-                tables: names
-                    .iter()
-                    .map(object_table_name)
-                    .collect::<Result<Vec<_>>>()?,
-                is_view: false,
-                temporary: *temporary,
-            })),
+            ObjectType::Table => {
+                let global_temporary = *temporary && take_drop_global_temp_flag();
+                Ok(Statement::DropTable(DropTableStmt {
+                    if_exists: *if_exists,
+                    tables: names
+                        .iter()
+                        .map(object_table_name)
+                        .collect::<Result<Vec<_>>>()?,
+                    is_view: false,
+                    temporary: *temporary,
+                    global_temporary,
+                }))
+            }
             ObjectType::View => Ok(Statement::DropTable(DropTableStmt {
                 if_exists: *if_exists,
                 tables: names
@@ -1289,6 +1327,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     .collect::<Result<Vec<_>>>()?,
                 is_view: true,
                 temporary: false,
+                global_temporary: false,
             })),
             ObjectType::Role => Ok(Statement::DropRole(DropRoleStmt {
                 if_exists: *if_exists,
@@ -1732,6 +1771,7 @@ const SHOW_DDL_JOBS_SCHEMA: &str = "__sealdb_ddl_jobs__";
 const SHOW_BINDINGS_SCHEMA: &str = "__sealdb_bindings__";
 const SHOW_WARNINGS_SCHEMA: &str = "__sealdb_warnings__";
 const SHOW_STATS_TOPN_SCHEMA: &str = "__sealdb_stats_topn__";
+const SHOW_STATS_HISTOGRAMS_SCHEMA: &str = "__sealdb_stats_histograms__";
 const RENAME_INDEX_MARKER: &str = "__sealdb_rename_index__";
 const RENAME_INDEX_SEP: char = '\u{1f}';
 
@@ -1896,6 +1936,76 @@ fn rewrite_real_type_precision(sql: &str) -> String {
 /// Identifier byte, used to tell a type keyword from part of a longer word.
 fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// MySQL binary literal `0b101` → `X'05'`: the bit string is a binary string
+/// left-padded to whole bytes, which the hex literal spells exactly. sqlparser
+/// only tokenizes `0x…` numerics, so `0b101` would otherwise reach the planner
+/// as a column name.
+fn rewrite_mysql_bit_literals(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let quote = bytes[i];
+            out.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                if ch == quote as char {
+                    break;
+                }
+            }
+            continue;
+        }
+        let ident_before = i > 0 && is_ident_char(bytes[i - 1]);
+        if !ident_before && bytes[i] == b'0' && matches!(bytes.get(i + 1), Some(b'b') | Some(b'B'))
+        {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && matches!(bytes[end], b'0' | b'1') {
+                end += 1;
+            }
+            if end > start && !is_ident_char(bytes.get(end).copied().unwrap_or(b' ')) {
+                let bits = &sql[start..end];
+                if let Some(hex) = bit_string_hex(bits) {
+                    out.push_str("X'");
+                    out.push_str(&hex);
+                    out.push('\'');
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// `0100` → `"04"` (left-pad to whole bytes, then one hex pair per byte).
+fn bit_string_hex(bits: &str) -> Option<String> {
+    if bits.len() > 128 {
+        return None;
+    }
+    let pad = (8 - bits.len() % 8) % 8;
+    let mut hex = String::with_capacity((bits.len() + pad) / 4);
+    let mut nibble = 0u8;
+    let mut count = 0;
+    for bit in std::iter::repeat('0').take(pad).chain(bits.chars()) {
+        nibble = (nibble << 1) | u8::from(bit == '1');
+        count += 1;
+        if count == 4 {
+            hex.push(char::from_digit(u32::from(nibble), 16)?);
+            nibble = 0;
+            count = 0;
+        }
+    }
+    Some(hex)
 }
 
 /// Rewrite `enum(b'10101')` / `set(0b101)` members: TiDB treats the bit
@@ -2365,6 +2475,264 @@ fn rewrite_mysql_column_charset(sql: &str) -> String {
     out
 }
 
+/// Private separator joining the parts of a `[db.]table.column` name written in
+/// a `CREATE TABLE` column definition or `ALTER TABLE … MODIFY/CHANGE COLUMN`.
+/// DDL splits on it to reproduce TiDB's `checkContainDotColumn` errors
+/// (1102 / 1103) using the resolved target schema and table.
+pub const QUALIFIED_COLUMN_SEP: char = '\u{1}';
+
+/// TiDB accepts `db.table.column` / `table.column` as a column name in
+/// `CREATE TABLE` and `ALTER TABLE … MODIFY/CHANGE`; sqlparser's grammar takes
+/// a single identifier there, so join the dotted parts into one quoted
+/// identifier and let DDL validate the namespace.
+fn rewrite_qualified_column_names(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_comment_or_literal(bytes, i) {
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "CREATE") {
+            if let Some(end) = scan_create_table_column_names(bytes, i, &mut edits) {
+                i = end;
+                continue;
+            }
+        } else if keyword_at(bytes, i, "ALTER") {
+            if let Some(end) = scan_alter_table_column_names(bytes, i, &mut edits) {
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if edits.is_empty() {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(sql.len() + edits.len() * 4);
+    let mut cursor = 0usize;
+    for (start, end, replacement) in edits {
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&sql[cursor..start]);
+        out.push_str(&replacement);
+        cursor = end;
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
+/// Read a dotted identifier chain starting at `start`.
+fn read_name_chain(bytes: &[u8], start: usize) -> Option<(usize, usize, Vec<String>)> {
+    let mut parts = Vec::new();
+    let mut i = start;
+    loop {
+        let (name, after) = read_ident(bytes, i);
+        if name.is_empty() {
+            return None;
+        }
+        parts.push(name);
+        let dot = skip_ws_and_comments(bytes, after);
+        if dot < bytes.len() && bytes[dot] == b'.' {
+            let next = skip_ws_and_comments(bytes, dot + 1);
+            if next >= bytes.len()
+                || !(bytes[next].is_ascii_alphanumeric()
+                    || bytes[next] == b'_'
+                    || matches!(bytes[next], b'`' | b'\'' | b'"'))
+            {
+                return None;
+            }
+            i = next;
+            continue;
+        }
+        return Some((start, after, parts));
+    }
+}
+
+/// Record an edit collapsing a multi-part name; no edit for a plain identifier.
+fn note_name_chain(
+    bytes: &[u8],
+    start: usize,
+    edits: &mut Vec<(usize, usize, String)>,
+) -> Option<usize> {
+    let (begin, end, parts) = read_name_chain(bytes, start)?;
+    if parts.len() < 2 {
+        return Some(end);
+    }
+    let joined = parts.join(&QUALIFIED_COLUMN_SEP.to_string());
+    edits.push((begin, end, format!("`{joined}`")));
+    Some(end)
+}
+
+/// Is this the first word of a table-level constraint inside a column list?
+fn is_column_list_constraint(bytes: &[u8], i: usize) -> bool {
+    [
+        "PRIMARY",
+        "UNIQUE",
+        "KEY",
+        "INDEX",
+        "CONSTRAINT",
+        "FOREIGN",
+        "CHECK",
+        "FULLTEXT",
+        "SPATIAL",
+        "LIKE",
+    ]
+    .iter()
+    .any(|kw| keyword_at(bytes, i, kw))
+}
+
+/// Scan a `CREATE TABLE` statement, rewriting qualified column names inside its
+/// column list. Returns the position after the list, or `None` if this is not a
+/// `CREATE TABLE` with a column list.
+fn scan_create_table_column_names(
+    bytes: &[u8],
+    create_at: usize,
+    edits: &mut Vec<(usize, usize, String)>,
+) -> Option<usize> {
+    let mut i = skip_ws_and_comments(bytes, create_at + "CREATE".len());
+    if keyword_at(bytes, i, "OR") {
+        i = skip_ws_and_comments(bytes, i + "OR".len());
+        if !keyword_at(bytes, i, "REPLACE") {
+            return None;
+        }
+        i = skip_ws_and_comments(bytes, i + "REPLACE".len());
+    }
+    if keyword_at(bytes, i, "TEMPORARY") {
+        i = skip_ws_and_comments(bytes, i + "TEMPORARY".len());
+    }
+    if !keyword_at(bytes, i, "TABLE") {
+        return None;
+    }
+    i = skip_ws_and_comments(bytes, i + "TABLE".len());
+    if keyword_at(bytes, i, "IF") {
+        i = skip_ws_and_comments(bytes, i + "IF".len());
+        if keyword_at(bytes, i, "NOT") {
+            i = skip_ws_and_comments(bytes, i + "NOT".len());
+        }
+        if !keyword_at(bytes, i, "EXISTS") {
+            return None;
+        }
+        i = skip_ws_and_comments(bytes, i + "EXISTS".len());
+    }
+    let (_, after_table, _) = read_name_chain(bytes, i)?;
+    i = skip_ws_and_comments(bytes, after_table);
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut at_def_start = true;
+    while i < bytes.len() {
+        if let Some(end) = skip_comment_or_literal(bytes, i) {
+            i = end;
+            continue;
+        }
+        let b = bytes[i];
+        if b == b'(' {
+            depth += 1;
+            i += 1;
+            if depth > 1 {
+                at_def_start = false;
+            }
+            continue;
+        }
+        if b == b')' {
+            depth = depth.saturating_sub(1);
+            i += 1;
+            if depth == 0 {
+                return Some(i);
+            }
+            at_def_start = false;
+            continue;
+        }
+        if depth == 1 && b == b',' {
+            at_def_start = true;
+            i += 1;
+            continue;
+        }
+        if depth == 1 && at_def_start {
+            let start = skip_ws_and_comments(bytes, i);
+            if start != i {
+                i = start;
+                continue;
+            }
+            at_def_start = false;
+            if !is_column_list_constraint(bytes, i)
+                && let Some(end) = note_name_chain(bytes, i, edits)
+            {
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Scan an `ALTER TABLE` statement, rewriting qualified names after
+/// `MODIFY [COLUMN]` / `CHANGE [COLUMN]`. Returns the end of the statement.
+fn scan_alter_table_column_names(
+    bytes: &[u8],
+    alter_at: usize,
+    edits: &mut Vec<(usize, usize, String)>,
+) -> Option<usize> {
+    let mut i = skip_ws_and_comments(bytes, alter_at + "ALTER".len());
+    if !keyword_at(bytes, i, "TABLE") {
+        return None;
+    }
+    i = skip_ws_and_comments(bytes, i + "TABLE".len());
+    let (_, after_table, _) = read_name_chain(bytes, i)?;
+    i = after_table;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_comment_or_literal(bytes, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b';' if depth == 0 => return Some(i + 1),
+            _ => {
+                if depth == 0 && keyword_at(bytes, i, "MODIFY") {
+                    let mut j = skip_ws_and_comments(bytes, i + "MODIFY".len());
+                    if keyword_at(bytes, j, "COLUMN") {
+                        j = skip_ws_and_comments(bytes, j + "COLUMN".len());
+                    }
+                    if let Some(end) = note_name_chain(bytes, j, edits) {
+                        i = end;
+                        continue;
+                    }
+                } else if depth == 0 && keyword_at(bytes, i, "CHANGE") {
+                    let mut j = skip_ws_and_comments(bytes, i + "CHANGE".len());
+                    if keyword_at(bytes, j, "COLUMN") {
+                        j = skip_ws_and_comments(bytes, j + "COLUMN".len());
+                    }
+                    if let Some(end) = note_name_chain(bytes, j, edits) {
+                        let next = skip_ws_and_comments(bytes, end);
+                        if let Some(end) = note_name_chain(bytes, next, edits) {
+                            i = end;
+                            continue;
+                        }
+                        i = next;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    Some(i)
+}
+
 fn rewrite_rename_index(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 24);
@@ -2572,7 +2940,7 @@ const ALTER_INDEX_MARKER: &str = "__sealdb_alter_index__";
 /// sqlparser has no `ALTER TABLE t ALTER INDEX name [IN]VISIBLE`. Rewrite to a
 /// marked `RENAME COLUMN` that `lower_alter_spec` turns back into
 /// AlterIndexVisibility.
-fn rewrite_alter_index_visibility(sql: &str) -> String {
+fn rewrite_alter_index_visibility(sql: &str) -> Result<String> {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 24);
     let mut i = 0;
@@ -2581,6 +2949,7 @@ fn rewrite_alter_index_visibility(sql: &str) -> String {
             let after_alter = skip_ws(bytes, i + "ALTER".len());
             if keyword_at(bytes, after_alter, "INDEX") {
                 let after_index = skip_ws(bytes, after_alter + "INDEX".len());
+                let quoted = bytes.get(after_index) == Some(&b'`');
                 let (name, after_name) = read_ident(bytes, after_index);
                 let after_name = skip_ws(bytes, after_name);
                 let (visibility, after_vis) = if keyword_at(bytes, after_name, "INVISIBLE") {
@@ -2591,6 +2960,21 @@ fn rewrite_alter_index_visibility(sql: &str) -> String {
                     ("", after_name)
                 };
                 if !name.is_empty() && !visibility.is_empty() {
+                    // `ALTER INDEX` takes an identifier; `PRIMARY` is reserved,
+                    // so TiDB reports a syntax error at that token.
+                    if !quoted && name.eq_ignore_ascii_case("PRIMARY") {
+                        let near = sql[after_index..].trim_end();
+                        let near = near.trim_end_matches(';').trim_end();
+                        // TiDB (MySQL) reports the 1-based column of the
+                        // token's last byte.
+                        let col = after_index + name.len();
+                        return Err(Error::new(
+                            ERR_PARSE_ERROR,
+                            format!(
+                                "You have an error in your SQL syntax; check the manual that corresponds to your TiDB version for the right syntax to use line 1 column {col} near \"{near};\" "
+                            ),
+                        ));
+                    }
                     out.push_str("RENAME COLUMN `");
                     out.push_str(ALTER_INDEX_MARKER);
                     out.push_str(&escape_backticks(&name));
@@ -2604,7 +2988,56 @@ fn rewrite_alter_index_visibility(sql: &str) -> String {
         }
         i = push_sql_char(&mut out, sql, i);
     }
+    Ok(out)
+}
+
+/// sqlparser has no `DROP GLOBAL TEMPORARY TABLE`. Rewrite it to
+/// `DROP TEMPORARY TABLE` and record, per temporary DROP statement, whether the
+/// original named GLOBAL (the `DropTableStmt` lowering consumes the flags).
+fn rewrite_drop_global_temporary(sql: &str) -> String {
+    PENDING_DROP_GLOBAL_TEMP.with(|cell| cell.borrow_mut().clear());
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "DROP") && at_statement_start(bytes, i) {
+            let after_drop = skip_ws(bytes, i + "DROP".len());
+            let (global, after_global) = if keyword_at(bytes, after_drop, "GLOBAL") {
+                (true, skip_ws(bytes, after_drop + "GLOBAL".len()))
+            } else {
+                (false, after_drop)
+            };
+            let (after_temp, is_temp) = if keyword_at(bytes, after_global, "TEMPORARY") {
+                (skip_ws(bytes, after_global + "TEMPORARY".len()), true)
+            } else if keyword_at(bytes, after_global, "TEMP") {
+                (skip_ws(bytes, after_global + "TEMP".len()), true)
+            } else {
+                (after_global, false)
+            };
+            if is_temp && keyword_at(bytes, after_temp, "TABLE") {
+                PENDING_DROP_GLOBAL_TEMP.with(|cell| cell.borrow_mut().push(global));
+                // Both spellings lowered to `DROP TEMPORARY TABLE`; sqlparser
+                // accepts TABLES too, but the lowering reads `temporary`.
+                out.push_str("DROP TEMPORARY TABLE");
+                i = after_temp + "TABLE".len();
+                continue;
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
     out
+}
+
+/// Take the GLOBAL flag recorded for the next temporary DROP statement.
+fn take_drop_global_temp_flag() -> bool {
+    PENDING_DROP_GLOBAL_TEMP.with(|cell| {
+        let mut flags = cell.borrow_mut();
+        if flags.is_empty() {
+            false
+        } else {
+            flags.remove(0)
+        }
+    })
 }
 
 fn split_rename_index_marker(encoded: &str) -> Result<(String, String)> {
@@ -2622,6 +3055,15 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
     'stmt: while i < bytes.len() {
         if keyword_at(bytes, i, "ADMIN") && at_statement_start(bytes, i) {
             let after_admin = skip_ws(bytes, i + "ADMIN".len());
+            // `ADMIN CLEANUP TABLE LOCK <tables>` needs its table list, which
+            // the misc allowlist extractor lowers; leave it for that pass
+            // instead of the SUPER-only `DO 0` fallback below.
+            if keyword_at(bytes, after_admin, "CLEANUP") {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
             // `ADMIN SET|UNSET BDR ROLE <role>`: record the operation and emit
             // `DO 0`; the session checks SUPER and applies it.
             let mut bdr = None;
@@ -2630,10 +3072,9 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
                 if keyword_at(bytes, after_op, "BDR") {
                     let after_bdr = skip_ws(bytes, after_op + "BDR".len());
                     if keyword_at(bytes, after_bdr, "ROLE") {
-                        if let Ok((role, end)) = parse_quoted_or_ident(
-                            bytes,
-                            skip_ws(bytes, after_bdr + "ROLE".len()),
-                        ) {
+                        if let Ok((role, end)) =
+                            parse_quoted_or_ident(bytes, skip_ws(bytes, after_bdr + "ROLE".len()))
+                        {
                             bdr = Some((AdminOp::SetBdr(role), end));
                         }
                     }
@@ -2980,6 +3421,41 @@ fn rewrite_show_stats_topn(sql: &str) -> String {
         i = push_sql_char(&mut out, sql, i);
     }
     out
+}
+
+/// TiDB `SHOW STATS_HISTOGRAMS [WHERE …]`; sqlparser has no such statement, so
+/// it is rewritten to `SHOW TABLES FROM <marker>` (keeping the `WHERE`), and
+/// decoded back to `StatsHistograms`.
+fn rewrite_show_stats_histograms(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "SHOW") {
+            let after_show = skip_ws(bytes, i + "SHOW".len());
+            if keyword_at(bytes, after_show, "STATS_HISTOGRAMS") {
+                out.push_str("SHOW TABLES FROM `");
+                out.push_str(SHOW_STATS_HISTOGRAMS_SCHEMA);
+                out.push('`');
+                i = after_show + "STATS_HISTOGRAMS".len();
+                continue;
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
+fn decode_show_stats_histograms(show: &mut ShowStmt) {
+    if show.kind == ShowStmtKind::Tables
+        && show
+            .db_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(SHOW_STATS_HISTOGRAMS_SCHEMA))
+    {
+        show.kind = ShowStmtKind::StatsHistograms;
+        show.db_name = None;
+    }
 }
 
 fn decode_show_stats_topn(show: &mut ShowStmt) {
@@ -3825,9 +4301,7 @@ fn rewrite_into_outfile(sql: &str) -> String {
             };
             if kw_len > 0 {
                 let after_kw = skip_ws(bytes, after_into + kw_len);
-                if after_kw < bytes.len()
-                    && (bytes[after_kw] == b'\'' || bytes[after_kw] == b'"')
-                {
+                if after_kw < bytes.len() && (bytes[after_kw] == b'\'' || bytes[after_kw] == b'"') {
                     let end = skip_quoted(bytes, after_kw);
                     let head = sql[..i].trim_end();
                     let tail = sql[end..].trim_start();
@@ -3835,9 +4309,7 @@ fn rewrite_into_outfile(sql: &str) -> String {
                     if tail.is_empty() {
                         return format!("SELECT * FROM ({head}) AS {INTO_OUTFILE_MARKER}");
                     }
-                    return format!(
-                        "SELECT * FROM ({head}) AS {INTO_OUTFILE_MARKER} {tail}"
-                    );
+                    return format!("SELECT * FROM ({head}) AS {INTO_OUTFILE_MARKER} {tail}");
                 }
             }
         }
@@ -4443,6 +4915,60 @@ fn rewrite_tidb_clustered_comment(sql: &str) -> String {
     out
 }
 
+/// Expand TiDB `/*T![global_index] GLOBAL */` into the bare index option so
+/// [`strip_tidb_create_table_options`] records the GLOBAL marker again (SHOW
+/// CREATE TABLE round-trips indexes this way).
+fn rewrite_tidb_global_index_comment(sql: &str) -> String {
+    const PREFIX: &str = "/*T![global_index]";
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains(&PREFIX.to_ascii_lowercase()) {
+        return sql.to_string();
+    }
+    let prefix = PREFIX.to_ascii_lowercase();
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let q = bytes[i];
+            out.push(q as char);
+            i += 1;
+            while i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                if q == b'\'' && ch == '\\' {
+                    if let Some(next) = sql[i..].chars().next() {
+                        out.push(next);
+                        i += next.len_utf8();
+                    }
+                    continue;
+                }
+                if ch == q as char {
+                    if i < bytes.len() && bytes[i] == q {
+                        out.push(q as char);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if lower[i..].starts_with(&prefix)
+            && let Some(end) = lower[i..].find("*/")
+        {
+            out.push_str(" GLOBAL ");
+            i += end + 2;
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Expand TiDB `/*T![affinity] AFFINITY='table' */` into the bare table option
 /// so the CREATE/ALTER option extractors can capture it.
 fn rewrite_tidb_affinity_comment(sql: &str) -> String {
@@ -4649,7 +5175,7 @@ fn strip_tidb_create_table_options(sql: &str) -> Result<String> {
         },
     };
     const GLOBAL: [&str; 2] = ["nonclustered", "clustered"];
-    const OPTIONS: [&str; 2] = ["pre_split_regions", "shard_row_id_bits"];
+    const OPTIONS: [&str; 3] = ["pre_split_regions", "shard_row_id_bits", "auto_id_cache"];
 
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -4810,8 +5336,16 @@ fn strip_tidb_create_table_options(sql: &str) -> Result<String> {
                     out.push('\'');
                     continue;
                 }
-                if OPTIONS.contains(&word.as_str()) {
-                    // `name = digits` table option.
+                // TiDB `UNIQUE KEY idx (b) LOCAL`: the explicit local form is
+                // the default, so it only needs to be dropped from the text.
+                if word == "local" && out.trim_end().ends_with(')') {
+                    out.push(' ');
+                    continue;
+                }
+                // `AUTO_ID_CACHE` on ALTER TABLE stays in the text: the
+                // generic option parser (`parse_alter_table_options`) reads it.
+                if OPTIONS.contains(&word.as_str()) && !(word == "auto_id_cache" && !partial_ok) {
+                    // `name [=] digits` table option (TiDB accepts both).
                     let mut j = i;
                     while j < bytes.len() && (bytes[j] as char).is_whitespace() {
                         j += 1;
@@ -4821,11 +5355,26 @@ fn strip_tidb_create_table_options(sql: &str) -> Result<String> {
                         while j < bytes.len() && (bytes[j] as char).is_whitespace() {
                             j += 1;
                         }
+                    }
+                    {
                         let num_start = j;
                         while j < bytes.len() && bytes[j].is_ascii_digit() {
                             j += 1;
                         }
                         if j > num_start {
+                            // `AUTO_ID_CACHE` keeps its digits: values past
+                            // i64 are rejected by the DDL layer with 1105.
+                            // Only CREATE TABLE strips it here; ALTER TABLE
+                            // keeps the option for `parse_alter_table_options`.
+                            if word == "auto_id_cache" && partial_ok {
+                                let raw = String::from_utf8_lossy(&bytes[num_start..j]).to_string();
+                                PENDING_AUTO_ID_CACHE.with(|cell| {
+                                    *cell.borrow_mut() = Some(raw);
+                                });
+                                out.push(' ');
+                                i = j;
+                                continue;
+                            }
                             let value: u32 = String::from_utf8_lossy(&bytes[num_start..j])
                                 .parse()
                                 .unwrap_or(0);
@@ -8270,10 +8819,7 @@ fn parse_drop_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
 
 /// `SET DEFAULT ROLE {NONE | ALL | role[, …]} TO user[, …]`. Default roles
 /// become active on the next login (TiDB `SetDefaultRoleStmt`).
-fn try_parse_set_default_role(
-    bytes: &[u8],
-    start: usize,
-) -> Result<Option<(Statement, usize)>> {
+fn try_parse_set_default_role(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
     let mut i = skip_ws(bytes, start + "SET".len());
     if !keyword_at(bytes, i, "DEFAULT") {
         return Ok(None);
@@ -9390,7 +9936,10 @@ enum AlterPartOp {
         defs: Vec<PartitionDef>,
         count: Option<u64>,
     },
-    Repartition(PartitionOption),
+    Repartition {
+        option: PartitionOption,
+        update_indexes: Vec<IndexUpdate>,
+    },
     Drop {
         if_exists: bool,
         names: Vec<String>,
@@ -9434,6 +9983,11 @@ enum AlterPartOp {
     TruncatePartition(Vec<String>),
     /// `CACHE` / `NOCACHE` (sqlparser has no cached-table grammar).
     Cache(bool),
+    /// `CONVERT TO CHARACTER SET <charset> [COLLATE <collation>]`.
+    ConvertCharset {
+        charset: String,
+        collate: Option<String>,
+    },
 }
 
 /// `ALTER TABLE` table options TiDB accepts in the spec list
@@ -9462,6 +10016,7 @@ const ALTER_TABLE_OPTION_KEYWORDS: &[&str] = &[
     "SECONDARY_ENGINE",
     "SHARD_ROW_ID_BITS",
     "PRE_SPLIT_REGIONS",
+    "AUTO_ID_CACHE",
     "TIFLASH_REPLICA",
 ];
 
@@ -9545,10 +10100,17 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                     let after_part = skip_ws(bytes, after_name + "PARTITION".len());
                     if keyword_at(bytes, after_part, "BY") {
                         let after_by = skip_ws(bytes, after_part + "BY".len());
-                        let (option, _) = parse_partition_by(bytes, after_by)?;
+                        let (option, spec_end) = parse_partition_by(bytes, after_by)?;
+                        // TiDB `... PARTITION BY … UPDATE INDEXES (idx GLOBAL, …)`.
+                        let (update_indexes, end) =
+                            parse_update_indexes(bytes, skip_ws(bytes, spec_end))?;
                         out.push_str(&sql[i..after_name]);
                         out.push_str("ALGORITHM=INPLACE");
-                        ops.push(Some(AlterPartOp::Repartition(option)));
+                        ops.push(Some(AlterPartOp::Repartition {
+                            option,
+                            update_indexes,
+                        }));
+                        let _ = end;
                         i = skip_ws(bytes, stmt_end(bytes, after_by));
                         continue;
                     }
@@ -9923,6 +10485,55 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                         continue;
                     }
                 }
+                // `ALTER TABLE t CONVERT TO CHARACTER SET <cs> [COLLATE <coll>]`
+                // — sqlparser has no `CONVERT TO` grammar.
+                if keyword_at(bytes, after_name, "CONVERT") {
+                    let after_convert = skip_ws(bytes, after_name + "CONVERT".len());
+                    if keyword_at(bytes, after_convert, "TO") {
+                        let mut j = skip_ws(bytes, after_convert + "TO".len());
+                        if keyword_at(bytes, j, "CHARACTER") {
+                            j = skip_ws(bytes, j + "CHARACTER".len());
+                            if keyword_at(bytes, j, "SET") {
+                                j = skip_ws(bytes, j + "SET".len());
+                            }
+                        } else if keyword_at(bytes, j, "CHARSET") {
+                            j = skip_ws(bytes, j + "CHARSET".len());
+                        }
+                        let (charset, next) = read_ident(bytes, j);
+                        if !charset.is_empty() {
+                            if !crate::charset::is_supported_charset(&charset) {
+                                return Err(Error::new(
+                                    ERR_UNKNOWN_CHARACTER_SET,
+                                    format!("Unknown character set: '{charset}'"),
+                                ));
+                            }
+                            let mut collate = None;
+                            let mut k = skip_ws(bytes, next);
+                            if keyword_at(bytes, k, "COLLATE") {
+                                let (name, after) =
+                                    read_ident(bytes, skip_ws(bytes, k + "COLLATE".len()));
+                                if !name.is_empty() {
+                                    if let Some(err) =
+                                        crate::charset::collation_validation_error(&name)
+                                    {
+                                        return Err(err);
+                                    }
+                                    collate = Some(name);
+                                    k = after;
+                                }
+                            }
+                            let end = stmt_end(bytes, k);
+                            out.push_str(&sql[i..after_name]);
+                            out.push_str("ALGORITHM=INPLACE");
+                            ops.push(Some(AlterPartOp::ConvertCharset {
+                                charset: charset.to_ascii_lowercase(),
+                                collate,
+                            }));
+                            i = skip_ws(bytes, end);
+                            continue;
+                        }
+                    }
+                }
                 // Non-partition ALTER TABLE — still consume one alter slot as None.
                 ops.push(None);
             }
@@ -10225,6 +10836,54 @@ fn extract_create_table_placement(sql: &str) -> Result<(String, Vec<Option<Strin
         i += ch.len_utf8();
     }
     Ok((out, policies))
+}
+
+/// TiDB `CREATE DATABASE db PLACEMENT POLICY p`: sqlparser has no grammar for
+/// the option, so drop it (the policy itself has no observable effect here).
+fn rewrite_create_database_placement(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(next) = skip_comment_or_literal(bytes, i) {
+            out.push_str(&sql[i..next]);
+            i = next;
+            continue;
+        }
+        if keyword_at(bytes, i, "CREATE") {
+            let after = skip_ws(bytes, i + "CREATE".len());
+            if keyword_at(bytes, after, "DATABASE") {
+                let end = stmt_end(bytes, i);
+                out.push_str(&strip_database_placement(&sql[i..end]));
+                i = end;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn strip_database_placement(stmt: &str) -> String {
+    let bytes = stmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(next) = skip_comment_or_literal(bytes, i) {
+            i = next;
+            continue;
+        }
+        if keyword_at(bytes, i, "PLACEMENT") {
+            let after = skip_ws(bytes, i + "PLACEMENT".len());
+            if keyword_at(bytes, after, "POLICY") {
+                return stmt[..i].trim_end().to_string();
+            }
+        }
+        let ch = stmt[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+    stmt.to_string()
 }
 
 fn strip_placement_from_create(stmt: &str) -> (String, Option<String>) {
@@ -11117,6 +11776,74 @@ fn insert_partition_names(exprs: Option<&Vec<Expr>>) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// TiDB `UPDATE INDEXES (idx GLOBAL, idx2 LOCAL, …)` after `PARTITION BY …`.
+/// Returns the entries and the position right after the clause (or `from`
+/// when the clause is absent).
+fn parse_update_indexes(bytes: &[u8], from: usize) -> Result<(Vec<IndexUpdate>, usize)> {
+    if !keyword_at(bytes, from, "UPDATE") {
+        return Ok((Vec::new(), from));
+    }
+    let mut i = skip_ws(bytes, from + "UPDATE".len());
+    if !keyword_at(bytes, i, "INDEXES") {
+        return Err(Error::unsupported("UPDATE"));
+    }
+    i = skip_ws(bytes, i + "INDEXES".len());
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return Err(Error::new(
+            ERR_PARSE_ERROR,
+            "You have an error in your SQL syntax; expected '(' after UPDATE INDEXES",
+        ));
+    }
+    let close = matching_paren(bytes, i).ok_or_else(|| {
+        Error::new(
+            ERR_PARSE_ERROR,
+            "You have an error in your SQL syntax; unbalanced UPDATE INDEXES list",
+        )
+    })?;
+    let body = std::str::from_utf8(&bytes[i + 1..close])
+        .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid UPDATE INDEXES list"))?;
+    let mut updates = Vec::new();
+    for item in split_top_level_items(body) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let tokens = split_ident_words(item);
+        let (name, option) = match tokens.last() {
+            Some(last) if last.eq_ignore_ascii_case("global") => {
+                (tokens[..tokens.len() - 1].join(" "), true)
+            }
+            Some(last) if last.eq_ignore_ascii_case("local") => {
+                (tokens[..tokens.len() - 1].join(" "), false)
+            }
+            _ => {
+                return Err(Error::new(
+                    ERR_PARSE_ERROR,
+                    "You have an error in your SQL syntax; UPDATE INDEXES needs GLOBAL or LOCAL",
+                ));
+            }
+        };
+        updates.push(IndexUpdate {
+            name,
+            global: option,
+        });
+    }
+    Ok((updates, skip_ws(bytes, close + 1)))
+}
+
+/// Split a comma separated clause body at top level (no nested parens here).
+fn split_top_level_items(body: &str) -> Vec<&str> {
+    body.split(',').collect()
+}
+
+/// Split an index-name + option fragment into its whitespace separated words,
+/// stripping surrounding backticks/quotes.
+fn split_ident_words(item: &str) -> Vec<String> {
+    item.split_whitespace()
+        .map(|word| word.trim_matches('`').trim_matches('"').to_string())
+        .collect()
 }
 
 fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {
@@ -14105,6 +14832,44 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
             .map(object_table_name)
             .collect::<Result<Vec<_>>>()?;
         ((left, Some(join), Vec::new()), tables)
+    } else if from.len() > 1 && !delete.tables.is_empty() {
+        // `DELETE t1 FROM t1, t2 WHERE ...`: MySQL's comma-separated
+        // multi-table form. Each FROM factor must be a plain table (a JOIN
+        // inside a factor is handled by the single-factor branch).
+        let mut factors = Vec::with_capacity(from.len());
+        for twj in from.iter() {
+            if !twj.joins.is_empty() {
+                return Err(Error::unsupported("JOIN in DELETE FROM list"));
+            }
+            let (name, _alias, ctes) = table_factor(&twj.relation)?;
+            if !ctes.is_empty() {
+                return Err(Error::unsupported("derived table in UPDATE/DELETE"));
+            }
+            factors.push(name);
+        }
+        let first = factors[0].clone();
+        let mut joins: Vec<Join> = Vec::new();
+        let mut prev = first.clone();
+        for right in factors.into_iter().skip(1) {
+            joins.push(Join {
+                left: prev.clone(),
+                right: right.clone(),
+                tp: JoinType::Inner,
+                on: true_expr(),
+                using_cols: Vec::new(),
+                natural: false,
+                straight: false,
+            });
+            prev = right;
+        }
+        let head = joins.first().cloned();
+        let extra = joins.into_iter().skip(1).collect();
+        let tables = delete
+            .tables
+            .iter()
+            .map(object_table_name)
+            .collect::<Result<Vec<_>>>()?;
+        ((first, head, extra), tables)
     } else {
         if from.len() != 1 {
             return Err(Error::unsupported("multi-table DELETE"));
@@ -14151,6 +14916,105 @@ fn has_dml_ignore_hint(hints: &[sqlparser::ast::OptimizerHint]) -> bool {
     hints
         .iter()
         .any(|h| h.text.trim().eq_ignore_ascii_case(DML_IGNORE_HINT))
+}
+
+/// MySQL `DELETE t1.*, t2.* FROM …`: sqlparser's delete target list only
+/// accepts table names, so drop the `.*` wildcard (the target is the table).
+fn rewrite_delete_star_targets(sql: &str) -> String {
+    let chunks = split_top_level_statements(sql);
+    let mut out = String::with_capacity(sql.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i > 0 {
+            out.push(';');
+        }
+        out.push_str(&rewrite_one_delete_star_targets(chunk));
+    }
+    out
+}
+
+fn rewrite_one_delete_star_targets(chunk: &str) -> String {
+    let Some((kw, rest)) = take_leading_word(chunk) else {
+        return chunk.to_string();
+    };
+    if !kw.eq_ignore_ascii_case("DELETE") {
+        return chunk.to_string();
+    }
+    let Some(from_pos) = top_level_word_position(rest, "FROM") else {
+        return chunk.to_string();
+    };
+    let head = &rest[..from_pos];
+    if !head.contains(".*") {
+        return chunk.to_string();
+    }
+    let mut stripped = String::with_capacity(head.len());
+    let mut chars = head.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '.' && head[idx + 1..].starts_with('*') {
+            chars.next();
+            continue;
+        }
+        stripped.push(ch);
+    }
+    format!("{kw}{stripped}{}", &rest[from_pos..])
+}
+
+/// Byte offset of `word` at paren depth 0 outside quotes/comments.
+fn top_level_word_position(text: &str, word: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' | b'`' => quote = Some(b),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {
+                if depth == 0
+                    && bytes.len() - i >= word.len()
+                    && bytes[i..i + word.len()].eq_ignore_ascii_case(word.as_bytes())
+                    && (i == 0 || !is_word_byte(bytes[i - 1]))
+                    && bytes.get(i + word.len()).is_none_or(|b| !is_word_byte(*b))
+                {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// sqlparser's MySQL dialect has no `UPDATE IGNORE` / `DELETE IGNORE`; rewrite
@@ -14596,6 +15460,34 @@ fn extract_sequence_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     let mut ops = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        // `SHOW CREATE SEQUENCE <name>` must not be mistaken for a CREATE
+        // SEQUENCE statement. It resolves the permanent sequence namespace
+        // (temporary tables never shadow it).
+        if keyword_at(bytes, i, "SHOW") {
+            let after_show = skip_ws(bytes, i + "SHOW".len());
+            if keyword_at(bytes, after_show, "CREATE") {
+                let after_create = skip_ws(bytes, after_show + "CREATE".len());
+                if keyword_at(bytes, after_create, "SEQUENCE") {
+                    let after_seq = skip_ws(bytes, after_create + "SEQUENCE".len());
+                    let (schema, name, end) = read_qualified_name(bytes, after_seq)?;
+                    out.push_str("SET NAMES '__sealdb_seq__'");
+                    ops.push(Some(Statement::Show(ShowStmt {
+                        kind: ShowStmtKind::CreateSequence,
+                        db_name: None,
+                        table: Some(TableName::new(schema, name)),
+                        user: None,
+                        using_roles: Vec::new(),
+                        full: false,
+                        pattern: None,
+                        column: None,
+                        var_scope: ShowVarScope::Session,
+                        filter: None,
+                    })));
+                    i = end;
+                    continue;
+                }
+            }
+        }
         if keyword_at(bytes, i, "CREATE") {
             let after_create = skip_ws(bytes, i + "CREATE".len());
             if keyword_at(bytes, after_create, "SEQUENCE") {
@@ -15075,6 +15967,14 @@ fn lower_not_null_option(options: &[sqlparser::ast::ColumnOption]) -> Option<boo
         .then_some(false)
 }
 
+/// Column `ON UPDATE <expr>` (TiDB `ColumnOptionOnUpdate`) kept as SQL text.
+fn lower_column_on_update(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<String> {
+    options.iter().find_map(|opt| match &opt.option {
+        sqlparser::ast::ColumnOption::OnUpdate(expr) => Some(expr.to_string()),
+        _ => None,
+    })
+}
+
 /// Column `CHARACTER SET <name>` option (TiDB `FieldType.Charset`).
 fn lower_column_charset(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<String> {
     options.iter().find_map(|opt| match &opt.option {
@@ -15141,6 +16041,15 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
             auto_increment: lower_auto_increment(&col.options),
             auto_random: lower_auto_random(&col.options),
             not_null: lower_not_null(&col.options),
+            explicit_null: col
+                .options
+                .iter()
+                .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::Null)),
+            inline_primary_key: col
+                .options
+                .iter()
+                .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(_))),
+            on_update: lower_column_on_update(&col.options),
             charset: lower_column_charset(&col.options),
             collate: lower_column_collate(&col.options),
             comment: lower_column_comment(&col.options),
@@ -15166,7 +16075,11 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         }
     }
     if cols.is_empty() && refer_table.is_none() && select.is_none() {
-        return Err(Error::unsupported("CREATE TABLE without columns"));
+        // TiDB `buildTableInfo`: a table needs at least one column (1113).
+        return Err(Error::new(
+            ERR_TABLE_MUST_HAVE_COLUMNS,
+            "A table must have at least 1 column",
+        ));
     }
     let mut indices = lower_table_indices(&create.constraints)?;
     // Inline `c int UNIQUE` → unique index named after the column.
@@ -15194,6 +16107,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                 clustered: false,
                 invisible: false,
                 where_clause: None,
+                fulltext: false,
             });
         }
     }
@@ -15213,12 +16127,13 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                 clustered: col_pk_clustered && !col_pk_nonclustered,
                 invisible: false,
                 where_clause: None,
+                fulltext: false,
             },
         );
     }
     validate_create_table_options(&create.table_options)?;
     let (charset, collate) = lower_table_charset_collate(&create.table_options)?;
-    let (shard_row_id_bits, pre_split_regions) = take_tidb_table_options();
+    let (shard_row_id_bits, pre_split_regions, auto_id_cache) = take_tidb_table_options();
     Ok(Statement::CreateTable(CreateTableStmt {
         if_not_exists: create.if_not_exists,
         temporary: create.temporary,
@@ -15239,6 +16154,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         select,
         shard_row_id_bits,
         pre_split_regions,
+        auto_id_cache,
         checks: Vec::new(),
         placement_policy: None,
     }))
@@ -15608,6 +16524,50 @@ fn lower_interval_parts(iv: &Interval) -> Result<(ExprNode, String)> {
     Ok((value, unit))
 }
 
+fn is_comparison_operator(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::Spaceship
+    )
+}
+
+/// `@v` (single `@`, not a system variable).
+fn is_user_var_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Identifier(id) if id.value.starts_with('@') && !id.value.starts_with("@@")
+    )
+}
+
+/// Lower MySQL's `@v := expr` operator. The session evaluates it per row (user
+/// variables live in an eval-time store), so it lowers to a builtin that carries
+/// the target name as a literal instead of a column reference.
+fn lower_user_var_assignment(left: &Expr, right: &Expr, op: &BinaryOperator) -> Result<ExprNode> {
+    let target = lower_expr(left)?;
+    let ExprNode::Column(col) = target else {
+        return Err(Error::unsupported(format!("operator {op}")));
+    };
+    if col.table.is_some() || !col.name.starts_with('@') || col.name.starts_with("@@") {
+        return Err(Error::unsupported(format!("operator {op}")));
+    }
+    Ok(ExprNode::Func(FuncCallExpr {
+        name: "__SEALDB_ASSIGN".to_string(),
+        args: vec![
+            ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(col.name.into_bytes()),
+            }),
+            lower_expr(right)?,
+        ],
+        distinct: false,
+    }))
+}
+
 fn lower_expr(expr: &Expr) -> Result<ExprNode> {
     match expr {
         Expr::Value(v) => Ok(ExprNode::Value(ValueExpr {
@@ -15640,23 +16600,27 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             // so it lowers to a builtin that carries the target name as a
             // literal instead of a column reference.
             if matches!(op, BinaryOperator::Assignment) {
-                let target = lower_expr(left)?;
-                let ExprNode::Column(col) = target else {
-                    return Err(Error::unsupported(format!("operator {op}")));
-                };
-                if col.table.is_some() || !col.name.starts_with('@') || col.name.starts_with("@@") {
-                    return Err(Error::unsupported(format!("operator {op}")));
+                // sqlparser binds `:=` like `=`, so TiDB's
+                // `BoolPri CompareOp @v := PredicateExpr`
+                // (`c = @v := 1`) arrives as `(c = @v) := 1`. TiDB parses the
+                // assignment on the variable, i.e. `c = (@v := 1)`.
+                if let Expr::BinaryOp {
+                    left: cmp_left,
+                    op: cmp_op,
+                    right: cmp_right,
+                } = left.as_ref()
+                    && is_comparison_operator(cmp_op)
+                    && is_user_var_expr(cmp_right)
+                {
+                    let assigned = lower_user_var_assignment(cmp_right, right, op)?;
+                    return Ok(ExprNode::Binary(BinaryOpExpr {
+                        op: lower_binary_op(cmp_op)?,
+                        left: Box::new(lower_expr(cmp_left)?),
+                        right: Box::new(assigned),
+                        single_cnf_item: false,
+                    }));
                 }
-                return Ok(ExprNode::Func(FuncCallExpr {
-                    name: "__SEALDB_ASSIGN".to_string(),
-                    args: vec![
-                        ExprNode::Value(ValueExpr {
-                            datum: Datum::Bytes(col.name.into_bytes()),
-                        }),
-                        lower_expr(right)?,
-                    ],
-                    distinct: false,
-                }));
+                return lower_user_var_assignment(left, right, op);
             }
             // MySQL JSON arrow operators: `doc -> path` = `JSON_EXTRACT(doc,
             // path)` returning JSON, `doc ->> path` additionally unquotes to a
@@ -16743,6 +17707,15 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 auto_increment: lower_auto_increment(&column_def.options),
                 auto_random: lower_auto_random(&column_def.options),
                 not_null: lower_not_null(&column_def.options),
+                explicit_null: column_def
+                    .options
+                    .iter()
+                    .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::Null)),
+                inline_primary_key: column_def
+                    .options
+                    .iter()
+                    .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(_))),
+                on_update: lower_column_on_update(&column_def.options),
                 charset: lower_column_charset(&column_def.options),
                 collate: lower_column_collate(&column_def.options),
                 comment: lower_column_comment(&column_def.options),
@@ -16903,6 +17876,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     clustered: false,
                     invisible: index_def_invisible(&idx.index_options),
                     where_clause,
+                    fulltext: false,
                 }))
             }
             TableConstraint::Unique(idx) => Ok(AlterTableSpec::AddIndex(lower_unique_index(idx)?)),
@@ -16912,6 +17886,30 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             TableConstraint::ForeignKey(fk) => Ok(AlterTableSpec::AddForeignKey(
                 lower_foreign_key_constraint(fk)?,
             )),
+            TableConstraint::FulltextOrSpatial(idx) if idx.fulltext => {
+                let columns = idx
+                    .columns
+                    .iter()
+                    .map(index_part)
+                    .collect::<Result<Vec<_>>>()?;
+                let name = idx
+                    .opt_index_name
+                    .as_ref()
+                    .map(|ident| ident.value.clone())
+                    .unwrap_or_else(|| default_index_name(&columns));
+                Ok(AlterTableSpec::AddIndex(IndexDef {
+                    name,
+                    columns,
+                    unique: false,
+                    primary: false,
+                    global: false,
+                    nonclustered: false,
+                    clustered: false,
+                    invisible: false,
+                    where_clause: None,
+                    fulltext: true,
+                }))
+            }
             other => Err(Error::unsupported(format!("ALTER TABLE ADD {other}"))),
         },
         other => Err(Error::unsupported(format!("ALTER TABLE {other}"))),
@@ -16920,6 +17918,9 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
 
 fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>> {
     let mut indices = Vec::new();
+    // Whether each index name was auto-generated (empty in the statement):
+    // TiDB only renames generated names, an explicit duplicate is 1061.
+    let mut auto_names = Vec::new();
     for constraint in constraints {
         match constraint {
             TableConstraint::Index(idx) => {
@@ -16942,6 +17943,7 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     // MySQL/TiDB: `KEY (b)` → index name `b`; an expression
                     // key defaults to `expression_index`.
                     .unwrap_or_else(|| default_index_name(&columns));
+                auto_names.push(idx.name.is_none());
                 let where_clause = take_partial_index_predicate(&name);
                 indices.push(IndexDef {
                     name,
@@ -16953,15 +17955,49 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     clustered: false,
                     invisible: index_def_invisible(&idx.index_options),
                     where_clause,
+                    fulltext: false,
                 });
             }
-            TableConstraint::Unique(idx) => indices.push(lower_unique_index(idx)?),
-            TableConstraint::PrimaryKey(idx) => indices.push(lower_primary_key(idx)?),
+            TableConstraint::Unique(idx) => {
+                auto_names.push(idx.index_name.is_none() && idx.name.is_none());
+                indices.push(lower_unique_index(idx)?);
+            }
+            TableConstraint::PrimaryKey(idx) => {
+                auto_names.push(false);
+                indices.push(lower_primary_key(idx)?);
+            }
             // Accept FK syntax as no-op for now (TiDB stores; enforcement is separate).
             TableConstraint::ForeignKey(_) => {}
             TableConstraint::Check(_) => return Err(Error::unsupported("CHECK constraint")),
-            TableConstraint::FulltextOrSpatial(_) => {
-                return Err(Error::unsupported("FULLTEXT / SPATIAL INDEX"));
+            TableConstraint::FulltextOrSpatial(idx) => {
+                if !idx.fulltext {
+                    return Err(Error::unsupported("SPATIAL INDEX"));
+                }
+                // TiDB's InnoDB ignores a FULLTEXT key (warning 1214): keep
+                // the definition so DDL can report the warning and drop it.
+                let columns = idx
+                    .columns
+                    .iter()
+                    .map(index_part)
+                    .collect::<Result<Vec<_>>>()?;
+                let name = idx
+                    .opt_index_name
+                    .as_ref()
+                    .map(|ident| ident.value.clone())
+                    .unwrap_or_else(|| default_index_name(&columns));
+                auto_names.push(idx.opt_index_name.is_none());
+                indices.push(IndexDef {
+                    name,
+                    columns,
+                    unique: false,
+                    primary: false,
+                    global: false,
+                    nonclustered: false,
+                    clustered: false,
+                    invisible: false,
+                    where_clause: None,
+                    fulltext: true,
+                });
             }
             other => {
                 return Err(Error::unsupported(format!(
@@ -16970,18 +18006,22 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
             }
         }
     }
-    Ok(rename_duplicate_index_names(indices))
+    Ok(rename_duplicate_index_names(indices, &auto_names))
 }
 
-/// TiDB `renameIndexes`: duplicate non-PRIMARY index names get a `_2`, `_3`, …
-/// suffix (`expression_index`, `expression_index_2`, …).
-fn rename_duplicate_index_names(mut indices: Vec<IndexDef>) -> Vec<IndexDef> {
+/// TiDB `renameIndexes`: duplicate *generated* non-PRIMARY index names get a
+/// `_2`, `_3`, … suffix (`expression_index`, `expression_index_2`, …). An
+/// explicit duplicate name is left alone so DDL reports 1061 / 1068.
+fn rename_duplicate_index_names(mut indices: Vec<IndexDef>, auto: &[bool]) -> Vec<IndexDef> {
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for idx in &mut indices {
+    for (pos, idx) in indices.iter_mut().enumerate() {
         if idx.name.eq_ignore_ascii_case("PRIMARY") {
             continue;
         }
         if used.insert(idx.name.clone()) {
+            continue;
+        }
+        if !auto.get(pos).copied().unwrap_or(false) {
             continue;
         }
         let base = idx.name.clone();
@@ -17025,6 +18065,7 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
         clustered: false,
         invisible: index_def_invisible(&idx.index_options),
         where_clause,
+        fulltext: false,
     })
 }
 
@@ -17085,6 +18126,7 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
         clustered,
         invisible: index_def_invisible(&idx.index_options),
         where_clause: take_partial_index_predicate("PRIMARY"),
+        fulltext: false,
     })
 }
 
@@ -17147,7 +18189,91 @@ fn index_part(col: &sqlparser::ast::IndexColumn) -> Result<IndexPart> {
 /// `field.Text()` spelling of an index expression, used by SHOW CREATE TABLE
 /// and `information_schema.tidb_indexes`.
 fn index_expr_text(expr: &Expr) -> Result<String> {
-    Ok(lower_expr(expr)?.restore_string())
+    let text = lower_expr(expr)?.restore_string();
+    // TiDB stores `GeneratedExprString` with the charset introducer each
+    // literal was written with (`_utf8'$.p'`); the lowered AST drops it, so
+    // replay the source text's introducers onto the rendered literals.
+    Ok(apply_charset_introducers(&text, &format!("{expr}")))
+}
+
+/// Charset introducer names an index-part expression wrote, in source order.
+fn source_charset_introducers(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'_' && (i == 0 || !ident(bytes[i - 1])) {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && ident(bytes[j]) {
+                j += 1;
+            }
+            let mut k = j;
+            while k < bytes.len() && bytes[k] == b' ' {
+                k += 1;
+            }
+            if j > start && k < bytes.len() && (bytes[k] == b'\'' || bytes[k] == b'"') {
+                out.push(source[start..j].to_ascii_lowercase());
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Prefix the k-th single-quoted literal of `rendered` with the k-th introducer
+/// of `source` (`cast(json_extract(j, '$.p') as …)` → `… _utf8'$.p' …`).
+fn apply_charset_introducers(rendered: &str, source: &str) -> String {
+    let introducers = source_charset_introducers(source);
+    if introducers.is_empty() {
+        return rendered.to_string();
+    }
+    let bytes = rendered.as_bytes();
+    let mut spans: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\'' {
+            i += 1;
+            continue;
+        }
+        spans.push(i);
+        let mut j = i + 1;
+        loop {
+            if j >= bytes.len() {
+                break;
+            }
+            if bytes[j] == b'\\' {
+                j += 2;
+                continue;
+            }
+            if bytes[j] == b'\'' {
+                if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                    j += 2;
+                    continue;
+                }
+                j += 1;
+                break;
+            }
+            j += 1;
+        }
+        i = j;
+    }
+    if spans.len() != introducers.len() {
+        return rendered.to_string();
+    }
+    let mut out = String::with_capacity(rendered.len() + spans.len() * 6);
+    let mut last = 0;
+    for (start, introducer) in spans.iter().zip(&introducers) {
+        out.push_str(&rendered[last..*start]);
+        out.push('_');
+        out.push_str(introducer);
+        last = *start;
+    }
+    out.push_str(&rendered[last..]);
+    out
 }
 
 /// `CHAR(32)` length text; `VARCHAR(MAX)` has no MySQL length and keeps `MAX`.

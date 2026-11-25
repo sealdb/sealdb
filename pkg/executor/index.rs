@@ -157,8 +157,15 @@ pub(crate) fn write_index_keys(
         if !index_applies(info, index, values) {
             continue;
         }
+        // A multi-valued column may repeat an element inside one array
+        // (`[3, 3, 4]`); TiDB writes that element's key only once for the row,
+        // so the row never conflicts with itself.
+        let mut written: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for entry in index_value_variants(info, index, values) {
             let key = encode_index_key(physical_id, index.id, &entry, handle, index.unique);
+            if !written.insert(key.as_bytes().to_vec()) {
+                continue;
+            }
             if index.unique && txn.get(key.as_bytes())?.is_some() {
                 let value = entry
                     .iter()

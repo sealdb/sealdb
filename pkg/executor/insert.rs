@@ -8,10 +8,11 @@ use sealdb_errno::{
     ERR_DATA_OUT_OF_RANGE, ERR_DATA_TOO_LONG, ERR_DUP_ENTRY, ERR_FIELD_NOT_DEFAULT,
     ERR_FIELD_SPECIFIED_TWICE, ERR_INVALID_AUTO_RANDOM, ERR_NO_DB,
     ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
-    ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN, ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
-    ERR_TRUNCATED_WRONG_VALUE, ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD, ERR_UNKNOWN_ERROR,
-    ERR_UNKNOWN_PARTITION, ERR_WARN_DATA_OUT_OF_RANGE, ERR_WARN_DATA_TRUNCATED,
-    ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
+    ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN, ERR_RECORD_FILE_FULL,
+    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_TRUNCATED_WRONG_VALUE,
+    ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD, ERR_UNKNOWN_ERROR, ERR_UNKNOWN_PARTITION,
+    ERR_WARN_DATA_OUT_OF_RANGE, ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error,
+    Result,
 };
 use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
@@ -39,6 +40,34 @@ thread_local! {
     /// Whether this statement already recorded the auto-increment id TiDB
     /// exposes through `LAST_INSERT_ID()` (the first generated id wins).
     static LAST_ID_RECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The session's `tidb_tmp_table_max_size` while the statement runs
+    /// (`None` outside a session). Only temporary-table writes consult it.
+    static TMP_TABLE_MAX_SIZE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Publish `tidb_tmp_table_max_size` for the duration of `f`. The previous
+/// value is restored even if `f` unwinds.
+pub fn with_tmp_table_max_size<R>(limit: Option<u64>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TMP_TABLE_MAX_SIZE.with(|cell| cell.set(self.0));
+        }
+    }
+    let previous = TMP_TABLE_MAX_SIZE.with(std::cell::Cell::get);
+    TMP_TABLE_MAX_SIZE.with(|cell| cell.set(limit));
+    let _restore = Restore(previous);
+    f()
+}
+
+fn tmp_table_max_size() -> Option<u64> {
+    TMP_TABLE_MAX_SIZE.with(std::cell::Cell::get)
+}
+
+/// Bytes a row contributes to a temporary table (`TemporaryTableData`
+/// accounts the encoded KV value, which is dominated by the row payload).
+fn row_data_size(col_ids: &[i64], values: &[Datum]) -> u64 {
+    encode_row(col_ids, values).len() as u64
 }
 
 /// Record one generated AUTO_INCREMENT id for `LAST_INSERT_ID()`.
@@ -314,6 +343,24 @@ impl Executor for InsertExec {
             let mut existing = scan_table(&self.txn, info, lock, LockWait::Block, &physical)?;
             let mut affected = 0u64;
             let mut duplicates = 0u64;
+            // Temporary tables are capped by `tidb_tmp_table_max_size`; the
+            // scanned rows give the current footprint so a rolled-back insert
+            // is not counted again (the limit lives outside the txn).
+            let temp_limit = if info.temporary {
+                tmp_table_max_size()
+            } else {
+                None
+            };
+            let col_ids: Vec<i64> = info.columns.iter().map(|c| c.id).collect();
+            let table_name = self.stmt.table.name.clone();
+            let mut temp_size = temp_limit
+                .map(|_| {
+                    existing
+                        .iter()
+                        .map(|row| row_data_size(&col_ids, &row.values))
+                        .sum::<u64>()
+                })
+                .unwrap_or(0);
             self.txn.with_txn(|txn| {
                 for PendingRow {
                     values,
@@ -339,10 +386,21 @@ impl Executor for InsertExec {
                         }
                         return Err(e);
                     }
+                    if let Some(limit) = temp_limit
+                        && temp_size > limit
+                    {
+                        return Err(Error::new(
+                            ERR_RECORD_FILE_FULL,
+                            format!("The table '{table_name}' is full"),
+                        ));
+                    }
                     match write_row(txn, &self.domain, info, values, *rowid) {
                         Ok((handle, physical_id)) => {
                             if let Some(id) = generated_id {
                                 record_last_insert_id(*id);
+                            }
+                            if temp_limit.is_some() {
+                                temp_size += row_data_size(&col_ids, values);
                             }
                             existing.push(crate::table_reader::ScannedRow {
                                 handle,
@@ -1317,7 +1375,9 @@ fn fill_auto_increment(
             }
         };
         if needs_alloc {
-            let next = domain.next_auto_id(info.id)?;
+            // TiDB `AUTO_ID_CACHE`: ids are handed out in batches of the
+            // table option (1 by default).
+            let next = domain.next_auto_id_with_cache(info.id, info.auto_id_cache.unwrap_or(1))?;
             if let Some(max) = auto_increment_ceiling(&col.field_type)
                 && next > max
             {
@@ -1755,11 +1815,19 @@ pub(crate) fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Resul
     {
         if t.year == 0 {
             if sealdb_expression::sql_mode_flag("NO_ZERO_DATE") {
-                let msg = format!(
-                    "Incorrect timestamp value: '{t}' for column '{}' at row {}",
-                    col.name.o(),
-                    cast_row_no()
-                );
+                // The message quotes the value as the user wrote it (`0`, not
+                // the normalized zero timestamp). An UPDATE assignment reports
+                // the value alone; INSERT/REPLACE append the column and row.
+                let value_text = v.display();
+                let msg = if UPDATE_ASSIGNMENT.with(std::cell::Cell::get) {
+                    format!("Incorrect timestamp value: '{value_text}'")
+                } else {
+                    format!(
+                        "Incorrect timestamp value: '{value_text}' for column '{}' at row {}",
+                        col.name.o(),
+                        cast_row_no()
+                    )
+                };
                 if strict_sql_mode() {
                     return Err(Error::new(ERR_TRUNCATED_WRONG_VALUE, msg));
                 }
@@ -1823,7 +1891,17 @@ fn check_decimal_scale(raw: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<()>
         Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         _ => return Ok(()),
     };
-    let (frac_text, frac_digits) = match text.split_once('.') {
+    // An exponent form (`12e-3`) hides its fractional digits behind the shift:
+    // TiDB rounds the expanded value (`0.012`, three fractional digits) but
+    // reports the original spelling in the warning.
+    let expanded = if text.contains(['e', 'E']) {
+        sealdb_types::MyDecimal::parse(text.trim())
+            .map(|d| d.to_string())
+            .unwrap_or_else(|_| text.clone())
+    } else {
+        text.clone()
+    };
+    let (frac_text, frac_digits) = match expanded.split_once('.') {
         Some((_, frac)) => {
             let digits = frac.chars().take_while(|c| c.is_ascii_digit()).count();
             (frac, digits)
@@ -1881,6 +1959,24 @@ fn check_numeric_range(raw: &Datum, out: Datum, col: &sealdb_meta::ColumnInfo) -
             Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
             other => other.display(),
         };
+        // An exponent form (`1e30`) carries zeros the raw text does not show;
+        // expand it so the integer-digit count matches the stored value.
+        let text = if text.contains(['e', 'E']) {
+            sealdb_types::MyDecimal::parse(text.trim()).map_or(text, |d| d.to_string())
+        } else {
+            text
+        };
+        // An UNSIGNED DECIMAL keeps a negative assignment as its unsigned
+        // zero (TiDB `ProduceDecimal`): 1264 outside strict mode, an error
+        // inside it.
+        if ft.is_unsigned() && text.trim_start().starts_with('-') {
+            if strict_sql_mode() {
+                return Err(Error::new(ERR_WARN_DATA_OUT_OF_RANGE, msg()));
+            }
+            sealdb_expression::note_warning(ERR_WARN_DATA_OUT_OF_RANGE, msg());
+            let zero = sealdb_types::MyDecimal::from_i64(0).with_frac(ft.decimal);
+            return Ok(Datum::Decimal(zero));
+        }
         let int_digits = text
             .trim()
             .trim_start_matches(['+', '-'])
@@ -2154,7 +2250,8 @@ fn is_plain_decimal(text: &str) -> bool {
 }
 
 /// Whether `text` is a well-formed decimal with an exponent (`12e-3`,
-/// `1.5E+2`). Such a literal is a valid number but not an exact DECIMAL one.
+/// `1.5E+2`). TiDB's `MyDecimal.FromString` shifts the mantissa by the
+/// exponent, so such a literal is a valid DECIMAL value.
 fn is_exponent_form(text: &str) -> bool {
     let trimmed = text.trim();
     let rest = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
@@ -2176,20 +2273,14 @@ fn invalid_numeric_text(
 ) -> Result<Option<Result<Datum>>> {
     let ft = &col.field_type;
     if ft.tp == TYPE_DECIMAL || ft.tp == TYPE_NEW_DECIMAL {
-        if is_plain_decimal(text) {
+        if is_plain_decimal(text) || is_exponent_form(text) {
             return Ok(None);
         }
-        // An exponent form is a valid float but not a decimal literal: TiDB
-        // keeps 0 and only warns.
         let msg = format!(
             "Incorrect decimal value: '{}' for column '{}' at row 1",
             sealdb_errno::error_value(text),
             col.name.o()
         );
-        if is_exponent_form(text) {
-            sealdb_expression::note_warning(sealdb_errno::ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD, msg);
-            return Ok(Some(Ok(implicit_zero(&ft))));
-        }
         if strict_sql_mode() {
             return Ok(Some(Err(Error::new(
                 sealdb_errno::ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD,
@@ -2732,6 +2823,22 @@ fn rowid_override(columns: &[String], row: &[Datum]) -> Result<Option<i64>> {
     }
 }
 
+/// Allocate a row id for a heap row. A table with an `AUTO_INCREMENT` column
+/// hands both out of the same auto-id chunk (TiDB `table.Allocator`), and both
+/// honour `AUTO_ID_CACHE`; `SHARD_ROW_ID_BITS` randomizes the high bits.
+fn next_row_handle(domain: &Domain, info: &sealdb_meta::TableInfo) -> Result<i64> {
+    let step = info.auto_id_cache.unwrap_or(1);
+    if info.shard_row_id_bits > 0 {
+        // TiDB `SHARD_ROW_ID_BITS`: heap-table row ids embed a shard prefix that
+        // changes every `tidb_shard_allocate_step` rows of a batch.
+        domain.next_sharded_handle(info.id, info.shard_row_id_bits)
+    } else if info.columns.iter().any(|c| c.auto_increment) {
+        domain.next_auto_id_with_cache(info.id, step)
+    } else {
+        domain.next_handle_with_cache(info.id, step)
+    }
+}
+
 fn write_row(
     txn: &mut dyn sealdb_kv::Transaction,
     domain: &Domain,
@@ -2753,11 +2860,7 @@ fn write_row(
         // `_tidb_rowid` given by the statement (heap table only). `0` still
         // asks for an allocated id unless `NO_AUTO_VALUE_ON_ZERO` is set.
         if explicit == 0 && !sealdb_expression::sql_mode_flag("NO_AUTO_VALUE_ON_ZERO") {
-            if info.shard_row_id_bits > 0 {
-                domain.next_sharded_handle(info.id, info.shard_row_id_bits)?
-            } else {
-                domain.next_handle(info.id)?
-            }
+            next_row_handle(domain, info)?
         } else {
             // Keep the allocator ahead of an explicit id so a later implicit
             // insert cannot reuse it (TiDB `bumpRowID`). A sharded table only
@@ -2768,7 +2871,13 @@ fn write_row(
             } else {
                 ((explicit as u64) << bits >> bits) as i64
             };
-            domain.bump_handle(info.id, bump)?;
+            // An `AUTO_INCREMENT` table shares one allocator between the column
+            // and `_tidb_rowid`, so the explicit handle raises that counter.
+            if info.columns.iter().any(|c| c.auto_increment) {
+                domain.bump_auto_id(info.id, bump)?;
+            } else {
+                domain.bump_handle(info.id, bump)?;
+            }
             explicit
         }
     } else if info.pk_is_handle {
@@ -2776,14 +2885,10 @@ fn write_row(
             Some(Datum::I64(v)) => *v,
             Some(Datum::Year(v)) => *v,
             Some(Datum::U64(v)) => *v as i64,
-            _ => domain.next_handle(info.id)?,
+            _ => next_row_handle(domain, info)?,
         }
-    } else if info.shard_row_id_bits > 0 {
-        // TiDB `SHARD_ROW_ID_BITS`: heap-table row ids embed a shard prefix that
-        // changes every `tidb_shard_allocate_step` rows of a batch.
-        domain.next_sharded_handle(info.id, info.shard_row_id_bits)?
     } else {
-        domain.next_handle(info.id)?
+        next_row_handle(domain, info)?
     };
     let physical_id = locate_partition_for_row(info, values)?;
     let key = encode_row_key_with_handle(physical_id, handle);

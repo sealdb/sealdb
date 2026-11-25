@@ -9,7 +9,8 @@ use crate::list_partition::{
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_NO_SUCH_TABLE,
-    ERR_UNSUPPORTED_DDL_OPERATION, Error, Result,
+    ERR_UNSUPPORTED_DDL_OPERATION, ERR_WRONG_NAME_FOR_INDEX, ERR_WRONG_PARTITION_NAME, Error,
+    Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -17,7 +18,7 @@ use sealdb_meta::{
     ListInEntry, Mutator, PartitionDefinition, PartitionInfo, PartitionType, TableInfo,
 };
 use sealdb_parser::ast::{
-    PartitionDef, PartitionOption, PartitionType as AstPartitionType, TableName,
+    IndexUpdate, PartitionDef, PartitionOption, PartitionType as AstPartitionType, TableName,
 };
 use sealdb_tablecodec::{
     decode_handle_from_row_key, decode_row, encode_row_key_with_handle, encode_table_prefix,
@@ -105,11 +106,26 @@ fn evaluate_interval_bound(bound: &str) -> String {
     }
 }
 
+/// TiDB `util.IsInCorrectIdentifierName` for partition names: an empty name or
+/// one whose last byte is a space is rejected with 1567 before any DDL work.
+fn validate_partition_names(defs: &[PartitionDef]) -> Result<()> {
+    for def in defs {
+        if def.name.is_empty() || def.name.ends_with(' ') {
+            return Err(Error::new(
+                ERR_WRONG_PARTITION_NAME,
+                "Incorrect partition name",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn attach_partitions(
     meta: &mut Mutator,
     info: &mut TableInfo,
     spec: &PartitionOption,
 ) -> Result<()> {
+    validate_partition_names(&spec.defs)?;
     let key_cols = if !spec.columns.is_empty() {
         spec.columns.clone()
     } else if !spec.column.is_empty() {
@@ -475,6 +491,9 @@ pub fn add_partitions(
     current_db: &str,
     storage: &dyn Storage,
 ) -> Result<()> {
+    // TiDB preprocess `checkAlterTableGrammar` rejects bad partition names
+    // before the table is even resolved (1567).
+    validate_partition_names(defs)?;
     let (schema, name) = resolve_name(table, current_db)?;
     let db = is
         .schema_by_name(&schema)
@@ -2292,6 +2311,17 @@ pub fn reorganize_partitions(
     }
     remove_idxs.sort_unstable();
 
+    // TiDB `getReplacedPartitionIDs`: RANGE partitions must be reorganized as
+    // one contiguous run (8200 otherwise).
+    if part_ref.tp == PartitionType::Range
+        && remove_idxs.windows(2).any(|pair| pair[1] != pair[0] + 1)
+    {
+        return Err(Error::new(
+            ERR_UNSUPPORTED_DDL_OPERATION,
+            "Unsupported REORGANIZE PARTITION of RANGE; not adjacent partitions",
+        ));
+    }
+
     if part_ref.tp == PartitionType::Range {
         let key_cols: Vec<String> = part_ref.columns.iter().map(|c| c.o().to_string()).collect();
         let range_columns = part_ref.range_columns;
@@ -2429,6 +2459,7 @@ pub fn repartition(
     is: &InfoSchema,
     table: &TableName,
     spec: &PartitionOption,
+    update_indexes: &[IndexUpdate],
     current_db: &str,
     storage: &dyn Storage,
 ) -> Result<()> {
@@ -2457,6 +2488,29 @@ pub fn repartition(
         }
     }
     drop(txn);
+    // TiDB `... UPDATE INDEXES (idx GLOBAL, idx2 LOCAL)`: the explicit option
+    // overrides the current locality; unknown or repeated names are 1280.
+    let mut seen = std::collections::HashSet::new();
+    for update in update_indexes {
+        let lower = update.name.to_ascii_lowercase();
+        if !seen.insert(lower.clone()) {
+            return Err(Error::new(
+                ERR_WRONG_NAME_FOR_INDEX,
+                format!("Incorrect index name '{}'", update.name),
+            ));
+        }
+        let Some(index) = info
+            .indices
+            .iter_mut()
+            .find(|idx| idx.name.o().eq_ignore_ascii_case(&update.name))
+        else {
+            return Err(Error::new(
+                ERR_WRONG_NAME_FOR_INDEX,
+                format!("Incorrect index name '{}'", update.name),
+            ));
+        };
+        index.global = update.global;
+    }
     attach_partitions(meta, &mut info, spec)?;
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;

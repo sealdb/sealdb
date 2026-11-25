@@ -7323,6 +7323,7 @@ fn selection_table(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::BatchPointGet { table, .. }
         | PhysicalPlan::TableReader { table, .. }
         | PhysicalPlan::IndexReader { table, .. }
+        | PhysicalPlan::IndexMerge { table, .. }
         | PhysicalPlan::IndexLookUpReader { table, .. } => Some(table),
         PhysicalPlan::Selection { child, .. }
         | PhysicalPlan::Projection { child, .. }

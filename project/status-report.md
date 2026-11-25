@@ -1,6 +1,6 @@
 # 整体进展报告（Status Report）
 
-> 生成时间：2026-11-23 19:40 (+08:00)
+> 生成时间：2026-11-25 00:20 (+08:00)
 > 事实来源：`project/regression/manifest.json`（suite 状态）、`project/parity/status.json`（包级对齐）、`git log`
 > 规范：[testing.md](./testing.md) · [parity-discipline.md](./parity-discipline.md) · [progress.md](./progress.md)
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **131 个** 登记为 `green`（R1 4 / R2 16 / R3 32 / R5 7 / R6 20 / R7 52）。本轮新增 `privilege/privileges` 转绿：对齐 TiDB 的 31 位静态权限位与展示顺序、动态权限记录 `WITH GRANT OPTION`、补齐 `ALTER USER` / `CREATE ROLE` / `SET DEFAULT ROLE` / `RENAME USER` / `SET PASSWORD` 等账号角色 DDL、`SHOW GRANTS` 的 `CURRENT_USER()`/`USING` 角色展开与 3530、`information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES` 与 `mysql.user` 物化，并落地逐语句鉴权矩阵（DML 列级/表级、`IMPORT INTO`、`SET GLOBAL`、视图 definer 双路径、`CLUSTER_*` 的 `CONFIG` 门控）；TiKV 重置时同步清空权限快照，避免上一文件的 `GRANT ALL` 泄漏到下一文件。上一轮新增 `session/privileges` 转绿：`CURRENT_USER()`/`USER()` 内置函数、视图级 `CREATE VIEW`/`SHOW VIEW` 权限位与 `GRANT … ON view` 解析、`mysql.tables_priv` 由权限管理器虚拟物化（`Select,Show View` / `Create View` 渲染），以及 `GRANT … ON t` 未限定库名时按会话当前库落库；同时修正旧快照中 `ALL` 位掩码（0x3f/0x7f）的兼容解码，避免 TiKV 持久化快照让 root 丢失新权限位。再上一轮新增 `statistics/overflow_calc` 转绿：统计默认值对齐 TiDB v2 analyze（256 桶 / TopN 100），ANALYZE 为普通索引登记占位统计（不再误报 `stats:partial[idx:missing]`），并新增「RIGHT JOIN 两侧聚簇键区间 → 有序 `TableRangeScan` + `MergeJoin`」的计划选择。此前一轮新增 `explain_indexmerge_stats` 转绿：`utf8mb4_0900_ai_ci` 索引键的 UCA 排序键（ranger 区间按权重字节渲染）、IndexMerge 下 cop `TopN` 只在索引键覆盖排序列时下沉到臂、否则落在 merge 的 probe 侧，以及 merge 估算归零时根 `TopN` 保留 limit 上界。再此前一轮新增 `ddl/db_partition`：LIST/LIST COLUMNS 字面量与日期归一、RANGE COLUMNS 尾列类型强制、1526/1654 错误码分流、RANGE REORGANIZE PARTITION 行迁移与 `_tidb_rowid` 冲突重分配，以及 PREPARE 中 `\n` 转义与 INTERVAL RANGE 语句。R1 已收口，R2 完成 16/22，R3 完成 32/48，R5 完成 7/12，R7 完成 52/110；架构侧仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **139 个** 登记为 `green`（R1 4 / R2 16 / R3 32 / R5 12 / R6 20 / R7 55）。本轮新增 `globalindex/analyze` 转绿：表达式索引上的 SELECT 列表若正好拼出索引键表达式（`select c+1 … where (c+1)>3`），根 `Projection` 由 `expr_index_point_projection` 统一裁决——覆盖读在键区间/有序读上才保留重算投影且列号按 `max_col_id` 口径（`plus(t.c, 1)->Column#8`），全索引扫描直接回放键值不再多出投影，`gcSubstituter` 换入的可见虚拟列则由 `wrap_output_projection` 按「键区间 / 有谓词」判据决定是否补投影（修掉 `Column#9` 与缺失的 `cast(… double BINARY)` 渲染）。上一轮新增 `globalindex/misc` 转绿：`CREATE TABLE` 上「既是 GLOBAL 又是 CLUSTERED」的唯一键 / 主键按 TiDB 8200 拒绝、索引定义尾部的 `LOCAL` 关键字、`ALTER TABLE … PARTITION BY … UPDATE INDEXES (idx GLOBAL|LOCAL)` 的解析与逐索引 locality 翻转（不存在的索引名或重复项报 1280）、`SHOW CREATE TABLE` 对全局二级索引回写 `/*T![global_index] GLOBAL */` 并在解析侧展开、`FROM PARTITION (pN)` 读取全局索引时在 `IndexReader` 上补 `in(_tidb_tid, tidN)` 钉分区（与有序扫描合并为 `KEEP_ORDER_SEL`，保留 `keep order:true`），以及已分析表上全量覆盖索引扫描的 estRows 取真实行数（不再恒为伪统计 10000）。上一轮新增 `globalindex/multi_valued_index` 转绿：多值索引单行内重复元素（`{"zipcode": [3,3,4]}`）按行内索引键去重（不再与自身 1062，跨行重复仍冲突）、GLOBAL MVIndex merge 根补 `partition:all`/`partition:pN` 标签、`merge_extra_projection` 只在脏读 `UnionScan` 或有序 merge 多出排序列时保留根投影、`IndexMergeExecutor` 补上 merge 根 `probe_selection`（`Selection(Probe)`）过滤、root `Selection` 的算子信息用 `IndexMerge` 的真实表名限定，以及索引表达式文本按 `GeneratedExprString` 回放字符集引导符（`_utf8'$.zipcode'` 不再被改写成 `_utf8mb4`）。上一轮新增 `ddl/db_integration` 转绿，R5 由此收口（12/12）：表达式索引沿用 TiDB `checkIndexColumn` 的全套校验（多值 `CAST(… ARRAY)` 按 AST 判定并豁免整列规则、零宽 CHAR/VARCHAR → 3761、无长度 TEXT/BLOB → 3757、JSON/GEOMETRY → 3753）、`getIndexColumnLength` 的逐类型字节折算与 3072 键长 1071、`timestampadd`/`timestampdiff` 的返回类型、`DEFAULT NULL` 与转义 `BINARY(197)` 默认值长度，以及 `SHOW CREATE VIEW` 的「视图体保留自然别名 + 列清单 64 字符回落 `name_exp_<pos>`」双规则。上一轮新增 `session/temporary_table` 转绿：跨库临时表统一登记到 `TEMP_TABLE_SCHEMA`（限定名 `db2.t` 同步改写）、`CREATE TEMPORARY TABLE … LIKE` 清空 placement/affinity、显式事务内 TRUNCATE 走 txn handle 清理未提交行，以及 `UnionScan` 的 `keep_order` 下推。上一轮新增 `session/nontransactional` 转绿：补齐 `BATCH ON … LIMIT` 非事务 DML 的 `_tidb_rowid` 分裂条件（堆表在 `TableReader` 推送过滤前暴露隐藏行柄、`SELECT t1.*` 星号投影宽度、`INSERT … SELECT … ON DUPLICATE KEY UPDATE` 的 AST restore）、split 语句的 TiDB 括号恢复模式（`SET b=(b + 42)` / `((a <= 9) OR a IS NULL)`）、`DELETE IGNORE` 保留 IGNORE 且作业告警回传，以及 `sql_select_limit` 会话变量（顶层 SELECT/UNION 自动补 LIMIT，内部受限 SQL 豁免）。上一轮新增 `session/vars` 转绿：补齐 `SET_VAR` 提示的逐语句作用域（含 `PREPARE`/`EXECUTE` 文本内的提示）、`@@global./@@session.` 的变量作用域校验（1238）、instance 作用域变量的 SET SESSION 兼容路径（8142/1229）、`tidb_tso_client_batch_max_wait_time` 的 [0,10] 截断告警与 PD 动态布尔项，以及一批 MySQL 变量默认值。上一轮新增 `session/common` 转绿：补上 `@v := expr` 的赋值运算符（sqlparser 把它按 `=` 优先级左结合，`c = @v := 1` 需要旋转成 `c = (@v := 1)`）、跨库多表 `DELETE`/`UPDATE` 的 `db.t.col` 标签与按库名判定（同名表不再混淆）、MySQL 二进制字面量 `0b101`、`CAST(x AS BINARY(n))` 的零填充、`CAST(str AS TIME)` 的截断告警与非法值转 NULL。上一轮新增 `privilege/privileges` 转绿：对齐 TiDB 的 31 位静态权限位与展示顺序、动态权限记录 `WITH GRANT OPTION`、补齐 `ALTER USER` / `CREATE ROLE` / `SET DEFAULT ROLE` / `RENAME USER` / `SET PASSWORD` 等账号角色 DDL、`SHOW GRANTS` 的 `CURRENT_USER()`/`USING` 角色展开与 3530、`information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES` 与 `mysql.user` 物化，并落地逐语句鉴权矩阵（DML 列级/表级、`IMPORT INTO`、`SET GLOBAL`、视图 definer 双路径、`CLUSTER_*` 的 `CONFIG` 门控）；TiKV 重置时同步清空权限快照，避免上一文件的 `GRANT ALL` 泄漏到下一文件。上一轮新增 `session/privileges` 转绿：`CURRENT_USER()`/`USER()` 内置函数、视图级 `CREATE VIEW`/`SHOW VIEW` 权限位与 `GRANT … ON view` 解析、`mysql.tables_priv` 由权限管理器虚拟物化（`Select,Show View` / `Create View` 渲染），以及 `GRANT … ON t` 未限定库名时按会话当前库落库；同时修正旧快照中 `ALL` 位掩码（0x3f/0x7f）的兼容解码，避免 TiKV 持久化快照让 root 丢失新权限位。再上一轮新增 `statistics/overflow_calc` 转绿：统计默认值对齐 TiDB v2 analyze（256 桶 / TopN 100），ANALYZE 为普通索引登记占位统计（不再误报 `stats:partial[idx:missing]`），并新增「RIGHT JOIN 两侧聚簇键区间 → 有序 `TableRangeScan` + `MergeJoin`」的计划选择。此前一轮新增 `explain_indexmerge_stats` 转绿：`utf8mb4_0900_ai_ci` 索引键的 UCA 排序键（ranger 区间按权重字节渲染）、IndexMerge 下 cop `TopN` 只在索引键覆盖排序列时下沉到臂、否则落在 merge 的 probe 侧，以及 merge 估算归零时根 `TopN` 保留 limit 上界。再此前一轮新增 `ddl/db_partition`：LIST/LIST COLUMNS 字面量与日期归一、RANGE COLUMNS 尾列类型强制、1526/1654 错误码分流、RANGE REORGANIZE PARTITION 行迁移与 `_tidb_rowid` 冲突重分配，以及 PREPARE 中 `\n` 转义与 INTERVAL RANGE 语句。R1 已收口，R2 完成 16/22，R3 完成 32/48，R5 已收口（12/12），R7 完成 55/110；架构侧仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -22,9 +22,9 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **131 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 131 | 51.6% |
+| `green` | 139 | 54.7% |
 | `in_progress` | 8 | 3.1% |
-| `pending` | 105 | 41.3% |
+| `pending` | 97 | 38.2% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
 
@@ -38,24 +38,24 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **131 个** �
 | R2（join / subquery / agg / window / cte） | 16 | 5 | 1 | 主波完成 ~73% |
 | R3（point_get / index / partition / explain*） | 32 | 3 | 13 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
-| R5 | 7 | 0 | 5 | `session/txn` / `db_integration` / `session/variable` / `session/bootstrap_upgrade` / `session/session` / `session/privileges` / `privilege/privileges` 已绿 |
+| R5 | 12 | 0 | 0 | **已收口**：`session/txn` / `session/variable` / `session/session` / `session/common` / `session/vars` / `session/nontransactional` / `session/temporary_table` / `db_integration` / `ddl/db_integration` / `session/bootstrap_upgrade` / `session/privileges` / `privilege/privileges` |
 | R6 | 20 | 0 | 15 | DDL / infoschema 起步 |
-| R7 | 52 | 0 | 58 | 零散长尾 |
+| R7 | 55 | 0 | 55 | 零散长尾 |
 | D（TiFlash/MPP） | 0 | 0 | 2 | deferred |
 | local | — | — | — | 9 套冒烟 |
 
 ---
 
-## 3. 已绿 suite 清单（131）
+## 3. 已绿 suite 清单（139）
 
 | Wave | Suite |
 |---|---|
 | R1 | `select`, `show`, `types/const`, `types/time` |
 | R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_push_down`, `topn_pushdown`, `window_function` |
 | R3 | `access_path_selection`, `clustered_index`, `ddl/db_partition`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/explain`, `executor/explainfor`, `executor/index_lookup_pushdown_partition`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy`, `explain_easy_stats`, `explain_foreign_key`, `explain_generate_column_substitute`, `explain_indexmerge_stats`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `expression/explain`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `globalindex/point_get`, `partition`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
-| R5 | `session/txn`, `session/variable`, `session/session`, `session/privileges`, `privilege/privileges`, `db_integration`, `session/bootstrap_upgrade` |
+| R5 | `session/txn`, `session/variable`, `session/session`, `session/common`, `session/vars`, `session/nontransactional`, `session/temporary_table`, `session/privileges`, `privilege/privileges`, `db_integration`, `ddl/db_integration`, `session/bootstrap_upgrade` |
 | R6 | `ddl/affinity`, `ddl/attributes_sql`, `ddl/column`, `ddl/column_change`, `ddl/column_modify`, `ddl/column_type_change`, `ddl/db_cache`, `ddl/db_change`, `ddl/db_foreign_key`, `ddl/db_rename`, `ddl/ddl_error`, `ddl/fail_db`, `ddl/index_modify`, `ddl/resource_group`, `ddl/table_modify`, `infoschema/cluster_tables`, `infoschema/v2`, `statistics/integration`, `statistics/lock_table_stats`, `statistics/overflow_calc` |
-| R7 | `black_list`, `bindinfo/bind`, `bindinfo/session_handle`, `bindinfo/temptable`, `executor/adapter`, `executor/charset`, `executor/ddl`, `executor/distsql`, `executor/executor_txn`, `executor/index_advise`, `executor/index_lookup_join`, `executor/index_lookup_merge_join`, `executor/index_lookup_pushdown`, `executor/stale_txn`, `expression/enum_set`, `expression/format`, `expression/time`, `expression/vitess_hash`, `globalindex/expression_index`, `globalindex/information_schema`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `planner/core/casetest/index/partialindex`, `planner/core/memtable_predicate_extractor`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `sessiontxn/externals`, `table/cache`, `table/tables`, `table/temptable`, `util/admin`, `sessionctx/setvar`, `planner/core/indexjoin`, `planner/core/indexmerge_intersection`, `executor/compact_table`, `expression/constant_fold`, `executor/kv`, `planner/core/rule_result_reorder`, `table/index`, `executor/rowid`, `executor/analyze`, `executor/delete`, `executor/update`, `executor/insert`, `expression/cast`, `expression/noop_functions`, `planner/core/casetest/expression_rewriter`, `expression/misc` |
+| R7 | `black_list`, `bindinfo/bind`, `bindinfo/session_handle`, `bindinfo/temptable`, `executor/adapter`, `executor/charset`, `executor/ddl`, `executor/distsql`, `executor/executor_txn`, `executor/index_advise`, `executor/index_lookup_join`, `executor/index_lookup_merge_join`, `executor/index_lookup_pushdown`, `executor/stale_txn`, `expression/enum_set`, `expression/format`, `expression/time`, `expression/vitess_hash`, `globalindex/expression_index`, `globalindex/information_schema`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `planner/core/casetest/index/partialindex`, `planner/core/memtable_predicate_extractor`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `sessiontxn/externals`, `table/cache`, `table/tables`, `table/temptable`, `util/admin`, `sessionctx/setvar`, `planner/core/indexjoin`, `planner/core/indexmerge_intersection`, `executor/compact_table`, `expression/constant_fold`, `executor/kv`, `planner/core/rule_result_reorder`, `table/index`, `executor/rowid`, `executor/analyze`, `executor/delete`, `executor/update`, `executor/insert`, `expression/cast`, `expression/noop_functions`, `planner/core/casetest/expression_rewriter`, `expression/misc`, `globalindex/misc`, `globalindex/multi_valued_index`, `globalindex/analyze` |
 
 **复验证据**
 
@@ -93,9 +93,9 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **131 个** �
 ./tests/integrationtest/run-tests.sh -s tikv -k -t statistics/overflow_calc
 → PASS: tikv=1
 ./tests/integrationtest/run-tests.sh -s memory
-→ PASS: memory=135 skipped=119（128 green + 8 local）
-./tests/integrationtest/run-tests.sh -s tikv -k
-→ PASS: tikv=133 skipped=121
+→ PASS: memory=145 skipped=109（137 green + 8 local）
+./tests/integrationtest/run-tests.sh -s tikv -t ddl/db_integration
+→ PASS: memory=0 tikv=1
 ```
 
 TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此前全量 TiKV gate 反复卡死的根因是本地 store 长期复用后膨胀到 **51 GB**（tombstone / 失效 region，日志持续 `skip invalid split key`）。处理方式：`project/scripts/run_local_pd_tikv.sh stop` + `rm -rf /tmp/sealdb-pd-tikv` 后重启全新单节点集群。实测每轮全量 gate 约增 20 GB store，因此全量 TiKV gate 前统一从空 store 起，并先用 `du -sh /tmp/sealdb-pd-tikv` 确认。
@@ -279,6 +279,96 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 
 ---
 
+### 4.7 2026-11-23 波次（`session/common` 转绿 + 表达式/多表 DML 语义）
+
+| 方向 | 能力 |
+|---|---|
+| 赋值运算符 | `@v := expr` 按 TiDB 语法 `BoolPri CompareOp singleAtIdentifier := PredicateExpr` 处理：sqlparser 把 `:=` 按 `=` 左结合成 `(c = @v) := 1` 并报 1235，现旋转为 `c = (@v := 1)`；UPDATE/DELETE 的谓词与 SET 都走 eval-time 变量存储 |
+| 多表 DML 解析 | `DELETE t1 FROM t1, t2 WHERE …` 逗号表列表降为链式 join；`UPDATE t1, t2 SET …` 同步 |
+| 跨库同名表 | join 两侧 schema 标签保留库名（`db.t.col`），`resolve_column`/`find_schema_index` 在查询显式限定库名时按库名判定，避免 `session__common1.t` 与 `session__common.t` 的同名同别名互相串列 |
+| 二进制字面量 | MySQL `0b101` 统一改写为等值 `X'05'`（不足一字节左侧补零），`b'…'`/`X'…'` 保持 Bit datum；`CAST(x AS BINARY(n))` 对 Bit 取原始字节并截断/零填充（`cast(0x10 as binary(2))` = `0x1000`） |
+| CAST 到 TIME | `parse_duration_string` 保留「尾部多余文本」标记：`'1234x'` 返回 `00:12:34` + 1292 `Truncated incorrect time value`；空白/非数字前缀/≥12 字符尾巴按 TiDB 返回 NULL（DML 赋值仍按 `cast_for_column` 报错） |
+| 小数科学计数 | `MyDecimal::parse` 支持 `1e2` / `1.5e-3` 并做指数位移；INSERT 的数值范围校验接受指数形式（`unique` 冲突报 `'100'` 而不是 0） |
+| ADMIN 改写 | `ADMIN CLEANUP TABLE LOCK` 不再被 `rewrite_admin_show_ddl` 的兜底 `DO 0` 吞掉，交由 misc 提取器带表名降级 |
+
+**验证**
+
+```text
+./tests/integrationtest/run-tests.sh -s memory --status pending -t session/common
+→ PASS: memory=1 tikv=0 skipped=253
+./tests/integrationtest/run-tests.sh -s tikv -k --status pending -t session/common
+→ PASS: memory=0 tikv=1 skipped=253
+```
+
+---
+
+### 4.8 2026-11-23 波次（`session/vars` 转绿 + SET_VAR / 变量作用域）
+
+| 方向 | 能力 |
+|---|---|
+| `SET_VAR` 提示 | 变量名大小写归一、`SET_VAR(a=1) SET_VAR(a=2)` 取首个并告警 3126、未知变量告警 3128、`sql_auto_is_null` 按 noop 校验强制 OFF、`tikv_client_read_timeout` 负值归零/非法值跳过；`PREPARE` 文本内的提示在 `EXECUTE` 时生效并在语句结束恢复 |
+| 变量作用域 | 新增 `SysVarScope`（Session/Global/Both/Instance）：`@@global.<session-only>` 与 `@@session.<global-only>` 报 1238，裸 `@@x` 仍读会话值（未赋值时回落到全局）；`performance_schema_max_mutex_classes` 这类 `ScopeNone` 变量三作用域均可读 |
+| Instance 作用域 | `tidb_enable_legacy_instance_scope`（默认 ON）控制 `SET SESSION tidb_general_log`：开启时按 `SET GLOBAL` 执行并告警 8142，关闭时报 1229 |
+| PD 动态项 | `tidb_tso_client_batch_max_wait_time` 按 `TypeFloat[0,10]` 截断并告警 1292（`0.5`/`1.5` 保留小数）；`tidb_enable_tso_follower_proxy` / `pd_enable_follower_handle_region` 的 `@@` 输出 1/0，`SET GLOBAL … = DEFAULT` 回落默认 |
+| 变量表 | 补齐 `SET_VAR`/`@@` fixture 涉及的 MySQL 变量默认值与 ON/OFF 渲染（`tmp_table_size`、`join_buffer_size`、`max_join_size`、`optimizer_search_depth`、`windowing_use_high_precision` 等） |
+| 告警缓冲 | `@@warning_count` 读取上一语句的告警缓冲并随后清空，`@@session.warning_count`/`@@local.warning_count` 因此报 0 |
+
+**验证**
+
+```text
+./tests/integrationtest/run-tests.sh -s memory --status pending -t session/vars
+→ PASS: memory=1 tikv=0 skipped=253
+./tests/integrationtest/run-tests.sh -s tikv -k --status pending -t session/vars
+→ PASS: memory=0 tikv=1 skipped=253
+```
+
+---
+
+### 4.9 2026-11-23 波次（`session/temporary_table` 转绿 + 跨库临时表 / 事务内 TRUNCATE）
+
+| 方向 | 能力 |
+|---|---|
+| 跨库可见性 | `publish_temp_tables` / `overlay_temp_tables` 把所有会话临时表登记进 `TEMP_TABLE_SCHEMA`，非当前库的 `db2.tplacement3` 也能解析；`rewrite_temp_table_name` 同时改写未限定与 `db.t` 限定引用 |
+| `LIKE` 语义 | `CREATE TEMPORARY TABLE … LIKE 基表` 清空 `placement_policy` / `affinity`，临时表不继承 placement，`SHOW CREATE TABLE` 不渲染 `PLACEMENT POLICY` |
+| 事务内 TRUNCATE | 新增 `TxnManager::handle()` + `ddl::clear_table_keys_in_txn`：显式事务内 TRUNCATE 临时表走未提交的 txn handle，当前写缓冲的行一并清除（`select` 不再读到旧值） |
+| 保序下推 | `set_index_range_keep_order` 递归 `PhysicalPlan::UnionScan`，脏读 wrapper 下的 `IndexRangeScan` 仍带 `keep_order`；`plan_provides_order` 恢复 `IndexLookUpReader`/`IndexReader` 的排序推导 |
+
+**验证**
+
+```text
+./tests/integrationtest/run-tests.sh -s memory -t session/temporary_table
+→ PASS: memory=1 tikv=0
+./tests/integrationtest/run-tests.sh -s tikv -t session/temporary_table
+→ PASS: memory=0 tikv=1
+```
+
+---
+
+### 4.10 2026-11-23 波次（`ddl/db_integration` 转绿 + R5 收口）
+
+| 方向 | 能力 |
+|---|---|
+| 表达式索引校验 | `is_multi_valued_part` 用 AST 判定 `CAST(… AS … ARRAY)`（`json_array(b)` 不再误中）；多值部分豁免整列 BLOB/TEXT/JSON 规则，普通 JSON 函数表达式仍报 3753 |
+| `checkIndexColumn` | 零宽 `CHAR/VARCHAR` 结果 → 3761、无长度 `TEXT/BLOB` → 3757、`JSON`/`GEOMETRY` → 3753；`json_unquote`/`json_pretty` 按无长度 BLOB、`json_type` 51 字符、`json_quote` 按 `6n+2` 计宽 |
+| 3072 键长 | `getIndexColumnLength` 逐类型折算（BIT/CHAR/VARCHAR/DECIMAL/FLOAT≤24/时间类型…），多列或严格模式超限报 1071；列字符集/类型变更后 `revalidate_index_lengths` 复检 |
+| 时间函数索引 | `timestampadd(unit, n, dt)` → DATETIME（fsp 取时间参数）、`timestampdiff` → BIGINT，避免首个 unit 关键字被当成字符串回落（`explain_generate_column_substitute` 回归） |
+| 默认值 | `DEFAULT NULL` 不再参与 NOT NULL 的 1067 判定；`literal_char_len` 按解码字符数衡量转义/`\0` 填充后的 `BINARY(N)` 默认值（`binary(197)` 通过） |
+| 视图列名 | 视图体保留 `field.Text()` 自然别名、重名才 `Name_exp_*`；列清单额外对 >64 字符回落 `name_exp_<pos>`（`executor/ddl` 与 `ddl/db_integration` 的 `SHOW CREATE VIEW` 同时对齐） |
+| 小数入库 | `check_decimal_scale` 先展开指数再数小数位：`'12e-3'` 进 `DECIMAL(10,0)` 报 1366 告警并存 0，`'1e2'` 仍为 100（`executor/insert` 回归） |
+
+**验证**
+
+```text
+./tests/integrationtest/run-tests.sh -s memory -t ddl/db_integration
+→ PASS: memory=1 tikv=0
+./tests/integrationtest/run-tests.sh -s tikv -t ddl/db_integration
+→ PASS: memory=0 tikv=1
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory
+→ PASS（全量 green+local 闸门，0 mismatch）
+```
+
+---
+
 ## 5. 刚收口的 R3 套件
 
 | Suite | 收口要点 |
@@ -347,7 +437,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 1. `index_merge`：IN 子查询去关联成 semi/anti + `use_index_merge` 提示（`globalindex/mem_index_merge*` 已转绿，IndexMerge 侧骨架可直接复用）。
 2. `indexmerge_path` / `range_scan_for_like`：把 `utf8mb4_0900_ai_ci` 权重表补齐到非 ASCII 脚本（平假名/谚文），复用本轮落地的 `charset::collate_0900`。
 3. 回到 R2 剩余 `cte` / `explain_cte` / `join_reorder*`。
-4. R5 剩余 5 套（`session/vars`、`session/common`、`session/nontransactional`、`session/temporary_table`、`ddl/db_integration`），随后按波次推进 R4/R6/R7；TiFlash/MPP 维持 deferred。
+4. R5 已收口（12/12）；继续按波次推进 R6/R7 长尾与 R2 剩余 suite；TiFlash/MPP 维持 deferred。
 
 **备注（`planner/core/indexmerge_path` 归因，已用本地 TiDB v8.5.8 只读对拍确认）**
 
@@ -491,22 +581,22 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 12 | `planner/core/tests/prepare/issue` | pending | 0% | ✓ | — |
 | 13 | `planner/core/tests/prepare/prepare` | pending | 0% | ✓ | — |
 
-### R5（12 套，green 7）
+### R5（12 套，green 12，已收口）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
 | 1 | `db_integration` | green | 100% | ✓ | ✓ |
-| 2 | `ddl/db_integration` | pending | 0% | ✓ | — |
+| 2 | `ddl/db_integration` | green | 100% | ✓ | ✓ |
 | 3 | `privilege/privileges` | green | 100% | ✓ | ✓ |
 | 4 | `session/bootstrap_upgrade` | green | 100% | ✓ | ✓ |
-| 5 | `session/common` | pending | 0% | ✓ | — |
-| 6 | `session/nontransactional` | pending | 0% | ✓ | — |
+| 5 | `session/common` | green | 100% | ✓ | ✓ |
+| 6 | `session/nontransactional` | green | 100% | ✓ | ✓ |
 | 7 | `session/privileges` | green | 100% | ✓ | ✓ |
 | 8 | `session/session` | green | 100% | ✓ | ✓ |
-| 9 | `session/temporary_table` | pending | 0% | ✓ | — |
+| 9 | `session/temporary_table` | green | 100% | ✓ | ✓ |
 | 10 | `session/txn` | green | 100% | ✓ | ✓ |
-| 11 | `session/variable` | green | 100% | ✓ | — |
-| 12 | `session/vars` | pending | 0% | ✓ | — |
+| 11 | `session/variable` | green | 100% | ✓ | ✓ |
+| 12 | `session/vars` | green | 100% | ✓ | ✓ |
 
 ### R6（35 套，green 20）
 
@@ -548,7 +638,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 34 | `statistics/lock_table_stats` | green | 100% | ✓ | ✓ |
 | 35 | `statistics/overflow_calc` | green | 100% | ✓ | ✓ |
 
-### R7（110 套，green 52）
+### R7（110 套，green 53）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
@@ -610,7 +700,7 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 56 | `expression/time` | green | 100% | ✓ | ✓ |
 | 57 | `expression/vitess_hash` | green | 100% | ✓ | ✓ |
 | 58 | `generated_columns` | pending | 0% | ✓ | — |
-| 59 | `globalindex/analyze` | pending | 0% | ✓ | — |
+| 59 | `globalindex/analyze` | green | 100% | ✓ | ✓ |
 | 60 | `globalindex/ddl` | pending | 0% | ✓ | — |
 | 61 | `globalindex/expression_index` | green | 100% | ✓ | ✓ |
 | 62 | `globalindex/information_schema` | green | 100% | ✓ | ✓ |
@@ -618,8 +708,8 @@ TiKV 侧：全量 `-s tikv` gate 在清空本地 store 后可稳定跑通。此�
 | 64 | `globalindex/mem_index_lookup` | pending | 0% | ✓ | — |
 | 65 | `globalindex/mem_index_non_unique` | green | 100% | ✓ | ✓ |
 | 66 | `globalindex/mem_index_reader` | pending | 0% | ✓ | — |
-| 67 | `globalindex/misc` | pending | 0% | ✓ | — |
-| 68 | `globalindex/multi_valued_index` | pending | 0% | ✓ | — |
+| 67 | `globalindex/misc` | green | 100% | ✓ | ✓ |
+| 68 | `globalindex/multi_valued_index` | green | 100% | ✓ | ✓ |
 | 69 | `globalindex/update` | green | 100% | ✓ | ✓ |
 | 70 | `imdbload` | pending | 0% | ✓ | — |
 | 71 | `parser/integration` | green | 100% | ✓ | ✓ |

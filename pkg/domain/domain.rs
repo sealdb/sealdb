@@ -144,6 +144,11 @@ struct Inner {
     /// Skip Storage writes of Mutator until COMMIT after in-txn DDL.
     defer_persist: bool,
     jobs: Vec<Job>,
+    /// TiDB `AUTO_ID_CACHE` session cache: `table_id → (next, end, step)` for
+    /// `AUTO_INCREMENT` allocation.
+    auto_id_chunks: HashMap<i64, (i64, i64, i64)>,
+    /// The same cache for `_tidb_rowid` on heap tables.
+    handle_chunks: HashMap<i64, (i64, i64, i64)>,
 }
 
 /// Mutator + InfoSchema captured before the first DDL in an explicit
@@ -219,6 +224,8 @@ impl Domain {
                 infoschema,
                 defer_persist: false,
                 jobs: Vec::new(),
+                auto_id_chunks: HashMap::new(),
+                handle_chunks: HashMap::new(),
             }),
             storage,
             privilege: Arc::new(privilege),
@@ -821,27 +828,75 @@ impl Domain {
     }
 
     pub fn next_handle(&self, table_id: i64) -> Result<i64> {
+        self.next_handle_with_cache(table_id, 1)
+    }
+
+    /// Allocate a `_tidb_rowid`, honouring the table's `AUTO_ID_CACHE` batch
+    /// size (TiDB `AutoIDAllocator`): a chunk of `step` ids is reserved from the
+    /// meta counter and handed out one by one until it is exhausted.
+    pub fn next_handle_with_cache(&self, table_id: i64, step: i64) -> Result<i64> {
+        let step = step.max(1);
         let mut inner = self.inner.lock().expect("domain handle lock");
-        let next = inner.meta.alloc_handle(table_id)?;
+        if step > 1
+            && let Some((next, end, chunk_step)) = inner.handle_chunks.get_mut(&table_id)
+            && *chunk_step == step
+            && *next <= *end
+        {
+            let id = *next;
+            *next += 1;
+            return Ok(id);
+        }
+        let (first, last) = inner.meta.alloc_handle_batch(table_id, step)?;
+        inner
+            .handle_chunks
+            .insert(table_id, (first + 1, last, step));
         if !inner.defer_persist {
             persist_meta(self.storage.as_ref(), &mut inner.meta)?;
         }
-        Ok(next)
+        Ok(first)
     }
 
     /// Allocate the next value for a table's `AUTO_INCREMENT` column.
     pub fn next_auto_id(&self, table_id: i64) -> Result<i64> {
+        self.next_auto_id_with_cache(table_id, 1)
+    }
+
+    /// `AUTO_INCREMENT` allocation with a TiDB `AUTO_ID_CACHE` batch size.
+    pub fn next_auto_id_with_cache(&self, table_id: i64, step: i64) -> Result<i64> {
+        let step = step.max(1);
         let mut inner = self.inner.lock().expect("domain handle lock");
-        let next = inner.meta.alloc_auto_id(table_id)?;
+        if step > 1
+            && let Some((next, end, chunk_step)) = inner.auto_id_chunks.get_mut(&table_id)
+            && *chunk_step == step
+            && *next <= *end
+        {
+            let id = *next;
+            *next += 1;
+            return Ok(id);
+        }
+        let (first, last) = inner.meta.alloc_auto_id_batch(table_id, step)?;
+        inner
+            .auto_id_chunks
+            .insert(table_id, (first + 1, last, step));
         if !inner.defer_persist {
             persist_meta(self.storage.as_ref(), &mut inner.meta)?;
         }
-        Ok(next)
+        Ok(first)
+    }
+
+    /// Last handed-out `AUTO_INCREMENT` value (0 when never allocated), used by
+    /// `SHOW CREATE TABLE` to print `AUTO_INCREMENT=<value + 1>`.
+    pub fn peek_auto_id(&self, table_id: i64) -> i64 {
+        let inner = self.inner.lock().expect("domain handle lock");
+        inner.meta.peek_auto_id(table_id)
     }
 
     /// Raise the `AUTO_INCREMENT` counter after an explicit user value.
     pub fn bump_auto_id(&self, table_id: i64, value: i64) -> Result<()> {
         let mut inner = self.inner.lock().expect("domain handle lock");
+        // An explicit id invalidates the reserved chunk (TiDB rebases the
+        // allocator when the base moves).
+        inner.auto_id_chunks.remove(&table_id);
         inner.meta.bump_auto_id(table_id, value)?;
         if !inner.defer_persist {
             persist_meta(self.storage.as_ref(), &mut inner.meta)?;
@@ -853,6 +908,8 @@ impl Domain {
     /// each transaction from 1).
     pub fn reset_auto_id(&self, table_id: i64) -> Result<()> {
         let mut inner = self.inner.lock().expect("domain handle lock");
+        inner.auto_id_chunks.remove(&table_id);
+        inner.handle_chunks.remove(&table_id);
         inner.meta.reset_auto_id(table_id);
         if !inner.defer_persist {
             persist_meta(self.storage.as_ref(), &mut inner.meta)?;
@@ -863,6 +920,7 @@ impl Domain {
     /// Raise the `_tidb_rowid` allocator after an explicitly written handle.
     pub fn bump_handle(&self, table_id: i64, value: i64) -> Result<()> {
         let mut inner = self.inner.lock().expect("domain handle lock");
+        inner.handle_chunks.remove(&table_id);
         inner.meta.bump_handle(table_id, value)?;
         if !inner.defer_persist {
             persist_meta(self.storage.as_ref(), &mut inner.meta)?;

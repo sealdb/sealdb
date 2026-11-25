@@ -2135,6 +2135,7 @@ dependencies = [
  "aes",
  "chrono",
  "chrono-tz",
+ "regex",
  "sealdb-errno",
  "sealdb-meta",
  "sealdb-parser",

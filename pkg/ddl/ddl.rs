@@ -40,6 +40,28 @@ fn validate_identifiers(stmt: &Statement) -> Result<()> {
             Ok(())
         }
         Statement::CreateIndex(s) => check_identifier(&s.name),
+        Statement::AlterTable(s) => {
+            for spec in &s.specs {
+                match spec {
+                    sealdb_parser::ast::AlterTableSpec::AddColumn { column, .. } => {
+                        check_identifier(&column.name)?;
+                    }
+                    sealdb_parser::ast::AlterTableSpec::ChangeColumn { new_name, .. }
+                    | sealdb_parser::ast::AlterTableSpec::RenameColumn { new_name, .. }
+                    | sealdb_parser::ast::AlterTableSpec::RenameIndex { new_name, .. } => {
+                        check_identifier(new_name)?;
+                    }
+                    sealdb_parser::ast::AlterTableSpec::AddIndex(index) => {
+                        check_identifier(&index.name)?;
+                    }
+                    sealdb_parser::ast::AlterTableSpec::RenameTable { new_name } => {
+                        check_identifier(&new_name.name)?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

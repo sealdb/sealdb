@@ -251,6 +251,83 @@ fn view_sources(
     Ok(sources)
 }
 
+/// TiDB `buildProjection` (`AsViewSchema`): a duplicated *anonymous* field (a
+/// literal / expression with no `AS`) is renamed `Name_exp_<name>` then
+/// `Name_exp_<n>_<name>`. Fields with an explicit alias or a plain column
+/// reference reserve their name first, so `select 't','t',1 as t` yields
+/// `Name_exp_t, Name_exp_1_t, t`. The printed view body keeps the renamed
+/// aliases too; only the column list additionally drops names that cannot be
+/// column identifiers (see [`cap_view_field_names`]).
+fn dedup_view_anonymous_fields(select: &mut SelectStmt) {
+    // `field.Text()` without the `name_exp_<pos>` fallback of
+    // `select_field_name`: a 65-character literal still names the view body
+    // alias after its own text in TiDB, and only the column list falls back.
+    let names: Vec<String> = select
+        .fields
+        .iter()
+        .map(|field| {
+            if let Some(name) = field.as_name.as_deref().filter(|n| !n.is_empty()) {
+                return name.to_string();
+            }
+            match &field.expr {
+                ExprNode::Column(_) | ExprNode::Value(_) => field.expr.name(),
+                _ => field
+                    .orig_text
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| field.expr.name()),
+            }
+        })
+        .collect();
+    let anonymous: Vec<bool> = select
+        .fields
+        .iter()
+        .map(|field| {
+            field.as_name.as_deref().is_none_or(|n| n.is_empty())
+                && !matches!(field.expr, ExprNode::Column(_))
+        })
+        .collect();
+    let mut dedup: HashMap<String, usize> = HashMap::new();
+    for (i, field) in select.fields.iter_mut().enumerate() {
+        field.as_name = Some(names[i].clone());
+        if anonymous[i] {
+            continue;
+        }
+        dedup.insert(names[i].to_ascii_lowercase(), 0);
+    }
+    for (i, field) in select.fields.iter_mut().enumerate() {
+        if !anonymous[i] {
+            continue;
+        }
+        let original = names[i].clone();
+        if let Some(dup) = dedup.get(&original.to_ascii_lowercase()).copied() {
+            let renamed = if dup == 0 {
+                format!("Name_exp_{original}")
+            } else {
+                format!("Name_exp_{dup}_{original}")
+            };
+            field.as_name = Some(renamed);
+            dedup.insert(original.to_ascii_lowercase(), dup + 1);
+        } else {
+            dedup.insert(original.to_ascii_lowercase(), 0);
+        }
+    }
+}
+
+/// TiDB's view column list falls back to `name_exp_<position>` (1-based) for a
+/// field whose name cannot be a column identifier: TiDB accepts at most 64
+/// characters there, while the printed body keeps the full derived alias.
+fn cap_view_field_names(select: &mut SelectStmt) {
+    for (i, field) in select.fields.iter_mut().enumerate() {
+        let Some(name) = field.as_name.as_deref() else {
+            continue;
+        };
+        if name.is_empty() || name.len() > 64 {
+            field.as_name = Some(format!("name_exp_{}", i + 1));
+        }
+    }
+}
+
 /// Expand `*` / `t.*` into an explicit, schema-qualified select list the way
 /// TiDB stores a view definition.
 fn expand_view_stars(is: &InfoSchema, select: &mut SelectStmt, current_db: &str) -> Result<()> {
@@ -428,6 +505,19 @@ pub fn create_view(
     if let Some(set) = &mut view_set {
         expand_set_view_stars(is, set, current_db)?;
     }
+    // TiDB `AsViewSchema` names every field and renames duplicated anonymous
+    // ones in both the view's column list and the printed body. Only the column
+    // list additionally applies the 64-character `name_exp_<pos>` fallback.
+    // Only the statement providing the schema (the first arm of a set
+    // operation) decides the column list.
+    dedup_view_anonymous_fields(&mut view_select);
+    let mut schema_select = view_select.clone();
+    cap_view_field_names(&mut schema_select);
+    if let Some(set) = &mut view_set {
+        dedup_view_anonymous_fields(&mut set.first);
+        schema_select = Box::new(set.first.clone());
+        cap_view_field_names(&mut schema_select);
+    }
     let mut restore = RestoreCtx::new_view(&schema);
     match &view_set {
         Some(set) => set.restore(&mut restore)?,
@@ -456,12 +546,14 @@ pub fn create_view(
             ),
         ));
     }
-    let mut cols = columns_from_select(is, &stmt.select, current_db)?;
+    let mut cols = columns_from_select(is, &schema_select, current_db)?;
     if let Some(set) = &stmt.select_set {
         // Every UNION arm must resolve like a standalone query so a missing
         // table anywhere in the set operation reports 1146.
         for (_, arm) in &set.rest {
-            let _ = columns_from_select(is, arm, current_db)?;
+            let mut arm = arm.clone();
+            dedup_view_anonymous_fields(&mut arm);
+            let _ = columns_from_select(is, &arm, current_db)?;
         }
     }
     if !stmt.cols.is_empty() {
@@ -491,6 +583,7 @@ pub fn create_view(
         affinity: None,
         shard_row_id_bits: None,
         pre_split_regions: None,
+        auto_id_cache: None,
         refer_table: None,
         select: None,
         checks: Vec::new(),

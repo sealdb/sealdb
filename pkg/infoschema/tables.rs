@@ -17,38 +17,38 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "partitions" => Ok(partitions(is)),
         "processlist" => Ok(processlist()),
         "ddl_jobs" => Ok(ddl_jobs()),
-                "attributes" => Ok(attributes(is)),
-                // TiDB `CLUSTER_*` information_schema tables: the privilege
-                // check happens in the planner (CONFIG / PROCESS), the tables
-                // themselves yield no rows here.
-                "cluster_config" => Ok(empty(&["TYPE", "INSTANCE", "KEY", "VALUE"])),
-                "cluster_hardware" | "cluster_load" => Ok(empty(&[
-                    "TYPE",
-                    "INSTANCE",
-                    "DEVICE_TYPE",
-                    "DEVICE_NAME",
-                    "NAME",
-                    "VALUE",
-                ])),
-                "cluster_info" => Ok(empty(&[
-                    "TYPE",
-                    "INSTANCE",
-                    "STATUS_ADDRESS",
-                    "VERSION",
-                    "GIT_HASH",
-                    "START_TIME",
-                    "UPTIME",
-                    "SERVER_ID",
-                ])),
-                "cluster_systeminfo" => Ok(empty(&[
-                    "TYPE",
-                    "INSTANCE",
-                    "SYSTEM_TYPE",
-                    "SYSTEM_NAME",
-                    "NAME",
-                    "VALUE",
-                ])),
-                "cluster_log" => Ok(empty(&["TIME", "TYPE", "INSTANCE", "LEVEL", "MESSAGE"])),
+        "attributes" => Ok(attributes(is)),
+        // TiDB `CLUSTER_*` information_schema tables: the privilege
+        // check happens in the planner (CONFIG / PROCESS), the tables
+        // themselves yield no rows here.
+        "cluster_config" => Ok(empty(&["TYPE", "INSTANCE", "KEY", "VALUE"])),
+        "cluster_hardware" | "cluster_load" => Ok(empty(&[
+            "TYPE",
+            "INSTANCE",
+            "DEVICE_TYPE",
+            "DEVICE_NAME",
+            "NAME",
+            "VALUE",
+        ])),
+        "cluster_info" => Ok(empty(&[
+            "TYPE",
+            "INSTANCE",
+            "STATUS_ADDRESS",
+            "VERSION",
+            "GIT_HASH",
+            "START_TIME",
+            "UPTIME",
+            "SERVER_ID",
+        ])),
+        "cluster_systeminfo" => Ok(empty(&[
+            "TYPE",
+            "INSTANCE",
+            "SYSTEM_TYPE",
+            "SYSTEM_NAME",
+            "NAME",
+            "VALUE",
+        ])),
+        "cluster_log" => Ok(empty(&["TIME", "TYPE", "INSTANCE", "LEVEL", "MESSAGE"])),
         // Rows are produced by the executor (session-filtered grants).
         "schema_privileges" => Ok(empty(&[
             "GRANTEE",
@@ -387,6 +387,12 @@ const INFO_SCHEMA_TABLE_IDS: &[(&str, i64)] = &[
 fn sharding_info(table: &TableInfo, db: &str) -> Datum {
     if table.is_view() || db.eq_ignore_ascii_case("information_schema") {
         return Datum::Null;
+    }
+    if let Some(bits) = table.columns.iter().find_map(|col| col.auto_random) {
+        return bytes(&format!("PK_AUTO_RANDOM_BITS={bits}"));
+    }
+    if table.shard_row_id_bits > 0 {
+        return bytes(&format!("SHARD_BITS={}", table.shard_row_id_bits));
     }
     if table.pk_is_handle {
         bytes("NOT_SHARDED(PK_IS_HANDLE)")
@@ -867,7 +873,7 @@ fn statistics(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                     bytes("BTREE"),
                     bytes(""),
                     bytes(""),
-                    bytes("YES"),
+                    bytes(if idx.invisible { "NO" } else { "YES" }),
                     expression,
                 ]);
             }
@@ -951,7 +957,7 @@ fn tidb_indexes(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                     expression,
                     // TiDB `IndexInfo.ID`: an integer row handle has none (0).
                     Datum::I64(idx.id),
-                    bytes("YES"),
+                    bytes(if idx.invisible { "NO" } else { "YES" }),
                     bytes(if clustered { "YES" } else { "NO" }),
                     // TiDB `IndexInfo.Global`: only a `GLOBAL` index reports 1.
                     Datum::I64(if idx.global { 1 } else { 0 }),

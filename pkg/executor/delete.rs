@@ -9,7 +9,8 @@ use crate::join::hash_join_v1::hash_join_pairs;
 use crate::sortexec::sort::sort_rows_by;
 use crate::table_reader::{ScannedRow, scan_table};
 use crate::update::{
-    col_names, dml_row_lock, joined_schema, load_table, scan_dml_side, table_matches,
+    col_names, dml_row_lock, dml_side_rowid, joined_schema_with_rowid, joined_values_with_rowid,
+    load_table, scan_dml_side, table_matches,
 };
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_ROW_IS_REFERENCED_2, ERR_UNKNOWN_TABLE, Error, Result};
@@ -233,7 +234,16 @@ impl DeleteExec {
             &join.right,
             lock,
         )?;
-        let schema = joined_schema(&join.left.name, &left_names, &join.right.name, &right_names);
+        let left_rowid = dml_side_rowid(left_info.as_ref());
+        let right_rowid = dml_side_rowid(right_info.as_ref());
+        let schema = joined_schema_with_rowid(
+            &join.left,
+            &left_names,
+            left_rowid,
+            &join.right,
+            &right_names,
+            right_rowid,
+        );
         let left_values: Vec<Vec<Datum>> = left_rows.iter().map(|r| r.values.clone()).collect();
         let right_values: Vec<Vec<Datum>> = right_rows.iter().map(|r| r.values.clone()).collect();
         let pairs = hash_join_pairs(join, &left_names, &right_names, &left_values, &right_values)?;
@@ -244,7 +254,14 @@ impl DeleteExec {
         for (left_i, right_i) in pairs {
             let left_row = left_i.map(|i| &left_rows[i]);
             let right_row = right_i.map(|i| &right_rows[i]);
-            let joined = concat_optional(left_row, right_row, left_names.len(), right_names.len());
+            let joined = joined_values_with_rowid(
+                left_row,
+                right_row,
+                left_names.len(),
+                right_names.len(),
+                left_rowid,
+                right_rowid,
+            );
             if let Some(filter) = &self.stmt.selection
                 && !eval_filter(filter, &schema, &joined)?
             {
@@ -346,10 +363,20 @@ impl DeleteExec {
             rows.push(side_rows);
             infos.push(side_info);
         }
+        let rowid_sides: Vec<bool> = infos
+            .iter()
+            .map(|info| dml_side_rowid(info.as_ref()))
+            .collect();
         let schema: Vec<String> = tables
             .iter()
             .zip(&names)
-            .flat_map(|(t, cols)| cols.iter().map(move |c| format!("{}.{}", t.name, c)))
+            .zip(&rowid_sides)
+            .flat_map(|((t, cols), rowid)| {
+                cols.iter()
+                    .map(|c| format!("{}.{}", t.name, c))
+                    .chain(rowid.then(|| format!("{}._tidb_rowid", t.name)))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         let delete_side: Vec<bool> = tables
             .iter()
@@ -367,6 +394,9 @@ impl DeleteExec {
             for (side, &index) in indices.iter().enumerate() {
                 if let Some(row) = rows[side].get(index) {
                     joined.extend(row.values.iter().cloned());
+                    if rowid_sides[side] {
+                        joined.push(Datum::I64(row.handle));
+                    }
                 }
             }
             let mut matched = true;
@@ -423,24 +453,6 @@ impl DeleteExec {
         crate::internal::note_dml_affected(affected);
         Ok(())
     }
-}
-
-/// Concatenate optional join sides; unmatched outer rows are padded with NULL.
-fn concat_optional(
-    left: Option<&ScannedRow>,
-    right: Option<&ScannedRow>,
-    left_width: usize,
-    right_width: usize,
-) -> Vec<Datum> {
-    let mut row = match left {
-        Some(scanned) => scanned.values.clone(),
-        None => vec![Datum::Null; left_width],
-    };
-    match right {
-        Some(scanned) => row.extend_from_slice(&scanned.values),
-        None => row.extend(std::iter::repeat_n(Datum::Null, right_width)),
-    }
-    row
 }
 
 impl DeleteExec {

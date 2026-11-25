@@ -986,13 +986,15 @@ fn run_result_set(
         ResultSetNode::SetOpr(set) => Statement::SetOpr(set.clone()),
     };
     let stats = ctx.domain.stats();
-    let plan = PlanBuilder::new().build_with_schema(
-        &stmt,
-        Some(&ctx.domain.infoschema()),
-        &ctx.current_db,
-        Some(stats.as_ref()),
-        sealdb_planner::PartitionPruneMode::Dynamic,
-    )?;
+    let plan = crate::builder::with_txn_dirty_tables(&ctx.txn, || {
+        PlanBuilder::new().build_with_schema(
+            &stmt,
+            Some(&ctx.domain.infoschema()),
+            &ctx.current_db,
+            Some(stats.as_ref()),
+            sealdb_planner::PartitionPruneMode::Dynamic,
+        )
+    })?;
     let exec = ExecutorBuilder::build(
         &plan,
         &stmt,

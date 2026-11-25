@@ -4,9 +4,10 @@
 // multi-schema-state jobs.
 use crate::create_table::{
     affinity_setting, field_type_from_name, is_temporal_type, normalize_default,
-    referenced_by_foreign_key, references_identifier, requote_default, ttl_column_name,
-    validate_default_fsp, validate_default_literal, validate_display_width,
-    validate_generated_auto_increment, validate_generated_column_refs, validate_generated_expr,
+    referenced_by_foreign_key, references_identifier, requote_default,
+    resolve_qualified_column_name, ttl_column_name, validate_column_name, validate_default_fsp,
+    validate_default_literal, validate_display_width, validate_generated_auto_increment,
+    validate_generated_column_refs, validate_generated_expr,
 };
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
 use crate::partition::{
@@ -16,13 +17,16 @@ use crate::partition::{
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_CANT_DROP_FIELD_OR_KEY,
-    ERR_COLUMN_HAS_EXPRESSION_INDEX_DEPENDENT, ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
-    ERR_DEPENDENT_BY_GENERATED_COLUMN, ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL, ERR_DUP_FIELDNAME,
-    ERR_DUP_KEYNAME, ERR_FK_INCOMPATIBLE_COLUMNS, ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST,
-    ERR_NO_SUCH_TABLE, ERR_PRIMARY_CANT_HAVE_NULL, ERR_TABLE_EXISTS, ERR_TTL_DROP_COLUMN,
-    ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG, ERR_UNKNOWN_PARTITION,
-    ERR_UNSUPPORTED_DDL_OPERATION, ERR_UNSUPPORTED_MODIFY_CHARSET, ERR_UNSUPPORTED_ON_CACHE_TABLE,
-    ERR_UNSUPPORTED_ON_GENERATED_COLUMN, ERR_WRONG_OBJECT, Error, Result,
+    ERR_CANT_REMOVE_ALL_FIELDS, ERR_COLUMN_HAS_EXPRESSION_INDEX_DEPENDENT,
+    ERR_COLUMN_WITH_GENERATED_DEPENDENCIES, ERR_DEPENDENT_BY_GENERATED_COLUMN,
+    ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL, ERR_DUP_FIELDNAME, ERR_DUP_KEYNAME,
+    ERR_FK_INCOMPATIBLE_COLUMNS, ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST,
+    ERR_NO_SUCH_TABLE, ERR_OPT_ON_TEMPORARY_TABLE, ERR_PK_INDEX_CANT_BE_INVISIBLE,
+    ERR_PRIMARY_CANT_HAVE_NULL, ERR_TABLE_EXISTS, ERR_TABLE_MUST_HAVE_COLUMNS, ERR_TOO_MANY_FIELDS,
+    ERR_TTL_DROP_COLUMN, ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG,
+    ERR_UNKNOWN_PARTITION, ERR_UNSUPPORTED_DDL_OPERATION, ERR_UNSUPPORTED_MODIFY_CHARSET,
+    ERR_UNSUPPORTED_ON_CACHE_TABLE, ERR_UNSUPPORTED_ON_GENERATED_COLUMN,
+    ERR_WARN_TABLE_TYPE_NOT_SUPPORT_FULLTEXT, ERR_WRONG_OBJECT, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -45,6 +49,102 @@ pub fn alter_table(
     current_db: &str,
     storage: &dyn Storage,
 ) -> Result<()> {
+    // TiDB `AlterTable` resolves the target table before looking at the
+    // individual specs, so even an ignored option (`ALTER TABLE missing
+    // COMMENT '…'`) reports 1146 / 1049.
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    if is.schema_by_name(&schema).is_none() {
+        return Err(Error::new(
+            ERR_BAD_DB,
+            format!("Unknown database '{schema}'"),
+        ));
+    }
+    if is.table_by_name(&schema, &table).is_none() {
+        return Err(Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        ));
+    }
+    let target = is
+        .table_by_name(&schema, &table)
+        .expect("table existence checked above");
+    // TiDB `DDLExec.executeAlterTable`: a local temporary table rejects every
+    // ALTER TABLE (8200) before the individual specs are examined. Global
+    // temporary tables go through the normal path (options unsupported on
+    // temporary tables are refused individually).
+    if target.temporary && !target.on_commit_delete_rows {
+        return Err(Error::new(
+            ERR_UNSUPPORTED_DDL_OPERATION,
+            "TiDB doesn't support ALTER TABLE for local temporary table",
+        ));
+    }
+    // TiDB `checkMultiSchemaInfo` (multi-spec ALTER): the same column may not
+    // be added or dropped twice (8200), and the statement may not remove every
+    // visible column (1090 / 1113).
+    if stmt.specs.len() > 1 {
+        let current = is
+            .table_by_name(&schema, &table)
+            .expect("table existence checked above");
+        let mut touched: Vec<String> = Vec::new();
+        let mut add_cnt = 0usize;
+        let mut drop_names: Vec<String> = Vec::new();
+        for spec in &stmt.specs {
+            match spec {
+                AlterTableSpec::AddColumn { column, .. } => {
+                    add_cnt += 1;
+                    // TiDB preprocess `checkAddColumn`: a column that already
+                    // exists is 1060, before the multi-schema checks run.
+                    if current
+                        .columns
+                        .iter()
+                        .any(|c| c.name.o().eq_ignore_ascii_case(&column.name))
+                    {
+                        return Err(Error::new(
+                            ERR_DUP_FIELDNAME,
+                            format!("Duplicate column name '{}'", column.name),
+                        ));
+                    }
+                    let name = column.name.to_lowercase();
+                    if touched.contains(&name) {
+                        return Err(Error::new(
+                            ERR_UNSUPPORTED_DDL_OPERATION,
+                            format!("Unsupported operate same column '{name}'"),
+                        ));
+                    }
+                    touched.push(name);
+                }
+                AlterTableSpec::DropColumn { name, .. } => {
+                    let lower = name.to_lowercase();
+                    if touched.contains(&lower) {
+                        return Err(Error::new(
+                            ERR_UNSUPPORTED_DDL_OPERATION,
+                            format!("Unsupported operate same column '{lower}'"),
+                        ));
+                    }
+                    touched.push(lower);
+                    drop_names.push(name.clone());
+                }
+                _ => {}
+            }
+        }
+        if !drop_names.is_empty() {
+            let info = current;
+            let visible = info.columns.iter().filter(|c| !c.hidden).count();
+            if visible + add_cnt <= drop_names.len() {
+                return Err(if info.columns.len() > visible {
+                    Error::new(
+                        ERR_TABLE_MUST_HAVE_COLUMNS,
+                        "A table must have at least 1 column",
+                    )
+                } else {
+                    Error::new(
+                        ERR_CANT_REMOVE_ALL_FIELDS,
+                        "You can't delete all columns with ALTER TABLE; use DROP TABLE instead",
+                    )
+                });
+            }
+        }
+    }
     let mut snapshot = is.clone();
     for spec in &stmt.specs {
         // TiDB refuses every other ALTER TABLE on a cached table
@@ -87,6 +187,15 @@ pub fn alter_table(
                 drop_column(meta, &snapshot, stmt, name, *if_exists, current_db)?;
             }
             AlterTableSpec::AddIndex(index) => {
+                // TiDB's InnoDB cannot store a FULLTEXT index: warn 1214 and
+                // leave the table unchanged.
+                if index.fulltext {
+                    sealdb_expression::note_warning(
+                        ERR_WARN_TABLE_TYPE_NOT_SUPPORT_FULLTEXT,
+                        "The used table type doesn't support FULLTEXT indexes",
+                    );
+                    continue;
+                }
                 add_index(
                     meta,
                     &snapshot,
@@ -119,23 +228,28 @@ pub fn alter_table(
                 collate,
                 comment,
                 position,
-            } => change_column(
-                meta,
-                &snapshot,
-                stmt,
-                old_name,
-                new_name,
-                Some(type_name),
-                default.as_deref(),
-                generated.as_ref(),
-                *not_null,
-                charset.as_deref(),
-                collate.as_deref(),
-                comment.as_deref(),
-                position,
-                current_db,
-                storage,
-            )?,
+            } => {
+                let (schema, table) = resolve_name(&stmt.table, current_db)?;
+                let old_name = resolve_qualified_column_name(old_name, &schema, &table)?;
+                let new_name = resolve_qualified_column_name(new_name, &schema, &table)?;
+                change_column(
+                    meta,
+                    &snapshot,
+                    stmt,
+                    &old_name,
+                    &new_name,
+                    Some(type_name),
+                    default.as_deref(),
+                    generated.as_ref(),
+                    *not_null,
+                    charset.as_deref(),
+                    collate.as_deref(),
+                    comment.as_deref(),
+                    position,
+                    current_db,
+                    storage,
+                )?
+            }
             AlterTableSpec::ModifyColumn {
                 name,
                 type_name,
@@ -146,23 +260,27 @@ pub fn alter_table(
                 collate,
                 comment,
                 position,
-            } => change_column(
-                meta,
-                &snapshot,
-                stmt,
-                name,
-                name,
-                Some(type_name),
-                default.as_deref(),
-                generated.as_ref(),
-                *not_null,
-                charset.as_deref(),
-                collate.as_deref(),
-                comment.as_deref(),
-                position,
-                current_db,
-                storage,
-            )?,
+            } => {
+                let (schema, table) = resolve_name(&stmt.table, current_db)?;
+                let name = resolve_qualified_column_name(name, &schema, &table)?;
+                change_column(
+                    meta,
+                    &snapshot,
+                    stmt,
+                    &name,
+                    &name,
+                    Some(type_name),
+                    default.as_deref(),
+                    generated.as_ref(),
+                    *not_null,
+                    charset.as_deref(),
+                    collate.as_deref(),
+                    comment.as_deref(),
+                    position,
+                    current_db,
+                    storage,
+                )?
+            }
             AlterTableSpec::RenameColumn { old_name, new_name } => change_column(
                 meta,
                 &snapshot,
@@ -207,6 +325,14 @@ pub fn alter_table(
                                 format!("Table '{schema}.{table}' doesn't exist"),
                             )
                         })?;
+                    if info.temporary {
+                        // TiDB `AlterTablePlacement`: placement is rejected on
+                        // every temporary table (8006).
+                        return Err(Error::new(
+                            ERR_OPT_ON_TEMPORARY_TABLE,
+                            "`placement` is unsupported on temporary tables.",
+                        ));
+                    }
                     if value.eq_ignore_ascii_case("default") {
                         info.placement_policy = None;
                     } else {
@@ -215,11 +341,36 @@ pub fn alter_table(
                     }
                     meta.update_table(db.id, &info)?;
                     meta.gen_schema_version()?;
+                } else if name.eq_ignore_ascii_case("AUTO_ID_CACHE") {
+                    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+                    let db = snapshot.schema_by_name(&schema).ok_or_else(|| {
+                        Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'"))
+                    })?;
+                    let mut info = snapshot
+                        .table_by_name(&schema, &table)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::new(
+                                ERR_NO_SUCH_TABLE,
+                                format!("Table '{schema}.{table}' doesn't exist"),
+                            )
+                        })?;
+                    info.auto_id_cache = Some(crate::create_table::parse_auto_id_cache(value)?);
+                    meta.update_table(db.id, &info)?;
+                    meta.gen_schema_version()?;
                 }
             }
             AlterTableSpec::Cache { cached } => {
                 alter_cache(meta, &snapshot, stmt, *cached, current_db)?
             }
+            AlterTableSpec::ConvertCharset { charset, collate } => convert_charset(
+                meta,
+                &snapshot,
+                stmt,
+                charset,
+                collate.as_deref(),
+                current_db,
+            )?,
             AlterTableSpec::AddPartition { defs, count } => {
                 check_affinity_partition_op(
                     &snapshot,
@@ -237,14 +388,25 @@ pub fn alter_table(
                     storage,
                 )?;
             }
-            AlterTableSpec::Repartition(option) => {
+            AlterTableSpec::Repartition {
+                option,
+                update_indexes,
+            } => {
                 check_affinity_partition_op(
                     &snapshot,
                     &stmt.table,
                     current_db,
                     "Unsupported ALTER TABLE PARTITIONING of a table with AFFINITY option",
                 )?;
-                repartition(meta, &snapshot, &stmt.table, option, current_db, storage)?;
+                repartition(
+                    meta,
+                    &snapshot,
+                    &stmt.table,
+                    option,
+                    update_indexes,
+                    current_db,
+                    storage,
+                )?;
             }
             AlterTableSpec::ExchangePartition {
                 partition,
@@ -389,6 +551,12 @@ pub fn alter_table(
                     current_db,
                     storage,
                 )?;
+                // TiDB `ReorganizePartitions`: the affected partitions' stats
+                // become stale, so the statement carries a warning.
+                sealdb_expression::note_warning(
+                    1105,
+                    "The statistics of related partitions will be outdated after reorganizing partitions. Please use 'ANALYZE TABLE' statement if you want to update it now",
+                );
             }
             AlterTableSpec::AddForeignKey(fk) => {
                 add_foreign_key_spec(meta, &snapshot, stmt, fk, current_db)?
@@ -452,6 +620,72 @@ fn alter_cache(
     meta.update_table(db.id, &updated)?;
     meta.gen_schema_version()?;
     Ok(())
+}
+
+/// `ALTER TABLE t CONVERT TO CHARACTER SET <charset> [COLLATE <collation>]`.
+/// Every string column switches charset; TiDB then re-checks the index keys and
+/// reports 1071 when the wider charset pushes one past 3072 bytes.
+fn convert_charset(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &AlterTableStmt,
+    charset: &str,
+    collate: Option<&str>,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let Some(info) = is.table_by_name(&schema, &table) else {
+        return Err(Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        ));
+    };
+    let collation = collate
+        .map(str::to_string)
+        .unwrap_or_else(|| default_collation_for_charset(charset));
+    let mut updated = info.clone();
+    for col in &mut updated.columns {
+        if is_charset_convertible(&col.field_type) {
+            col.field_type.charset = charset.to_string();
+            col.field_type.collate = collation.clone();
+        }
+    }
+    crate::expr_index::revalidate_index_lengths(&updated)?;
+    meta.update_table(db.id, &updated)?;
+    meta.gen_schema_version()?;
+    Ok(())
+}
+
+/// String-like columns whose charset follows a table-level conversion.
+fn is_charset_convertible(ft: &FieldType) -> bool {
+    use sealdb_types::field_type::*;
+    matches!(
+        ft.tp,
+        TYPE_STRING
+            | TYPE_VARCHAR
+            | TYPE_VAR_STRING
+            | TYPE_TINY_BLOB
+            | TYPE_BLOB
+            | TYPE_MEDIUM_BLOB
+            | TYPE_LONG_BLOB
+            | TYPE_ENUM
+            | TYPE_SET
+    )
+}
+
+/// Default collation TiDB picks for a charset in `CONVERT TO CHARACTER SET`.
+fn default_collation_for_charset(charset: &str) -> String {
+    match charset.to_ascii_lowercase().as_str() {
+        "utf8mb4" | "utf8" => format!("{charset}_bin"),
+        "latin1" => "latin1_bin".to_string(),
+        "ascii" => "ascii_bin".to_string(),
+        "gbk" => "gbk_bin".to_string(),
+        "binary" => "binary".to_string(),
+        other => format!("{other}_bin"),
+    }
 }
 
 /// `ALTER TABLE t AFFINITY [=] 'table'|'partition'|'none'|''` (TiDB 8266).
@@ -744,6 +978,7 @@ fn add_column(
             format!("Duplicate column name '{}'", column.name),
         ));
     }
+    validate_column_name(&column.name)?;
     info.max_col_id += 1;
     let insert_at = column_insert_index(&info, position)?;
     let mut new_col = ColumnInfo::new(
@@ -816,6 +1051,15 @@ fn add_column(
         &new_col.field_type,
         new_col.default_expr.as_deref(),
     )?;
+    crate::create_table::validate_on_update(
+        new_col.name.o(),
+        &new_col.field_type,
+        column.on_update.as_deref(),
+    )?;
+    crate::create_table::check_column_attributes(new_col.name.o(), &new_col.field_type)?;
+    if info.columns.len() >= 1017 {
+        return Err(Error::new(ERR_TOO_MANY_FIELDS, "Too many columns"));
+    }
     let new_id = new_col.id;
     let default_value = column_default_datum(&new_col)?;
     // Existing rows were written before this column existed, so decode them
@@ -1160,10 +1404,12 @@ fn drop_column(
             format!("Table '{schema}.{table}' doesn't exist"),
         )
     })?;
+    // Hidden (expression-index) columns are not addressable: TiDB does not
+    // find them by name, so `DROP COLUMN _V$_…` reports "doesn't exist".
     let Some(pos) = info
         .columns
         .iter()
-        .position(|c| c.name.o().eq_ignore_ascii_case(name))
+        .position(|c| !c.hidden && c.name.o().eq_ignore_ascii_case(name))
     else {
         if if_exists {
             return Ok(());
@@ -1187,7 +1433,11 @@ fn drop_column(
             .handle_column()
             .is_some_and(|handle| handle.id == info.columns[pos].id)
     {
-        return Err(Error::unsupported("DROP handle column"));
+        // TiDB `ErrUnsupportedPKHandle` (8200).
+        return Err(Error::new(
+            ERR_UNSUPPORTED_DDL_OPERATION,
+            "Unsupported drop integer primary key",
+        ));
     }
     if info.ttl.as_ref().is_some_and(|ttl| {
         crate::create_table::ttl_column_name(&ttl.expr).eq_ignore_ascii_case(name)
@@ -1204,8 +1454,21 @@ fn drop_column(
     }) {
         return Err(Error::unsupported("DROP COLUMN used by INDEX"));
     }
+    // TiDB `isDroppableColumn`: the only column of a table cannot be dropped.
     if info.columns.len() == 1 {
-        return Err(Error::unsupported("DROP last column"));
+        return Err(Error::new(
+            ERR_CANT_REMOVE_ALL_FIELDS,
+            format!("can't drop only column {name} in table {table}"),
+        ));
+    }
+    // TiDB `checkVisibleColumnCnt(t, 0, 1)` for a single-spec DROP: when only
+    // hidden (functional-index) columns would remain, the table is empty.
+    let visible = info.columns.iter().filter(|c| !c.hidden).count();
+    if visible <= 1 {
+        return Err(Error::new(
+            ERR_TABLE_MUST_HAVE_COLUMNS,
+            "A table must have at least 1 column",
+        ));
     }
     info.columns.remove(pos);
     recompute_column_offsets(&mut info);
@@ -1347,6 +1610,7 @@ fn change_column(
     current_db: &str,
     storage: &dyn Storage,
 ) -> Result<()> {
+    validate_column_name(new_name)?;
     let (schema, table) = resolve_name(&stmt.table, current_db)?;
     let db = is
         .schema_by_name(&schema)
@@ -1387,6 +1651,7 @@ fn change_column(
         Some(false) => new_ft.flag &= !sealdb_types::field_type::NOT_NULL_FLAG,
         None => {}
     }
+    crate::create_table::check_column_attributes(new_name, &new_ft)?;
     // TiDB `checkPriKeyConstraint`: an explicit `NULL` on a PRIMARY KEY
     // column is refused even when the column was already NOT NULL (1171).
     if not_null == Some(false) && is_primary_key_column(&info, old_name) {
@@ -1605,6 +1870,9 @@ fn change_column(
             }
         }
     }
+    // TiDB re-runs `buildIndexColumns`: widening an indexed column past the
+    // 3072-byte key limit is 1071.
+    crate::expr_index::revalidate_index_lengths(&info)?;
     if changed {
         let affected: Vec<i64> = info
             .indices
@@ -3026,6 +3294,7 @@ fn rename_index(
             format!("Table '{schema}.{table}' doesn't exist"),
         )
     })?;
+    crate::create_table::check_index_name(new_name, false)?;
     let Some(pos) = info
         .indices
         .iter()
@@ -3081,6 +3350,29 @@ fn rename_index(
     Ok(())
 }
 
+/// TiDB `TableInfo.GetPrimaryKey`: the explicit `PRIMARY KEY` if there is one,
+/// otherwise the implicit primary key — the first `UNIQUE` index whose columns
+/// are all `NOT NULL` (expression/hidden columns disqualify an index).
+fn implicit_primary_key(info: &TableInfo) -> Option<i64> {
+    if let Some(pk) = info.indices.iter().find(|idx| idx.primary) {
+        return Some(pk.id);
+    }
+    info.indices
+        .iter()
+        .find(|idx| {
+            idx.unique
+                && !idx.columns.is_empty()
+                && idx.columns.iter().all(|ic| {
+                    info.columns.iter().any(|c| {
+                        c.name.l() == ic.name.l()
+                            && !c.hidden
+                            && c.field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0
+                    })
+                })
+        })
+        .map(|idx| idx.id)
+}
+
 fn alter_index_visibility(
     meta: &mut Mutator,
     is: &InfoSchema,
@@ -3099,16 +3391,29 @@ fn alter_index_visibility(
             format!("Table '{schema}.{table}' doesn't exist"),
         )
     })?;
+    // TiDB `TableInfo.GetPrimaryKey`: without an explicit `PRIMARY KEY`, the
+    // implicit primary key is the first `UNIQUE` index whose columns are all
+    // `NOT NULL`.
+    let implicit_pk = implicit_primary_key(&info);
     let Some(idx) = info
         .indices
         .iter_mut()
         .find(|idx| idx.name.o().eq_ignore_ascii_case(name))
     else {
+        // TiDB `validateAlterIndexVisibility`: an unknown key is 1176.
         return Err(Error::new(
-            ERR_CANT_DROP_FIELD_OR_KEY,
-            format!("Can't DROP '{name}'; check that column/key exists"),
+            ERR_KEY_DOES_NOT_EXIST,
+            format!("Key '{name}' doesn't exist in table '{}'", info.name.o()),
         ));
     };
+    // TiDB `checkInvisibleIndexOnPK`: the index that plays the role of the
+    // primary key cannot be hidden.
+    if invisible && implicit_pk == Some(idx.id) {
+        return Err(Error::new(
+            ERR_PK_INDEX_CANT_BE_INVISIBLE,
+            "A primary key index cannot be invisible",
+        ));
+    }
     idx.invisible = invisible;
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;

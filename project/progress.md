@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-23（green 131 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-23（green 137 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -5108,3 +5108,220 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   `session/nontransactional`、`session/temporary_table`、
   `ddl/db_integration`）。
 
+## 2026-11-23 20:58 — `session/common` 转绿（R5 8/12）
+
+### 目标
+`tests/integrationtest/t/session/common.test` 在 Memory 与 TiKV 双引擎下 100% 通过。
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| `@v := expr` 赋值运算符 | `lower.rs` 识别 `(lhs = @v) := rhs` 左结合形态并旋转为 `lhs = (@v := rhs)`；`__SEALDB_ASSIGN` 变量存储 + 返回 rhs |
+| 多表 DML | `DELETE t1 FROM t1, t2`、`UPDATE t1, t2 SET` 的逗号表列表降链式 join |
+| 跨库同名表 | `joined_schema` 保留 `db.t.col` 标签；`evaluator`/`update`/`delete` 的 `column_matches` 按库名判定 |
+| 二进制字面量 | `rewrite_mysql_bit_literals`：`0b101` → `X'05'`；`CAST(Bit AS BINARY(n))` 原始字节截断/零填充 |
+| CAST TIME | `parse_duration_string_truncated` 的尾部多余文本标记 → 1292 告警；非法前缀返回 NULL |
+| 小数指数 | `MyDecimal::parse` 支持 `1e2`/`1.5e-3` |
+| ADMIN CLEANUP | `ADMIN CLEANUP TABLE LOCK` 不再被兜底改写成 `DO 0` |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory --status pending -t session/common   → PASS: memory=1 tikv=0
+./tests/integrationtest/run-tests.sh -s tikv -k --status pending -t session/common  → PASS: memory=0 tikv=1
+```
+
+### 状态
+- manifest：green 132 / pending 104（R5 8/12）
+
+## 2026-11-23 21:48 — `session/vars` 转绿（R5 9/12）
+
+### 目标
+`tests/integrationtest/t/session/vars.test` 在 Memory 与 TiKV 双引擎下 100% 通过。
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| `SET_VAR` 提示 | 重复变量 → 3126 取首个；未知变量 → 3128 跳过；`sql_auto_is_null` 强制 OFF；`tikv_client_read_timeout` 负值归零、非法值跳过；`PREPARE` 文本内的提示在 `EXECUTE` 时生效 |
+| 作用域 | `SysVarScope`（Session/Global/Both/Instance）+ `check_sysvar_scopes`：`@@global.<session-only>` / `@@session.<global-only>` → 1238 |
+| Instance | `tidb_enable_legacy_instance_scope`（默认 ON）：`SET SESSION tidb_general_log` → 8142 告警并按 GLOBAL 落值；关闭 → 1229 |
+| PD 动态项 | `tidb_tso_client_batch_max_wait_time` 浮点 [0,10] 截断 + 1292；TSO follower / PD follower 布尔项输出 1/0 |
+| 变量表 | 补齐 34 个 MySQL 变量默认值与 ON/OFF 渲染；`@@warning_count` 读取后清空缓冲 |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory --status pending -t session/vars   → PASS: memory=1 tikv=0
+./tests/integrationtest/run-tests.sh -s tikv -k --status pending -t session/vars  → PASS: memory=0 tikv=1
+```
+
+### 回归
+`session/variable`、`sessionctx/setvar`、`select`、`expression/misc`、`bindinfo/bind`、`planner/core/rule_result_reorder` 仍全绿。
+
+### 状态
+- manifest：green 133 / pending 103（R5 9/12）
+
+## 2026-11-23 19:11 — `session/nontransactional` 转绿（R5 10/12）
+
+### 目标
+`tests/integrationtest/t/session/nontransactional.test` 在 Memory 与 TiKV 双引擎下 100% 通过。
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| `_tidb_rowid` 分裂条件 | 堆表 `TableReader` 在推送过滤前把隐藏行柄加入 schema（`\u{1}_tidb_rowid`）并逐行追加 handle，`BETWEEN` 条件在本地可求值；等价 `Point_Get` 走 `with_rowid` |
+| 星号投影宽度 | `SELECT *` + `_tidb_rowid` 过滤时用 `StarOrderProjection` 还原用户列宽，避免 `INSERT … SELECT *` 报 1136 |
+| 多表行柄 | `UPDATE`/`DELETE` join 的过滤 schema/值向量补 `table._tidb_rowid`，多表 split 条件不再 1054 |
+| `ON DUPLICATE KEY UPDATE` | `InsertStmt::restore` 在 select/select_set 形态下也输出该子句，split 语句不再丢子句触发 1062 |
+| split 语句恢复模式 | 新增 `RestoreCtx::new_batch`（TiDB `RestoreBracketAroundBinaryOperation`）：`SET b=(b + 42)`、`WHERE ((a <= 9) OR a IS NULL)`；`DELETE IGNORE` 保留 IGNORE |
+| 作业告警 | 各 split 语句的 warnings 汇总回 batch 结果（`DELETE IGNORE` 的 1451 等） |
+| `sql_select_limit` | 新增会话变量（默认 `18446744073709551615`）：顶层 `SELECT`/`SetOpr` 无 LIMIT 时按 TiDB `TryAddExtraLimit` 补 LIMIT（含 `EXPLAIN` 内层）；batch 内部 shard 枚举/split 执行标记为受限 SQL 豁免 |
+| 多表 `DELETE t1.*` | lower 层把 `DELETE t1.* FROM …` 重写为 `DELETE t1 FROM …`；单表分片列限定名与别名不匹配时按 TiDB 报 1054 |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t session/nontransactional   → PASS: memory=1 tikv=0
+./tests/integrationtest/run-tests.sh -s tikv -k -t session/nontransactional  → PASS: memory=0 tikv=1
+./tests/integrationtest/run-tests.sh -s memory -t executor/delete            → PASS（IGNORE/告警回归）
+./tests/integrationtest/run-tests.sh -s memory -t session/variable           → PASS
+./tests/integrationtest/run-tests.sh -s memory -t bindinfo/bind              → PASS
+./tests/integrationtest/run-tests.sh -s memory -t planner/core/rule_result_reorder → PASS
+```
+
+### 状态
+- manifest：`session/nontransactional` → `green`，green 135 / pending 101（R5 10/12）
+- 下一步：R5 剩余 `session/temporary_table`、`ddl/db_integration`。
+
+## 2026-11-23 22:40 — `session/temporary_table` 转绿（R5 11/12）
+
+### 目标
+`tests/integrationtest/t/session/temporary_table.test` 在 Memory 与 TiKV 双引擎下 100% 通过。
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 跨库临时表可见性 | `publish_temp_tables` / `overlay_temp_tables` 把**所有**会话临时表登记到 `TEMP_TABLE_SCHEMA`（不再只登记当前库）；`db2.tplacement3` 这类限定名也能解析 |
+| 限定名改写 | `rewrite_temp_table_name` 同时改写未限定与 `db.t` 限定形态（匹配会话临时表清单即改写到 `TEMP_TABLE_SCHEMA`） |
+| `CREATE TEMPORARY TABLE … LIKE` | 清空 `placement_policy` / `affinity`：临时表不继承基表 placement，`SHOW CREATE TABLE` 不再出现 `PLACEMENT POLICY` |
+| 事务内 `TRUNCATE` | 新增 `TxnManager::handle()` 与 `ddl::clear_table_keys_in_txn`：显式事务里 TRUNCATE 临时表时通过未提交的 txn handle 清行，当前写缓冲的行也一起删除 |
+| 临时表索引保序 | `set_index_range_keep_order` 递归 `PhysicalPlan::UnionScan`，脏读包装不再丢掉 `keep_order`；`plan_provides_order` 恢复 `IndexLookUpReader` / `IndexReader` 的有序推导（`USE INDEX(tmp1, u)` 结果顺序与金样一致） |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t session/temporary_table      → PASS: memory=1 tikv=0
+./tests/integrationtest/run-tests.sh -s tikv  -t session/temporary_table      → PASS: memory=0 tikv=1
+./tests/integrationtest/run-tests.sh -s memory -t table/temptable             → PASS
+./tests/integrationtest/run-tests.sh -s memory -t bindinfo/temptable          → PASS
+```
+
+### 状态
+- manifest：`session/temporary_table` → `green`，green 136 / pending 100（R5 11/12）
+
+## 2026-11-23 23:30 — `ddl/db_integration` 转绿（R5 12/12，R5 收口）
+
+### 目标
+`tests/integrationtest/t/ddl/db_integration.test` 在 Memory 与 TiKV 双引擎下 100% 通过（R5 最后一个 suite）。
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 表达式索引校验 | `is_multi_valued_part` 按 AST 判定 `CAST(… AS … ARRAY)`，不再用 `contains("ARRAY")` 误判 `json_array(b)`：多值索引部分豁免整列 BLOB/TEXT/JSON 规则，普通 JSON 函数表达式仍报 3753 |
+| 零宽/LOB 结果 | `checkIndexColumn` 等价校验：零宽 `CHAR/VARCHAR` 结果 → 3761；无长度 `TEXT/BLOB` 结果 → 3757；`JSON`/`GEOMETRY` → 3753；`json_unquote`/`json_pretty` 按无长度 BLOB 处理 |
+| 键长 3072 | `index_column_length` + `check_index_sum_length`：整数/浮点/小数/字符集字节数逐类型折算，多列或严格模式超 3072 报 1071；列字符集/类型变更后 `revalidate_index_lengths` 复检 |
+| 时间函数索引 | `timestampadd(unit, n, dt)` 按 DATETIME（fsp 取时间参数）定型、`timestampdiff` → BIGINT：首个参数是 unit 关键字，不再回落成不可索引的字符串类型（`explain_generate_column_substitute` 回归） |
+| 默认值 | `validate_default_literal` 忽略 `DEFAULT NULL`（NOT NULL 由列属性校验负责）；`literal_char_len` 按解码字符数衡量转义/`\0` 填充后的 `BINARY(N)` 长度（`binary(197)` 不再 1067） |
+| 视图列名 | 视图体别名保留 `field.Text()` 自然名并在重名时 `Name_exp_*`；列清单额外对超过 64 字符的名字回落 `name_exp_<pos>`（`executor/ddl`、`ddl/db_integration` 的 `SHOW CREATE VIEW` 双金样） |
+| 小数科学计数入库 | `check_decimal_scale` 先展开指数再数小数位：`insert … values('12e-3')` 进 `DECIMAL(10,0)` 报 1366 告警且存 0，`'1e2'` 仍按 100 参与唯一键冲突（`executor/insert` 回归） |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t ddl/db_integration          → PASS: memory=1 tikv=0
+./tests/integrationtest/run-tests.sh -s tikv  -t ddl/db_integration          → PASS: memory=0 tikv=1
+./tests/integrationtest/run-tests.sh -s memory -t executor/ddl               → PASS
+./tests/integrationtest/run-tests.sh -s memory -t executor/insert            → PASS
+./tests/integrationtest/run-tests.sh -s memory -t explain_generate_column_substitute → PASS
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory     → PASS（全量 green+local 闸门）
+```
+
+### 状态
+- manifest：`ddl/db_integration` → `green`，green 136 / pending 100（R5 12/12 收口）
+- 下一步：R6 / R7 长尾与 R2 剩余 suite。
+
+## 2026-11-23 24:30 — `globalindex/multi_valued_index` 转绿（R7）
+
+### 目标
+`tests/integrationtest/t/globalindex/multi_valued_index.test` 在 Memory 与 TiKV 双引擎下 100% 通过。
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 多值索引行内重复元素 | `write_index_keys` 按「单行内已写入的索引键」去重：`{"zipcode": [3,3,4]}` 中重复的 `3` 只落一个键，不再与自身触发 1062；跨行相同元素仍正常冲突（`[2,3]` vs 已有 `2`） |
+| GLOBAL 多值 merge 分区标签 | `mv_partition_access` 给 MVIndex merge 根补 `partition:all` / `partition:pN`（此前只在普通 IndexMerge 路径设置，MV 路径恒为空） |
+| merge 根投影 | `merge_extra_projection` 的 GLOBAL 分支改为只有 DataSource 真的多出列时才保留投影：脏读 `UnionScan`（`mem_index_merge` 有序/无序都会多出列）或有序 merge 的排序列（`order by c limit 1`）；普通 `SELECT *` 的 merge 不再多出空投影（本套件期望无 Projection） |
+| probe 侧过滤 | `IndexMergeExecutor` 新增 `probe_selection`：merge 根残差（`Selection(Probe)`）在 `TableRowIDScan` 回表后生效，此前完全未执行（`… and id > 1` 多返回 `id=1`） |
+| Selection 表名解析 | `selection_table` 认识 `IndexMerge`，root `Selection` 的算子信息用真实表名限定（`customers.custinfo` 而非占位 `t.custinfo`） |
+| 表达式索引的字符集引导符 | 索引表达式文本渲染按 `GeneratedExprString` 里记录的引导符还原（`_utf8'$.zipcode'` 不再被统一改写成 `_utf8mb4`）：`index_expr_text` 把源文本引导符回放到 `field.Text()` 文本，EXPLAIN 侧按存储文本还原 |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t globalindex/multi_valued_index --status pending  → PASS
+./tests/integrationtest/run-tests.sh           -t globalindex/multi_valued_index                → PASS: memory=1 tikv=1
+./tests/integrationtest/run-tests.sh -s memory -t globalindex/mem_index_merge                    → PASS（回归）
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory                          → PASS: memory=145（137 green + 8 local）
+./tests/integrationtest/run-tests.sh                                                              → PASS: memory=145 tikv=143
+```
+
+### 状态
+- manifest：`globalindex/multi_valued_index` → `green`，green 137 / pending 99（counts 同步）
+- 下一步：R7 长尾（`globalindex/misc`、`globalindex/analyze`、planner casetest 规则类）与 R2 剩余 suite。
+
+## 2026-11-24 20:40 — `globalindex/misc` 转绿（R7）
+
+### 目标
+`tests/integrationtest/t/globalindex/misc.test` 在 Memory 与 TiKV 双引擎下 100% 通过。
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| GLOBAL + CLUSTERED 拒绝 | `ddl/create_table` 在建索引时校验：`primary && global && pk_is_handle` 返回 8200 `ErrGeneralUnsupportedDDL`（TiDB 文案 `Unsupported create an index that is both a global index and a clustered index`） |
+| `LOCAL` 索引关键字 | parser 桥接层识别索引定义尾部（`unique key idx_b (b) local`）的 `LOCAL` 并剥离，等价 `GLOBAL=false` |
+| `UPDATE INDEXES` 子句 | AST 新增 `IndexUpdate`，`AlterTableSpec::Repartition` 携带 `update_indexes`；`parse_update_indexes` 解析 `ALTER TABLE … PARTITION BY … UPDATE INDEXES (idx GLOBAL\|LOCAL)`，`restore` 可回写；执行侧 `repartition` 在挂分区前逐索引翻转 `idx.global`，索引不存在/重复出现报 1280 `ERR_WRONG_NAME_FOR_INDEX` |
+| `SHOW CREATE TABLE` 全局索引 | `render_create_table` 对全局二级索引输出 `/*T![global_index] GLOBAL */`；parser 侧 `rewrite_tidb_global_index_comment` 把该注释展开为普通 `GLOBAL` 选项，保证 `show create table` 结果可再次解析 |
+| `FROM PARTITION (pN)` 读全局索引 | `pin_global_partition_read` 覆盖 `PhysicalPlan::IndexReader`：钉分区读取在 cop 侧补 `in(_tidb_tid, tidN)`；有序扫描时把 `TID_SEL` 合并为 `KEEP_ORDER_SEL`（`Selection` 仍在 `IndexFullScan` 之上、并保留 `keep order:true`），补回此前丢失的 `Projection` 递归，避免包裹层下的全局索引读取漏钉 |
+| 已分析表的覆盖索引扫描 estRows | `IndexReader` 全量扫描（无 range）取 `table_row_count` 真实行数（此前恒为伪统计 10000，`IndexReader`/`IndexFullScan` 及 `stats:pseudo` 标记都错），`order_by_index_plan` 的 IndexReader 分支同步 |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t globalindex/misc --status pending  → PASS
+./tests/integrationtest/run-tests.sh -s memory -t globalindex/expression_index      → PASS（回归：钉分区 + NULL 渲染）
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory            → PASS: memory=145（138 green + 8 local）
+./tests/integrationtest/run-tests.sh -s tikv                                       → PASS: tikv=143
+```
+
+### 状态
+- manifest：`globalindex/misc` → `green`，green 138 / pending 98（counts 同步）
+- 下一步：R7 长尾（`globalindex/analyze`、planner casetest 规则类）与 R2 剩余 suite。
+
+
+## 2026-11-25 00:20 — `globalindex/analyze` 转绿（R7）
+
+### 目标
+`tests/integrationtest/t/globalindex/analyze.test` 在 Memory 与 TiKV 双引擎下 100% 通过。
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 表达式索引 + 生成列替换的根投影 | `expr_index_point_projection` 只在「键区间 / 有序读」上保留重算投影：`select c+1 … where (c+1)>3` 的 `plus(t.c, 1)->Column#8` 由它按 `max_col_id` 口径生成，全索引扫描（只回放键值）不再多出投影 |
+| 覆盖读消投影 | `wrap_output_projection` 新增 `index_read_answers_select_expr`：SELECT 列表正好拼出索引键表达式、且无可见虚拟列需要重算时，不再追加通用投影（GLOBAL 表达式索引 `((c+1))` 的 `IndexReader` 直接以索引键作答；无可见虚拟列时仍保留通用投影，`select reverse(c_str)` 一类执行语义不受影响） |
+| 数字强转文本 | 有序/区间重算投影沿用 `expr_text_with_numeric_cast`，混算 `b + a` 渲染为 `cast(t.a, double BINARY)`，不再丢 `cast` |
+| 键区间 vs 全扫描判据 | 生成列替换（`gcSubstituter`）只有在存在键区间谓词或 `keep order` 有序读时才补 `Projection`：`select a+1 from t`（全索引扫描）保持 `IndexReader`，`explain_generate_column_substitute` 的 `select a+1 from t where a+1=3` 仍保留 `Column#8` |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t globalindex/analyze --status pending → PASS
+./tests/integrationtest/run-tests.sh -s memory -t explain_generate_column_substitute    → PASS（回归）
+./tests/integrationtest/run-tests.sh -s memory -t globalindex/{expression_index,misc,multi_valued_index} / executor/point_get → PASS
+./tests/integrationtest/run-tests.sh            → PASS: memory=147 tikv=145（139 green + 8 local）
+```
+
+### 状态
+- manifest：`globalindex/analyze` → `green`，green 139 / pending 97（counts 同步）
+- 下一步：R7 长尾（planner casetest 规则类）与 R2 剩余 suite。

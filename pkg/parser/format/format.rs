@@ -18,6 +18,9 @@ pub struct RestoreCtx {
     /// (TiDB `mysql.bind_info.bind_sql`): keywords keep their default case and
     /// string literals carry no charset introducer, unlike view mode.
     qualify_db: Option<String>,
+    /// TiDB `RestoreBracketAroundBinaryOperation`: non-transactional DML split
+    /// statements wrap every binary operation in parentheses (`SET b=(b + 42)`).
+    bracket_binary: bool,
 }
 
 impl Default for RestoreCtx {
@@ -34,6 +37,7 @@ impl RestoreCtx {
             generated: false,
             cte_names: Vec::new(),
             qualify_db: None,
+            bracket_binary: false,
         }
     }
 
@@ -46,6 +50,7 @@ impl RestoreCtx {
             generated: true,
             cte_names: Vec::new(),
             qualify_db: None,
+            bracket_binary: false,
         }
     }
 
@@ -57,6 +62,7 @@ impl RestoreCtx {
             generated: false,
             cte_names: Vec::new(),
             qualify_db: None,
+            bracket_binary: false,
         }
     }
 
@@ -69,6 +75,17 @@ impl RestoreCtx {
             generated: false,
             cte_names: Vec::new(),
             qualify_db: Some(db.to_string()),
+            bracket_binary: false,
+        }
+    }
+
+    /// Context for a non-transactional DML split statement: table names are
+    /// schema-qualified and every binary operation keeps TiDB's parentheses
+    /// (`SET b=(b + 42)`, `WHERE ((a <= 9) OR a IS NULL)`).
+    pub fn new_batch(db: &str) -> Self {
+        Self {
+            bracket_binary: true,
+            ..Self::new_qualify(db)
         }
     }
 
@@ -96,6 +113,11 @@ impl RestoreCtx {
 
     pub fn in_view(&self) -> bool {
         self.view_db.is_some()
+    }
+
+    /// Non-transactional DML split statement restore (see [`Self::new_batch`]).
+    pub fn brackets_binary(&self) -> bool {
+        self.bracket_binary
     }
 
     /// Enter the scope of a `WITH` clause while restoring a view body.

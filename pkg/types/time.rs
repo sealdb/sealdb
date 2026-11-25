@@ -390,7 +390,7 @@ pub fn duration_from_numeric(int_digits: &str) -> Option<Time> {
 /// TiDB `matchDuration` (`types.ParseDuration`): `[-] [D ]HH[:MM[:SS]][.frac]`,
 /// also accepting the compact `HHMMSS` digits. The fraction is rounded to six
 /// digits; `None` covers both unparsable text and an out-of-range hour.
-fn match_duration(s: &str) -> Option<Time> {
+fn match_duration(s: &str) -> Option<(Time, bool)> {
     let (negative, rest) = match s.strip_prefix('-') {
         Some(rest) => (true, rest.trim_start()),
         None => (false, s),
@@ -419,6 +419,7 @@ fn match_duration(s: &str) -> Option<Time> {
     if !rest.is_empty() && chars_len >= 12 {
         return None;
     }
+    let truncated = !rest.is_empty();
     let (mut hour, mut minute, mut second) = (hour, minute, second);
     if overflow {
         // TiDB `hhmmssAddOverflow`: the rounded-up fraction carries into the
@@ -436,18 +437,21 @@ fn match_duration(s: &str) -> Option<Time> {
     if minute >= 60 || second >= 60 || hour > 838 {
         return None;
     }
-    Some(Time {
-        year: 0,
-        month: 0,
-        day: 0,
-        hour: hour as u16,
-        minute: minute as u8,
-        second: second as u8,
-        micro: if overflow { 0 } else { micro },
-        fsp: if overflow { 0 } else { fsp },
-        neg: negative && (hour != 0 || minute != 0 || second != 0 || micro != 0),
-        tp: TimeType::Time,
-    })
+    Some((
+        Time {
+            year: 0,
+            month: 0,
+            day: 0,
+            hour: hour as u16,
+            minute: minute as u8,
+            second: second as u8,
+            micro: if overflow { 0 } else { micro },
+            fsp: if overflow { 0 } else { fsp },
+            neg: negative && (hour != 0 || minute != 0 || second != 0 || micro != 0),
+            tp: TimeType::Time,
+        },
+        truncated,
+    ))
 }
 
 /// TiDB `ParseFrac`: the six-digit microseconds of `digits` rounded to `fsp`
@@ -543,6 +547,13 @@ fn digit_prefix(s: &str) -> &str {
 
 /// Duration text (`'01:01:01'`, `'838:59:59'`) → TIME.
 pub fn parse_duration_string(s: &str) -> Option<Time> {
+    match_duration(s.trim()).map(|(time, _)| time)
+}
+
+/// `parse_duration_string` plus whether the matching prefix ignored trailing
+/// text (TiDB `matchDuration` reports `ErrTruncatedWrongVal` for that tail;
+/// `CAST` keeps the parsed clock and warns).
+pub fn parse_duration_string_truncated(s: &str) -> Option<(Time, bool)> {
     match_duration(s.trim())
 }
 
@@ -1201,7 +1212,9 @@ pub fn parse_date_literal(s: &str) -> Result<Time> {
 
 /// Parse `TIME '...'` / `{t '...'}` literal (suite: HH:MM:SS).
 pub fn parse_time_literal(s: &str) -> Result<Time> {
-    match_duration(s.trim()).ok_or_else(|| incorrect("time", s))
+    match_duration(s.trim())
+        .map(|(time, _)| time)
+        .ok_or_else(|| incorrect("time", s))
 }
 
 #[cfg(test)]

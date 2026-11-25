@@ -250,10 +250,7 @@ impl Manager {
                         } else {
                             entry.columns.retain(|(granted, col)| {
                                 !(granted.contains(elem.tp)
-                                    && elem
-                                        .cols
-                                        .iter()
-                                        .any(|x| x.eq_ignore_ascii_case(col)))
+                                    && elem.cols.iter().any(|x| x.eq_ignore_ascii_case(col)))
                             });
                         }
                         // Rebuild the union from table-level and column grants.
@@ -344,9 +341,10 @@ impl Manager {
                     ),
                 ));
             }
-            inner
-                .users
-                .insert(key.clone(), spec.auth.as_deref().map(encode_native_password));
+            inner.users.insert(
+                key.clone(),
+                spec.auth.as_deref().map(encode_native_password),
+            );
             let attrs = UserAttributes {
                 comment: spec.comment.clone(),
                 resource_group: spec.resource_group.clone(),
@@ -864,11 +862,14 @@ impl Manager {
         }
         let inner = self.inner.lock().expect("privilege lock");
         let holds = |identity: &UserIdentity| {
-            inner.grants.get(&user_key(identity)).is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|e| matches_scope(e, db, table) && e.with_grant)
-            })
+            inner
+                .grants
+                .get(&user_key(identity))
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|e| matches_scope(e, db, table) && e.with_grant)
+                })
         };
         holds(user) || active_roles.iter().any(holds)
     }
@@ -961,10 +962,8 @@ impl Manager {
             std::collections::BTreeMap::new();
         let mut table_privs: std::collections::BTreeMap<String, (PrivilegeType, bool)> =
             std::collections::BTreeMap::new();
-        let mut column_privs: std::collections::BTreeMap<
-            String,
-            Vec<(PrivilegeType, String)>,
-        > = std::collections::BTreeMap::new();
+        let mut column_privs: std::collections::BTreeMap<String, Vec<(PrivilegeType, String)>> =
+            std::collections::BTreeMap::new();
         for identity in &identities {
             let Some(entries) = inner.grants.get(&user_key(identity)) else {
                 continue;
@@ -1282,14 +1281,13 @@ impl Manager {
             }
         }
         rows.sort_by(|a, b| {
-            (
-                &a.grantee,
-                &a.db,
-                &a.table,
-                &a.column,
-                &a.privilege,
-            )
-                .cmp(&(&b.grantee, &b.db, &b.table, &b.column, &b.privilege))
+            (&a.grantee, &a.db, &a.table, &a.column, &a.privilege).cmp(&(
+                &b.grantee,
+                &b.db,
+                &b.table,
+                &b.column,
+                &b.privilege,
+            ))
         });
         rows
     }
@@ -1297,14 +1295,11 @@ impl Manager {
     /// Whether `user` holds any global grant (sees every privilege row).
     pub fn has_global_grant(&self, user: &UserIdentity) -> bool {
         let inner = self.inner.lock().expect("privilege lock");
-        inner
-            .grants
-            .get(&user_key(user))
-            .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|e| e.db.is_empty() && !e.table_privs.is_empty())
-            })
+        inner.grants.get(&user_key(user)).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.db.is_empty() && !e.table_privs.is_empty())
+        })
     }
 
     /// Serialize grant tables for Storage (TiDB mysql.user / db / tables_priv).
@@ -1438,9 +1433,7 @@ impl Manager {
                             .collect();
                         let column_bits = column_grants
                             .iter()
-                            .fold(PrivilegeType::default(), |acc, (bits, _)| {
-                                acc.union(*bits)
-                            });
+                            .fold(PrivilegeType::default(), |acc, (bits, _)| acc.union(*bits));
                         let table_privs = if column_grants.is_empty() {
                             privs
                         } else {
@@ -1540,7 +1533,11 @@ impl Manager {
             .map(|((user, host), auth)| {
                 let mut privs = PrivilegeType::default();
                 let mut with_grant = false;
-                for entry in inner.grants.get(&(user.clone(), host.clone())).into_iter().flatten()
+                for entry in inner
+                    .grants
+                    .get(&(user.clone(), host.clone()))
+                    .into_iter()
+                    .flatten()
                 {
                     if entry.db.is_empty() && entry.table.is_empty() {
                         privs = privs.union(entry.table_privs);
@@ -1757,7 +1754,13 @@ fn encode_native_password(password: &str) -> String {
 
 /// Minimal SHA-1 (mysql_native_password storage hash).
 fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let mut h: [u32; 5] = [
+        0x6745_2301,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
     let bit_len = (data.len() as u64).wrapping_mul(8);
     let mut msg = data.to_vec();
     msg.push(0x80);
