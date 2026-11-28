@@ -634,6 +634,12 @@ fn parse_error_code(raw: &str) -> Result<Option<i32>> {
                 Error::new(sealdb_errno::ERR_PARSE_ERROR, format!("bad --error {raw}"))
             })?;
         }
+        // A list that includes 0 means "may fail" (e.g. MySQL/TiDB portability
+        // shims): mysql-tester keeps the golden free of any error line, so the
+        // failure is tolerated without logging it.
+        if codes.iter().any(|code| *code == "0") {
+            return Ok(Some(-2));
+        }
         return Ok(Some(-1));
     }
     let first = codes.first().copied().unwrap_or(raw);
@@ -985,7 +991,7 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
         }
     }
     match (result, step.expected_error) {
-        (Ok(qr), Some(-1) | None) => {
+        (Ok(qr), Some(-1) | Some(-2) | None) => {
             if !step.log_result {
                 return Ok(step.sql.clone());
             }
@@ -1057,6 +1063,7 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
                 ))
             }
         }
+        (Err(_), Some(-2)) => Ok(step.sql.clone()),
         (Err(_), Some(-1)) => Ok(format!("{}\nGot one of the listed errors", step.sql)),
         (Err(err), Some(code)) if err.code != code => {
             // Triage aid: `SEALDB_ITEST_LENIENT_ERRORS` keeps the run going so

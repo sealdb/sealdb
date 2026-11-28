@@ -652,6 +652,30 @@ fn compare_datums_for_op(left: &Datum, right: &Datum, op: Op) -> Result<std::cmp
     compare_datums(left, right)
 }
 
+/// `CAST(… AS BINARY)` / `BINARY(n)` / `VARBINARY(n)` operand: byte-wise.
+fn is_binary_cast_expr(expr: &ExprNode) -> bool {
+    matches!(expr, ExprNode::Cast(cast) if sealdb_parser::ast::expressions::is_binary_cast_target(&cast.target))
+}
+
+/// Comparison with collation resolution.
+///
+/// A binary-charset cast (`col = cast('ABC' AS BINARY)`) makes the comparison
+/// byte-wise, just like TiDB's `types.CompareDatum` under the binary
+/// collation, instead of using the column's `*_ci` weights.
+fn compare_for_op(
+    expr: &BinaryOpExpr,
+    left: &Datum,
+    right: &Datum,
+    op: Op,
+) -> Result<std::cmp::Ordering> {
+    if (is_binary_cast_expr(&expr.left) || is_binary_cast_expr(&expr.right))
+        && let (Some(lb), Some(rb)) = (string_like_bytes(left), string_like_bytes(right))
+    {
+        return Ok(compare_bytes(CollateMode::Bin, lb, rb));
+    }
+    compare_datums_for_op(left, right, op)
+}
+
 /// Format invalid bytes like TiDB `formatInvalidChars` (`\x80`).
 /// Longest prefix of `bytes` that is valid UTF-8 (TiDB truncates a binary →
 /// char cast at the first invalid byte outside strict mode).
@@ -1104,7 +1128,7 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             return Ok(bool_datum(false));
         }
         return Ok(bool_datum(
-            compare_datums_for_op(&left, &right, Op::NullSafeEq)?.is_eq(),
+            compare_for_op(expr, &left, &right, Op::NullSafeEq)?.is_eq(),
         ));
     }
     if left.is_null() || right.is_null() {
@@ -1287,22 +1311,22 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             Ok(Datum::I64((datum_as_i128(&left)? % ri) as i64))
         }
         Op::Eq => Ok(bool_datum(
-            compare_datums_for_op(&left, &right, Op::Eq)?.is_eq(),
+            compare_for_op(expr, &left, &right, Op::Eq)?.is_eq(),
         )),
         Op::Ne => Ok(bool_datum(
-            !compare_datums_for_op(&left, &right, Op::Ne)?.is_eq(),
+            !compare_for_op(expr, &left, &right, Op::Ne)?.is_eq(),
         )),
         Op::Lt => Ok(bool_datum(
-            compare_datums_for_op(&left, &right, Op::Lt)?.is_lt(),
+            compare_for_op(expr, &left, &right, Op::Lt)?.is_lt(),
         )),
         Op::Le => Ok(bool_datum(
-            compare_datums_for_op(&left, &right, Op::Le)?.is_le(),
+            compare_for_op(expr, &left, &right, Op::Le)?.is_le(),
         )),
         Op::Gt => Ok(bool_datum(
-            compare_datums_for_op(&left, &right, Op::Gt)?.is_gt(),
+            compare_for_op(expr, &left, &right, Op::Gt)?.is_gt(),
         )),
         Op::Ge => Ok(bool_datum(
-            compare_datums_for_op(&left, &right, Op::Ge)?.is_ge(),
+            compare_for_op(expr, &left, &right, Op::Ge)?.is_ge(),
         )),
         Op::LeftShift | Op::RightShift => {
             if matches!(left, Datum::Null) || matches!(right, Datum::Null) {
@@ -2653,6 +2677,8 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         // `LOCATE(substr, str[, pos])` / `INSTR(str, substr)`.
         "LOCATE" => eval_locate(func, schema, row, false),
         "INSTR" => eval_locate(func, schema, row, true),
+        // `POSITION(substr IN str)` lowered with LOCATE's operand order.
+        "POSITION" => eval_locate(func, schema, row, false),
         "__LOCATE_COLL" => eval_locate(func, schema, row, false),
         "__INSTR_COLL" => eval_locate(func, schema, row, true),
         // MySQL regular-expression functions (ICU in MySQL, POSIX-ish here).
@@ -7572,6 +7598,9 @@ fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<D
     if left.is_null() {
         return Ok(Datum::Null);
     }
+    // `col IN (cast('a' AS BINARY), …)`: the whole list compares byte-wise,
+    // like TiDB's binary collation, instead of under the column's `*_ci`.
+    let binary = is_binary_cast_expr(&expr.expr) || expr.list.iter().any(is_binary_cast_expr);
     let mut saw_null = false;
     for item in &expr.list {
         let value = eval_expr_with_row(item, schema, row)?;
@@ -7579,7 +7608,11 @@ fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<D
             saw_null = true;
             continue;
         }
-        if compare_datums(&left, &value)?.is_eq() {
+        let equal = match (binary, string_like_bytes(&left), string_like_bytes(&value)) {
+            (true, Some(lb), Some(rb)) => compare_bytes(CollateMode::Bin, lb, rb).is_eq(),
+            _ => compare_datums(&left, &value)?.is_eq(),
+        };
+        if equal {
             return Ok(bool_datum(!expr.not));
         }
     }

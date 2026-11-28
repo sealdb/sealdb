@@ -4,6 +4,22 @@ use crate::opcode::Op;
 use sealdb_errno::Result;
 use sealdb_types::Datum;
 
+/// `CAST(… AS BINARY)`, `BINARY(n)` or `VARBINARY(n)`: a cast to the binary
+/// charset. Such a value compares byte-wise instead of under the column
+/// collation, so the cast node must survive constant folding.
+pub fn is_binary_cast_target(target: &str) -> bool {
+    let upper = target.trim().to_ascii_uppercase();
+    upper == "BINARY" || upper.starts_with("BINARY(") || upper.starts_with("VARBINARY")
+}
+
+/// Declared length of a `BINARY(n)` / `VARBINARY(n)` cast target.
+fn binary_cast_length(target: &str) -> Option<usize> {
+    let raw = target.trim();
+    let open = raw.find('(')?;
+    let close = raw[open..].find(')')? + open;
+    raw[open + 1..close].trim().parse::<usize>().ok()
+}
+
 #[derive(Clone, Debug)]
 pub enum ExprNode {
     Value(ValueExpr),
@@ -286,6 +302,26 @@ impl ExprNode {
     pub fn const_datum(&self) -> Option<Datum> {
         match self {
             ExprNode::Value(v) => Some(v.datum.clone()),
+            // `cast(<const> AS BINARY)` seeks the same key its value does; the
+            // node itself stays in the predicate so the comparison keeps the
+            // binary collation (see `rule_constant_fold`).
+            ExprNode::Cast(cast) if is_binary_cast_target(&cast.target) => {
+                let mut bytes = match Self::const_datum(&cast.expr)? {
+                    Datum::Bytes(bytes) => bytes,
+                    Datum::Bit(bytes) => bytes,
+                    other => other.as_bytes(),
+                };
+                if let Some(length) = binary_cast_length(&cast.target)
+                    && length > 0
+                {
+                    if bytes.len() >= length {
+                        bytes.truncate(length);
+                    } else {
+                        bytes.resize(length, 0);
+                    }
+                }
+                Some(Datum::Bytes(bytes))
+            }
             ExprNode::Unary(u) if matches!(u.op, Op::UnaryMinus | Op::Minus | Op::Plus) => {
                 let inner = Self::const_datum(&u.expr)?;
                 if matches!(u.op, Op::Plus) {

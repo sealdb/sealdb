@@ -14,9 +14,9 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 156,
-      "pending": 80,
-      "in_progress": 8,
+      "green": 157,
+      "in_progress": 10,
+      "pending": 77,
       "deferred": 2,
       "local": 8
     },
@@ -106,32 +106,35 @@
     {
       "name": "collation_agg_func",
       "wave": "R2",
-      "status": "pending",
+      "status": "in_progress",
       "test": "t/collation_agg_func.test",
-      "result": "r/collation_agg_func.result",
-      "has_result": false,
+      "result": "r/collation_agg_func_enabled.result",
+      "has_result": true,
       "skip_tikv": false,
-      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}",
+      "note": "SealDB boots with new collations enabled only; target the _enabled golden."
     },
     {
       "name": "collation_check_use_collation",
       "wave": "R4",
-      "status": "pending",
+      "status": "in_progress",
       "test": "t/collation_check_use_collation.test",
-      "result": "r/collation_check_use_collation.result",
-      "has_result": false,
+      "result": "r/collation_check_use_collation_enabled.result",
+      "has_result": true,
       "skip_tikv": false,
-      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+      "owner_hint": "planner/core/plan_cache*,session,util/collate",
+      "note": "SealDB boots with new collations enabled only; target the _enabled golden."
     },
     {
       "name": "collation_misc",
       "wave": "R4",
-      "status": "pending",
+      "status": "green",
       "test": "t/collation_misc.test",
-      "result": "r/collation_misc.result",
-      "has_result": false,
+      "result": "r/collation_misc_enabled.result",
+      "has_result": true,
       "skip_tikv": false,
-      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+      "owner_hint": "planner/core/plan_cache*,session,util/collate",
+      "note": "SealDB boots with new collations enabled only; target the _enabled golden."
     },
     {
       "name": "collation_pointget",

@@ -1351,8 +1351,8 @@ fn collations() -> (Vec<String>, Vec<Vec<Datum>>) {
                 Datum::I64(col.id),
                 bytes(if col.is_default { "Yes" } else { "" }),
                 bytes("Yes"),
-                Datum::I64(1),
-                bytes("PAD SPACE"),
+                Datum::I64(col.sortlen),
+                bytes(if col.no_pad { "NO PAD" } else { "PAD SPACE" }),
             ]
         })
         .collect();
@@ -1590,14 +1590,37 @@ struct Collation {
     charset: &'static str,
     id: i64,
     is_default: bool,
+    /// TiDB `charset.Collation.SortLen`: weight bytes per character (`0` for
+    /// the 0900 UCA collations, which sort by weight tables).
+    sortlen: i64,
+    /// `binary` / `*_0900_*` are NO PAD; everything else pads with spaces.
+    no_pad: bool,
 }
 
 const CHARSETS: &[Charset] = &[
     Charset {
-        name: "utf8mb4",
-        default_collation: "utf8mb4_bin",
-        description: "UTF-8 Unicode",
-        maxlen: 4,
+        name: "ascii",
+        default_collation: "ascii_bin",
+        description: "US ASCII",
+        maxlen: 1,
+    },
+    Charset {
+        name: "binary",
+        default_collation: "binary",
+        description: "binary",
+        maxlen: 1,
+    },
+    Charset {
+        name: "gbk",
+        default_collation: "gbk_chinese_ci",
+        description: "Chinese Internal Code Specification",
+        maxlen: 2,
+    },
+    Charset {
+        name: "latin1",
+        default_collation: "latin1_bin",
+        description: "Latin1",
+        maxlen: 1,
     },
     Charset {
         name: "utf8",
@@ -1606,85 +1629,119 @@ const CHARSETS: &[Charset] = &[
         maxlen: 3,
     },
     Charset {
-        name: "latin1",
-        default_collation: "latin1_bin",
-        description: "cp1252 West European",
-        maxlen: 1,
-    },
-    Charset {
-        name: "binary",
-        default_collation: "binary",
-        description: "Binary pseudo charset",
-        maxlen: 1,
-    },
-    Charset {
-        name: "ascii",
-        default_collation: "ascii_bin",
-        description: "US ASCII",
-        maxlen: 1,
-    },
-    Charset {
-        name: "gbk",
-        default_collation: "gbk_bin",
-        description: "GBK charset",
-        maxlen: 2,
+        name: "utf8mb4",
+        default_collation: "utf8mb4_bin",
+        description: "UTF-8 Unicode",
+        maxlen: 4,
     },
 ];
 
+/// TiDB's `charset.Collations`, in the order `information_schema.COLLATIONS`
+/// and `SHOW COLLATION` list them (alphabetical by name).
 const COLLATIONS: &[Collation] = &[
     Collation {
-        name: "utf8mb4_bin",
-        charset: "utf8mb4",
-        id: 46,
+        name: "ascii_bin",
+        charset: "ascii",
+        id: 65,
         is_default: true,
-    },
-    Collation {
-        name: "utf8mb4_general_ci",
-        charset: "utf8mb4",
-        id: 45,
-        is_default: false,
-    },
-    Collation {
-        name: "utf8mb4_unicode_ci",
-        charset: "utf8mb4",
-        id: 224,
-        is_default: false,
-    },
-    Collation {
-        name: "utf8_bin",
-        charset: "utf8",
-        id: 83,
-        is_default: true,
-    },
-    Collation {
-        name: "latin1_bin",
-        charset: "latin1",
-        id: 47,
-        is_default: true,
+        sortlen: 1,
+        no_pad: false,
     },
     Collation {
         name: "binary",
         charset: "binary",
         id: 63,
         is_default: true,
-    },
-    Collation {
-        name: "ascii_bin",
-        charset: "ascii",
-        id: 65,
-        is_default: true,
+        sortlen: 1,
+        no_pad: true,
     },
     Collation {
         name: "gbk_bin",
         charset: "gbk",
         id: 87,
-        is_default: true,
+        is_default: false,
+        sortlen: 1,
+        no_pad: false,
     },
     Collation {
         name: "gbk_chinese_ci",
         charset: "gbk",
         id: 28,
+        is_default: true,
+        sortlen: 1,
+        no_pad: false,
+    },
+    Collation {
+        name: "latin1_bin",
+        charset: "latin1",
+        id: 47,
+        is_default: true,
+        sortlen: 1,
+        no_pad: false,
+    },
+    Collation {
+        name: "utf8_bin",
+        charset: "utf8",
+        id: 83,
+        is_default: true,
+        sortlen: 1,
+        no_pad: false,
+    },
+    Collation {
+        name: "utf8_general_ci",
+        charset: "utf8",
+        id: 33,
         is_default: false,
+        sortlen: 1,
+        no_pad: false,
+    },
+    Collation {
+        name: "utf8_unicode_ci",
+        charset: "utf8",
+        id: 192,
+        is_default: false,
+        sortlen: 8,
+        no_pad: false,
+    },
+    Collation {
+        name: "utf8mb4_0900_ai_ci",
+        charset: "utf8mb4",
+        id: 255,
+        is_default: false,
+        sortlen: 0,
+        no_pad: true,
+    },
+    Collation {
+        name: "utf8mb4_0900_bin",
+        charset: "utf8mb4",
+        id: 309,
+        is_default: false,
+        sortlen: 1,
+        no_pad: true,
+    },
+    Collation {
+        name: "utf8mb4_bin",
+        charset: "utf8mb4",
+        id: 46,
+        is_default: true,
+        sortlen: 1,
+        no_pad: false,
+    },
+    Collation {
+        name: "utf8mb4_general_ci",
+        charset: "utf8mb4",
+        id: 45,
+        is_default: false,
+        sortlen: 1,
+        no_pad: false,
+    },
+    Collation {
+        name: "utf8mb4_unicode_ci",
+        charset: "utf8mb4",
+        id: 224,
+        is_default: false,
+        sortlen: 8,
+        no_pad: false,
     },
 ];
 

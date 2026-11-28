@@ -5670,3 +5670,27 @@ SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t sta
 ### 状态
 - manifest：`collation_pointget` → `green`（`result` 指向 `_enabled` 金样），green 156 / pending 80
 - 后续：把 `collation_agg_func` / `collation_check_use_collation` / `collation_misc` 同样指向 `_enabled` 金样后逐个转绿。
+
+## 2026-11-28 13:05 — `collation_misc` 转绿（R4 6/13）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| `POSITION` 下推 | 解析桥把 `POSITION(substr IN str)` 降级成 `position(str, substr)`（参数序与 `LOCATE` 一致），求值器分发到 `eval_locate(..., false)`。 |
+| 字符集元数据 | `SHOW COLLATION` 补 `Pad_attribute` 列（7 列）；`information_schema.character_sets` 中 `binary` 的描述改为 `binary`。 |
+| 二进制 cast 语义 | `is_binary_cast_target` 让常量折叠保留 `CAST(… AS BINARY)` 外壳；`const_datum` 能对二进制 cast 求值以生成索引区间，但 `binary_collation_conjunct` 把该合取式留在 cop `Selection`（计划为 `IndexRangeScan` + `Selection`），`=`/`IN` 的操作数为二进制 cast 时强制 `CollateMode::Bin` 逐字节比较；`EXPLAIN` 里二进制 cast 字面量按裸值渲染（`eq(t.uuid, "ABC")`）。 |
+| 集合/分组去重 | `UnionExec` 的去重键与 `HashAgg` 分组键在 PAD SPACE 下统一按排序键（去尾随空格）hex 编码，`'2010-09-09'` 与 `'2010-09-09  '` 落同一组。 |
+| join 谓词归位 | `fold_pinned_join_on` 识别单侧 `IN (常量)` 钉死并把两侧都钉死的等值 join 折成 `CARTESIAN inner join`；`rule_predicate_push_down` 的 `references_both_join_sides` 把跨侧非等值条件挂到 `HashJoin` 的 `other cond:`，不再多出外层 `Selection`。 |
+| DDL / 会话口径 | `ALTER TABLE … MODIFY` 的字符集变更按 TiDB `checkModifyCharsetAndCollation` 只放行 utf8/latin1 → utf8mb4（其余 8200）；`USE db` 同步 `collation_database` / `character_set_database`（不支持的新排序规则回落字符集默认）。 |
+| itest 容错 | `--error 0,…` 视为「允许失败」：成功照常输出、失败不比对错误码（金样里没有错误行）。 |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t collation_misc                 → PASS: memory=1
+./tests/integrationtest/run-tests.sh -s tikv -k -t collation_misc               → PASS: memory=0 tikv=1
+./tests/integrationtest/run-tests.sh -s memory                                  → PASS: memory=164 tikv=0 skipped=91
+```
+
+### 状态
+- manifest：`collation_misc` → `green`，green 157 / pending 77
+- 下一刀：`collation_check_use_collation`（子查询 + `ENUM`/`SET` 的 `IN`/`BETWEEN` 隐式排序规则）与 `collation_agg_func`。

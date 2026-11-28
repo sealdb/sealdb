@@ -239,7 +239,38 @@ fn counts_of(rows: &[Vec<Datum>]) -> HashMap<Vec<String>, usize> {
 }
 
 fn row_key(row: &[Datum]) -> Vec<String> {
-    row.iter().map(Datum::display).collect()
+    row.iter().map(union_key).collect()
+}
+
+/// Dedup key of one union column.
+///
+/// TiDB compares the aggregated column value (`Datum.CompareDatum`) rather than
+/// the branch-local datum, so a DATE `2010-09-09` and the string
+/// `'2010-09-09  '` are one row under a PAD SPACE collation. Normalizing to the
+/// display text without trailing spaces matches that equality.
+fn union_key(datum: &Datum) -> String {
+    match datum {
+        Datum::Bytes(bytes) | Datum::Bit(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => format!("s:{}", text.trim_end_matches(' ')),
+            // Invalid UTF-8 never equals a text value; keep the raw bytes.
+            Err(_) => format!(
+                "x:{}",
+                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
+        },
+        Datum::Enum(value) => match std::str::from_utf8(&value.label) {
+            Ok(text) => format!("s:{}", text.trim_end_matches(' ')),
+            Err(_) => format!(
+                "x:{}",
+                value
+                    .label
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ),
+        },
+        other => format!("s:{}", other.display().trim_end_matches(' ')),
+    }
 }
 
 fn column_mismatch() -> Error {

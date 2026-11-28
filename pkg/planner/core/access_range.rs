@@ -9,8 +9,41 @@
 use super::physical_plans::IndexScanRange;
 use sealdb_meta::{IndexInfo, TableInfo};
 use sealdb_parser::ast::expressions::ExprNode;
+use sealdb_parser::opcode::Op;
 use sealdb_statistics::pseudo;
 use sealdb_types::{Datum, EnumValue};
+
+/// A predicate comparing against `CAST(… AS BINARY)`.
+///
+/// The comparison runs under the binary collation while the index key stores
+/// the column collation's sort key, so the seek range can be broader than the
+/// predicate (`'ABC'` and `'abc'` share one `utf8mb4_general_ci` key). TiDB's
+/// ranger still builds the range but keeps the predicate as a cop Selection;
+/// the same predicate also stays in the statement so the executor re-derives
+/// the identical seek bounds.
+fn binary_collation_conjunct(conjunct: &ExprNode) -> bool {
+    fn is_binary_cast(expr: &ExprNode) -> bool {
+        matches!(expr, ExprNode::Cast(cast) if sealdb_parser::ast::expressions::is_binary_cast_target(&cast.target))
+    }
+    match conjunct {
+        ExprNode::Binary(bin)
+            if matches!(
+                bin.op,
+                Op::Eq
+                    | Op::Ne
+                    | Op::Lt
+                    | Op::Le
+                    | Op::Gt
+                    | Op::Ge
+                    | Op::NullSafeEq
+            ) =>
+        {
+            is_binary_cast(&bin.left) || is_binary_cast(&bin.right)
+        }
+        ExprNode::InList(list) => is_binary_cast(&list.expr) || list.list.iter().any(is_binary_cast),
+        _ => false,
+    }
+}
 
 pub struct IndexAccessRange {
     /// `range:…` text + estRows for EXPLAIN.
@@ -304,7 +337,7 @@ fn conjunction_key_ranges(
                     return None;
                 }
             }
-            if encoded {
+            if encoded && !binary_collation_conjunct(conjunct) {
                 part_conjuncts.push(conjunct.clone());
             }
         }
@@ -484,6 +517,7 @@ pub fn index_access_range(
         }
         bound_conjuncts.push(conjunct.clone());
         if encoded
+            && !binary_collation_conjunct(conjunct)
             && !consumed
                 .iter()
                 .any(|used| used.restore_string() == conjunct.restore_string())

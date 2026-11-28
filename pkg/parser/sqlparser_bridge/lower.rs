@@ -11304,45 +11304,118 @@ const ALTER_TABLE_OPTION_KEYWORDS: &[&str] = &[
 fn parse_alter_table_options(body: &str) -> Option<Vec<(String, String)>> {
     let mut options = Vec::new();
     for raw in split_defs(body) {
-        let item = raw.trim();
-        if item.is_empty() {
+        let mut rest = raw.trim();
+        if rest.is_empty() {
             return None;
         }
-        // `DEFAULT COLLATE x` / `DEFAULT CHARSET x` — the leading DEFAULT is
-        // noise in the option list.
-        let item = if keyword_at(item.as_bytes(), 0, "DEFAULT") {
-            item["DEFAULT".len()..].trim_start()
-        } else {
-            item
-        };
-        let item_bytes = item.as_bytes();
-        let name_end = skip_ident_or_quoted(item_bytes, skip_ws(item_bytes, 0));
-        let mut name = item[..name_end].trim().trim_matches('`').to_string();
-        let mut j = skip_ws(item_bytes, name_end);
-        // `CHARSET x` is rewritten to `CHARACTER SET x` before this pass.
-        if name.eq_ignore_ascii_case("CHARACTER") {
-            let set_at = skip_ws(item_bytes, j);
-            if set_at < item_bytes.len() && keyword_at(item_bytes, set_at, "SET") {
-                name = "CHARSET".to_string();
-                j = skip_ws(item_bytes, set_at + "SET".len());
+        // TiDB's `AlterTableOptionList` allows several space-separated options
+        // (`COLLATE a CHARSET b CHARSET c COLLATE d`), so keep consuming until
+        // the item is exhausted.
+        loop {
+            // `DEFAULT COLLATE x` / `DEFAULT CHARSET x` — the leading DEFAULT is
+            // noise in the option list.
+            rest = if keyword_at(rest.as_bytes(), 0, "DEFAULT") {
+                rest["DEFAULT".len()..].trim_start()
+            } else {
+                rest
+            };
+            let item_bytes = rest.as_bytes();
+            let name_end = skip_ident_or_quoted(item_bytes, skip_ws(item_bytes, 0));
+            let mut name = rest[..name_end].trim().trim_matches('`').to_string();
+            let mut j = skip_ws(item_bytes, name_end);
+            // `CHARSET x` is rewritten to `CHARACTER SET x` before this pass.
+            if name.eq_ignore_ascii_case("CHARACTER") {
+                let set_at = skip_ws(item_bytes, j);
+                if set_at < item_bytes.len() && keyword_at(item_bytes, set_at, "SET") {
+                    name = "CHARSET".to_string();
+                    j = skip_ws(item_bytes, set_at + "SET".len());
+                }
             }
+            if !ALTER_TABLE_OPTION_KEYWORDS
+                .iter()
+                .any(|kw| kw.eq_ignore_ascii_case(&name))
+            {
+                return None;
+            }
+            if j < item_bytes.len() && item_bytes[j] == b'=' {
+                j = skip_ws(item_bytes, j + 1);
+            }
+            let (value, consumed) = alter_table_option_value(&rest[j..])?;
+            options.push((name.to_ascii_uppercase(), value));
+            let tail = rest[j + consumed..].trim_start();
+            if tail.is_empty() {
+                break;
+            }
+            rest = tail;
         }
-        if !ALTER_TABLE_OPTION_KEYWORDS
-            .iter()
-            .any(|kw| kw.eq_ignore_ascii_case(&name))
-        {
-            return None;
-        }
-        if j < item_bytes.len() && item_bytes[j] == b'=' {
-            j = skip_ws(item_bytes, j + 1);
-        }
-        let value = item[j..].trim().to_string();
-        if value.is_empty() {
-            return None;
-        }
-        options.push((name.to_ascii_uppercase(), value));
     }
     (!options.is_empty()).then_some(options)
+}
+
+/// Read one option value: a quoted string, a parenthesised list, or a single
+/// bare word (the charset/collation names, `ENGINE=InnoDB`, …). Returns the
+/// value and how many bytes of `rest` it used.
+fn alter_table_option_value(rest: &str) -> Option<(String, usize)> {
+    let bytes = rest.as_bytes();
+    let first = *bytes.first()?;
+    if first == b'\'' || first == b'"' || first == b'`' {
+        let mut i = 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && first != b'`' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == first {
+                // A doubled quote is an escaped quote.
+                if i + 1 < bytes.len() && bytes[i + 1] == first {
+                    i += 2;
+                    continue;
+                }
+                let value = rest[..=i].to_string();
+                return Some((value, i + 1));
+            }
+            i += 1;
+        }
+        return None;
+    }
+    if first == b'(' {
+        let mut depth = 0usize;
+        let mut i = 0;
+        let mut quote: Option<u8> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(q) = quote {
+                if b == b'\\' && q != b'`' {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\'' | b'"' | b'`' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((rest[..=i].to_string(), i + 1));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        return None;
+    }
+    let mut i = 0;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let value = rest[..i].to_string();
+    (!value.is_empty()).then_some((value, i))
 }
 
 /// sqlparser MySQL dialect rejects `ADD/DROP PARTITION`; strip and re-attach.
@@ -18413,6 +18486,13 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         Expr::IsNotFalse(expr) => lower_is_truth(expr, "isnotfalse"),
         Expr::IsUnknown(expr) => lower_is_truth(expr, "isunknown"),
         Expr::IsNotUnknown(expr) => lower_is_truth(expr, "isnotunknown"),
+        // `POSITION(substr IN str)`: TiDB lowers it to the `position` builtin,
+        // which shares LOCATE's operand order (needle, haystack).
+        Expr::Position { expr, r#in } => Ok(ExprNode::Func(FuncCallExpr {
+            name: "position".to_string(),
+            args: vec![lower_expr(expr)?, lower_expr(r#in)?],
+            distinct: false,
+        })),
         Expr::Subquery(subquery) => {
             let query = lower_result_set(subquery)?;
             Ok(ExprNode::ScalarSubquery(ScalarSubqueryExpr {

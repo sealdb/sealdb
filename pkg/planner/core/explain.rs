@@ -8164,6 +8164,14 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
         }
         ExprNode::Cast(c) => {
             let upper = c.target.to_ascii_uppercase();
+            // A binary-charset cast of a literal is a constant to TiDB's
+            // ExplainInfo: the predicate prints `eq(t.uuid, "ABC")` even though
+            // the comparison still runs byte-wise.
+            if sealdb_parser::ast::expressions::is_binary_cast_target(&c.target)
+                && matches!(c.expr.as_ref(), ExprNode::Value(_))
+            {
+                return explain_scalar_expr(&c.expr, table);
+            }
             let target = if upper.contains("DOUBLE") || upper == "FLOAT8" {
                 "double BINARY".to_string()
             } else if upper.contains("CHAR") || upper.contains("STRING") || upper.contains("BINARY")

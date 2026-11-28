@@ -1546,14 +1546,32 @@ impl Session {
         match stmt {
             Statement::Use(use_stmt) => {
                 let is = self.domain.infoschema();
-                if is.schema_by_name(&use_stmt.db_name).is_none() {
+                let Some(schema) = is.schema_by_name(&use_stmt.db_name) else {
                     return Err(sealdb_errno::Error::new(
                         sealdb_errno::ERR_BAD_DB,
                         format!("Unknown database '{}'", use_stmt.db_name),
                     ));
-                }
+                };
+                // TiDB `useDB`: `character_set_database` / `collation_database`
+                // follow the schema, substituting a collation the new-collation
+                // framework does not support with the charset default.
+                use sealdb_parser::charset::Collation;
+                let db_charset = schema.charset.clone();
+                let db_collate = if schema.collate.is_empty() {
+                    Collation::default_for_charset(&db_charset).name
+                } else {
+                    schema.collate.clone()
+                };
+                let collate = if sealdb_parser::charset::is_supported_collation(&db_collate) {
+                    db_collate
+                } else {
+                    Collation::default_for_charset(&db_charset).name
+                };
+                let charset = Collation::parse(&collate).charset;
                 *self.current_db.lock().expect("session current_db lock") =
                     use_stmt.db_name.clone();
+                record_sysvar_override(self, "collation_database", &collate);
+                record_sysvar_override(self, "character_set_database", &charset);
                 return Ok(empty_result());
             }
             Statement::Set(set) => {
@@ -10920,6 +10938,7 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("character_set_results", "utf8mb4", VarKind::Text),
     ("character_set_server", "utf8mb4", VarKind::Text),
     ("collation_connection", "utf8mb4_bin", VarKind::Text),
+    ("collation_database", "utf8mb4_bin", VarKind::Text),
     ("collation_server", "utf8mb4_bin", VarKind::Text),
     ("cte_max_recursion_depth", "1000", VarKind::Text),
     (

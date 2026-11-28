@@ -1016,6 +1016,20 @@ fn push_into(
                                     on_keys.push(key);
                                     tp = JoinType::Inner;
                                 }
+                            } else if matches!(tp, JoinType::Inner)
+                                && references_both_join_sides(
+                                    &expr,
+                                    &left_map,
+                                    &right_map,
+                                    &left_tables,
+                                    &right_tables,
+                                )
+                            {
+                                // TiDB `DeriveOtherConditions`: a cross-side
+                                // non-equality is part of the hash join's
+                                // `other cond` (`in(t1.c, t2.c, t2.d)`), not a
+                                // Selection above the join.
+                                on_keys.push(expr);
                             } else {
                                 keep.push(expr);
                             }
@@ -2286,6 +2300,42 @@ fn same_join_key_type(key: &ExprNode, is: Option<&InfoSchema>, current_db: &str)
         (Some(a), Some(b)) => a == b,
         _ => true,
     }
+}
+
+/// Whether `expr` references columns owned by both join sides (and none that
+/// neither side owns). A cross-side predicate over base tables.
+fn references_both_join_sides(
+    expr: &ExprNode,
+    left_map: &std::collections::HashMap<String, Vec<String>>,
+    right_map: &std::collections::HashMap<String, Vec<String>>,
+    left_tables: &std::collections::HashSet<String>,
+    right_tables: &std::collections::HashSet<String>,
+) -> bool {
+    if expr.has_subquery() {
+        return false;
+    }
+    let cols = expr.referenced_columns();
+    if cols.is_empty() {
+        return false;
+    }
+    let mut left = false;
+    let mut right = false;
+    for (table, name) in cols {
+        let on_left = owner_of(table.as_deref(), &name, left_map, left_tables).is_some();
+        let on_right = owner_of(table.as_deref(), &name, right_map, right_tables).is_some();
+        if on_left && !on_right {
+            left = true;
+        } else if on_right && !on_left {
+            right = true;
+        } else if on_left && on_right {
+            // Ambiguous unqualified name (self-join): TiDB keeps the predicate
+            // above the join instead of guessing a side.
+            return false;
+        } else {
+            return false;
+        }
+    }
+    left && right
 }
 
 fn resolve_conjunct_side(

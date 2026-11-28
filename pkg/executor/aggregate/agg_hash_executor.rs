@@ -724,13 +724,18 @@ fn encode_group_key(keys: &[Datum], collations: &[CollateMode]) -> String {
     keys.iter()
         .enumerate()
         .map(|(i, d)| match (d, collations.get(i)) {
-            (Datum::Bytes(bytes), Some(mode)) => match key_bytes(*mode, bytes) {
-                Some(key) => format!(
+            // HashAgg groups on the collation sort key (`collator.Key`), which
+            // also trims trailing spaces under PAD SPACE collations; an
+            // untransformed key must use the same hex encoding so `'a'` and
+            // `'a '` land in one group.
+            (Datum::Bytes(bytes), Some(mode)) => {
+                let key = key_bytes(*mode, bytes);
+                let key = key.as_deref().unwrap_or(bytes);
+                format!(
                     "s:{}",
                     key.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                ),
-                None => format!("{d:?}"),
-            },
+                )
+            }
             _ => format!("{d:?}"),
         })
         .collect::<Vec<_>>()

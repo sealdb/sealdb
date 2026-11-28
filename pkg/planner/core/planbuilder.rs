@@ -2247,16 +2247,22 @@ impl PlanBuilder {
         // Outer joins are handled by `apply_outer_join_on` above.
         let both_base = !table_column_names(is, current_db, &first.left).is_empty()
             && !table_column_names(is, current_db, &first.right).is_empty();
+        // Single-side ON conjuncts pushed into the inputs; their equalities are
+        // still pin sources for the join-key fold below (`ON t1.c = t2.c AND
+        // t1.c IN ('1') AND t2.c IN ('1')` needs both pins).
+        let mut side_on_pins: Vec<ExprNode> = Vec::new();
         if both_base && matches!(first_tp, JoinType::Inner) {
             let (remaining, left_side, right_side) =
                 split_single_side_on(&first_on, &first.left, &first.right, is, current_db);
             let tables = [&first.left, &first.right];
             for conjunct in left_side {
                 let conjunct = rewrite_col_tables(&conjunct, &tables);
+                side_on_pins.push(conjunct.clone());
                 left = predicate_push_down(left, &conjunct, is, current_db);
             }
             for conjunct in right_side {
                 let conjunct = rewrite_col_tables(&conjunct, &tables);
+                side_on_pins.push(conjunct.clone());
                 right = predicate_push_down(right, &conjunct, is, current_db);
             }
             first_on = remaining;
@@ -2296,6 +2302,7 @@ impl PlanBuilder {
                 &first_on,
                 &left_derived,
                 &right_derived,
+                &side_on_pins,
                 &first.left,
                 &first.right,
             ) {
@@ -32751,6 +32758,7 @@ fn fold_pinned_join_on(
     on: &ExprNode,
     left_derived: &[ExprNode],
     right_derived: &[ExprNode],
+    side_on_pins: &[ExprNode],
     left: &TableName,
     right: &TableName,
 ) -> Option<(ExprNode, bool)> {
@@ -32783,24 +32791,41 @@ fn fold_pinned_join_on(
         } else {
             right_derived
         };
-        derived.iter().chain(base.iter()).find_map(|expr| {
-            let ExprNode::Binary(eq) = expr else {
-                return None;
-            };
-            if eq.op != Op::Eq {
-                return None;
-            }
-            let (ExprNode::Column(c), value) = (eq.left.as_ref(), eq.right.as_ref()) else {
-                return None;
-            };
-            if !c.name.eq_ignore_ascii_case(&col.name) {
-                return None;
-            }
-            if !c.table.as_deref().is_some_and(|q| in_table(q, table)) {
-                return None;
-            }
-            value.const_datum()
-        })
+        derived
+            .iter()
+            .chain(base.iter())
+            .chain(side_on_pins.iter())
+            .find_map(|expr| {
+                // `col = const` or its single-value form `col IN (const)`;
+                // TiDB normalizes the one-element list to an equality before
+                // constant propagation.
+                let (column, value) = match expr {
+                    ExprNode::Binary(eq) if eq.op == Op::Eq => {
+                        match (eq.left.as_ref(), eq.right.as_ref()) {
+                            (ExprNode::Column(c), value) => (c, value.const_datum()?),
+                            _ => return None,
+                        }
+                    }
+                    ExprNode::InList(list) if !list.not && list.list.len() == 1 => {
+                        let ExprNode::Column(c) = list.expr.as_ref() else {
+                            return None;
+                        };
+                        (c, list.list[0].const_datum()?)
+                    }
+                    _ => return None,
+                };
+                if !column.name.eq_ignore_ascii_case(&col.name) {
+                    return None;
+                }
+                if !column
+                    .table
+                    .as_deref()
+                    .is_some_and(|q| in_table(q, table))
+                {
+                    return None;
+                }
+                Some(value)
+            })
     };
     let mut remaining: Vec<ExprNode> = Vec::new();
     let mut folded = false;

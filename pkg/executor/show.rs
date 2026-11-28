@@ -526,10 +526,11 @@ impl Executor for ShowExec {
                     "Default".to_string(),
                     "Compiled".to_string(),
                     "Sortlen".to_string(),
+                    "Pad_attribute".to_string(),
                 ];
                 self.rows = rows
                     .into_iter()
-                    .map(|row| row.into_iter().take(6).collect())
+                    .map(|row| row.into_iter().collect())
                     .collect();
             }
             ShowStmtKind::DdlJobs => {

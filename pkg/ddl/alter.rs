@@ -1869,16 +1869,32 @@ fn change_column(
         }
         crate::create_table::validate_auto_random_bits(Some(shard), auto_random_range, &new_ft)?;
     }
-    // TiDB `ErrUnsupportedModifyCharset` (8200): a column's charset is fixed
-    // once created, so `MODIFY … CHARACTER SET x` on a different charset fails.
+    // TiDB `checkModifyCharsetAndCollation` (8200): only utf8/latin1 moving to
+    // utf8mb4 (or the same charset) is supported; every other charset change
+    // is refused.
     let old_charset = info.columns[pos].field_type.charset.clone();
     if let Some(charset) = charset
         && !charset.eq_ignore_ascii_case(&old_charset)
     {
-        return Err(Error::new(
-            ERR_UNSUPPORTED_MODIFY_CHARSET,
-            format!("Unsupported modify charset from {old_charset} to {charset}"),
-        ));
+        let normalized = |name: &str| {
+            if name.eq_ignore_ascii_case("utf8mb3") {
+                "utf8".to_string()
+            } else {
+                name.to_ascii_lowercase()
+            }
+        };
+        let from = normalized(&old_charset);
+        let to = normalized(charset);
+        let supported = (from == "utf8" && to == "utf8mb4")
+            || (from == "utf8" && to == "utf8")
+            || (from == "utf8mb4" && to == "utf8mb4")
+            || (from == "latin1" && to == "utf8mb4");
+        if !supported {
+            return Err(Error::new(
+                ERR_UNSUPPORTED_MODIFY_CHARSET,
+                format!("Unsupported modify charset from {old_charset} to {charset}"),
+            ));
+        }
     }
     if let Some(charset) = charset {
         new_ft.charset = charset.to_string();

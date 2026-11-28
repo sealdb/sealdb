@@ -232,8 +232,12 @@ fn fold_constants_opts(
     }
     // A JSON cast is part of the predicate TiDB prints (`cast(1, json BINARY)`);
     // folding it to a JSON literal would lose the comparison type information.
+    // A `cast(… AS BINARY)` constant is the same: the binary charset is what
+    // makes `col = cast('a' AS BINARY)` case-sensitive, so the node has to
+    // survive until evaluation (and EXPLAIN prints the plain literal).
     if let ExprNode::Cast(cast) = &rebuilt
-        && cast.target.to_ascii_lowercase().contains("json")
+        && (cast.target.to_ascii_lowercase().contains("json")
+            || sealdb_parser::ast::expressions::is_binary_cast_target(&cast.target))
     {
         return changed.then_some(rebuilt);
     }
