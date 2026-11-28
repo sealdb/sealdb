@@ -5625,3 +5625,9 @@ SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t exe
 ### 状态
 - manifest：`executor/statement_context` → `green`，green 154 / pending 82（counts 同步）
 - 下一刀：`expression/builtin`（`UNHEX` 已补，可接着补 `AES_DECRYPT` / `UNCOMPRESS` / `INET6_NTOA` 等二进制函数链）与 `executor/show` / `executor/simple` 等 R7 长尾。
+
+### 提交
+- `b78ac98` `feat(executor,ddl,session): green 15 more integration suites`：
+  补齐 `4723fa2` 之后 15 套转绿的全部代码与文档（此前逐轮漏提交）。
+- 流程回正：**每套 suite 转绿即单独提交**（代码 + manifest + status-report +
+  progress 同提交），不再积压；提交信息走 `project/scripts/check_commit_msg.sh`。
