@@ -12722,6 +12722,14 @@ fn validate_expr_column_refs(expr: &ExprNode, visible: &[String], clause: &str) 
             if visible.iter().any(|v| v.eq_ignore_ascii_case(table)) {
                 return Ok(());
             }
+            // TiDB's `t.*` resolution reports the missing table (1051) rather
+            // than an unknown column (1054) when an alias hides `t`.
+            if col.name == "*" {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_BAD_TABLE,
+                    format!("Unknown table '{table}'"),
+                ));
+            }
             Err(sealdb_errno::Error::new(
                 sealdb_errno::ERR_BAD_FIELD,
                 format!("Unknown column '{table}.{}' in '{clause}'", col.name),

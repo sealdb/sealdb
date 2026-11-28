@@ -5652,3 +5652,21 @@ SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t sta
 ### 状态
 - manifest：`statistics/handle` → `green`，green 155 / pending 81（counts 同步）
 - 下一刀：`executor/split_table` / `globalindex/mem_index_reader`（计划算子 ID 与 `Selection(in(_tidb_tid,…))` 口径）以及 `planner/core/cbo`（cost model v1/v2 的 `cost_trace` 渲染）等 R7/R3 长尾。
+
+## 2026-11-28 12:20 — `collation_pointget` 转绿（R4 5/13）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 变体金样 | `tests/integrationtest` 的 `ManifestSuite` 新增可选 `result`（相对 `tests/integrationtest` 的路径），`collect_tests` 用它覆盖由 `.test` 推导出的金样路径；用于只提供 `<name>_enabled.result` / `<name>_disabled.result` 的 TiDB suite（SealDB 固定以新排序规则启动，`_disabled` 变体不适用）。 |
+| 通配限定符口径 | `validate_expr_column_refs`：别名隐藏真实表名时，`t.*` 按 TiDB 报 1051 `Unknown table 't'`（此前误报 1054 `Unknown column 't.*' in 'field list'`）；`t.a` 等非通配限定列仍报 1054。 |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t collation_pointget           → PASS: memory=1
+./tests/integrationtest/run-tests.sh -s tikv -k -t collation_pointget         → PASS: memory=0 tikv=1
+```
+
+### 状态
+- manifest：`collation_pointget` → `green`（`result` 指向 `_enabled` 金样），green 156 / pending 80
+- 后续：把 `collation_agg_func` / `collation_check_use_collation` / `collation_misc` 同样指向 `_enabled` 金样后逐个转绿。

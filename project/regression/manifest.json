@@ -14,11 +14,11 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "deferred": 2,
-      "green": 155,
+      "green": 156,
+      "pending": 80,
       "in_progress": 8,
-      "local": 8,
-      "pending": 81
+      "deferred": 2,
+      "local": 8
     },
     "by_wave": {
       "D": 2,
@@ -136,12 +136,13 @@
     {
       "name": "collation_pointget",
       "wave": "R4",
-      "status": "pending",
+      "status": "green",
       "test": "t/collation_pointget.test",
-      "result": "r/collation_pointget.result",
-      "has_result": false,
+      "result": "r/collation_pointget_enabled.result",
+      "has_result": true,
       "skip_tikv": false,
-      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+      "owner_hint": "planner/core/plan_cache*,session,util/collate",
+      "note": "SealDB boots with new collations enabled only; target the _enabled golden."
     },
     {
       "name": "common_collation",

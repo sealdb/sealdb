@@ -242,6 +242,10 @@ pub struct ManifestSuite {
     /// under a session whose variables leaked from an earlier corpus file.
     #[serde(default)]
     pub session_init: Vec<String>,
+    /// Explicit golden path (relative to `tests/integrationtest`), for suites
+    /// whose TiDB goldens are config variants such as `<name>_enabled.result`.
+    #[serde(default)]
+    pub result: Option<String>,
 }
 pub fn testdata_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -694,6 +698,10 @@ fn collect_tests(
         }
         let rel = path.strip_prefix(t_root).unwrap().with_extension("result");
         let name = rel.with_extension("").to_string_lossy().replace('\\', "/");
+        let golden_name = manifest
+            .get(&name)
+            .and_then(|m| m.result.clone())
+            .unwrap_or_else(|| rel.to_string_lossy().replace('\\', "/"));
         let (status, wave, owner_hint, skip_tikv, session_init) =
             if let Some(m) = manifest.get(&name) {
                 (
@@ -729,7 +737,7 @@ fn collect_tests(
         out.push(Suite {
             name,
             test_path: path,
-            result_path: root.join("r").join(rel),
+            result_path: root.join(golden_name),
             steps,
             status,
             wave,
