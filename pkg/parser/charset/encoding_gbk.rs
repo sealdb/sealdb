@@ -24,6 +24,7 @@ pub static UNICODE_GBK_SUBSET: &[(char, &[u8])] = &[
     ('三', &[0xc8, 0xfd]),
     ('李', &[0xc0, 0xee]),
     ('四', &[0xcb, 0xc4]),
+    ('红', &[0xba, 0xec]),
 ];
 
 fn unicode_to_gbk() -> &'static HashMap<char, &'static [u8]> {

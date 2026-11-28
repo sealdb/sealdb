@@ -22,6 +22,20 @@ impl StreamAggExec {
         self.inner = self.inner.with_subquery(subquery);
         self
     }
+
+    pub(crate) fn with_group_collations(
+        mut self,
+        modes: Vec<sealdb_util::collate::CollateMode>,
+    ) -> Self {
+        self.inner = self.inner.with_group_collations(modes);
+        self
+    }
+
+    /// ORDER BY-only columns, exposed as extra first-row outputs.
+    pub(crate) fn with_order_columns(mut self, columns: &[String]) -> Self {
+        self.inner = self.inner.with_order_columns(columns);
+        self
+    }
 }
 
 impl Executor for StreamAggExec {

@@ -166,6 +166,10 @@ pub struct ColumnDef {
     /// TiDB `AUTO_RANDOM[(shard_bits[, range_bits])]`: the number of high bits
     /// XOR-shuffled with a random value (`None` = not an auto-random column).
     pub auto_random: Option<u32>,
+    /// `AUTO_RANDOM(shard_bits, range_bits)`: the number of bits reserved for
+    /// the whole id (sign + sign bit + shard + incremental). `None` means the
+    /// clause did not spell it (TiDB default 64).
+    pub auto_random_range: Option<u32>,
     /// Explicit `NOT NULL` (or PRIMARY KEY implied) column option.
     pub not_null: bool,
     /// Explicit `NULL` column option (TiDB `hasNullFlag`); a primary key
@@ -230,6 +234,10 @@ impl ColumnDef {
             // clients ignore it.
             ctx.write_str(" /*T![auto_rand] AUTO_RANDOM(");
             ctx.write_str(&bits.to_string());
+            if let Some(range) = self.auto_random_range {
+                ctx.write_str(", ");
+                ctx.write_str(&range.to_string());
+            }
             ctx.write_str(") */");
         }
         if let Some(comment) = &self.comment {
@@ -948,6 +956,8 @@ pub struct CreateIndexStmt {
     pub name: String,
     pub columns: Vec<IndexPart>,
     pub unique: bool,
+    /// TiDB `GLOBAL`: partition-independent index on a partitioned table.
+    pub global: bool,
     /// TiDB `INVISIBLE`: the optimizer ignores the new index.
     pub invisible: bool,
 }
@@ -986,6 +996,9 @@ impl CreateIndexStmt {
             }
         }
         ctx.write_str(")");
+        if self.global {
+            ctx.write_str(" /*T![global_index] GLOBAL */");
+        }
         Ok(())
     }
 }
@@ -1035,6 +1048,10 @@ pub enum AlterTableSpec {
         default: Option<String>,
         /// `GENERATED ALWAYS AS (expr)` given with the new definition.
         generated: Option<GeneratedColumn>,
+        /// `AUTO_RANDOM[(shard_bits[, range_bits])]` in the new definition.
+        auto_random: Option<u32>,
+        /// `AUTO_RANDOM(shard, range)` range bits in the new definition.
+        auto_random_range: Option<u32>,
         /// `NOT NULL` (Some(true)) / `NULL` (Some(false)) in the definition.
         not_null: Option<bool>,
         /// `CHARACTER SET <name>` in the new definition.
@@ -1053,6 +1070,10 @@ pub enum AlterTableSpec {
         default: Option<String>,
         /// `GENERATED ALWAYS AS (expr)` given with the new definition.
         generated: Option<GeneratedColumn>,
+        /// `AUTO_RANDOM[(shard_bits[, range_bits])]` in the new definition.
+        auto_random: Option<u32>,
+        /// `AUTO_RANDOM(shard, range)` range bits in the new definition.
+        auto_random_range: Option<u32>,
         /// `NOT NULL` (Some(true)) / `NULL` (Some(false)) in the definition.
         not_null: Option<bool>,
         /// `CHARACTER SET <name>` in the new definition.
@@ -1151,6 +1172,12 @@ pub enum AlterTableSpec {
     },
     /// Unsupported partition maintenance (`CHECK`/`OPTIMIZE`/…) → DDL 8200.
     UnsupportedPartitionOp(String),
+    /// `[WITH|WITHOUT] VALIDATION`: TiDB parses the clause, then warns 8200
+    /// that the validation mode is unsupported.
+    Validation {
+        /// `true` for `WITH VALIDATION`, `false` for `WITHOUT VALIDATION`.
+        with: bool,
+    },
     /// `FIRST PARTITION LESS THAN (bound)` (INTERVAL tables).
     FirstPartition {
         bound: String,
@@ -1169,6 +1196,12 @@ pub enum AlterTableSpec {
     },
     /// `ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES t (cols)`.
     AddForeignKey(ForeignKeyDef),
+    /// `DROP FOREIGN KEY <name>`: remove the constraint (the implicit index
+    /// created for it stays unless dropped explicitly).
+    DropForeignKey {
+        /// Constraint name.
+        name: String,
+    },
     /// `ALTER TABLE t [PARTITION p] ATTRIBUTES [=] '<key=value, ...>'`; `DEFAULT`
     /// resets the attributes of the table or of the named partition.
     Attributes {
@@ -1220,6 +1253,8 @@ impl AlterTableSpec {
                 type_name,
                 default,
                 generated,
+                auto_random,
+                auto_random_range,
                 not_null,
                 charset,
                 collate,
@@ -1264,6 +1299,15 @@ impl AlterTableSpec {
                     ctx.write_str(&comment.replace('\'', "''"));
                     ctx.write_str("'");
                 }
+                if let Some(bits) = auto_random {
+                    ctx.write_str(" AUTO_RANDOM(");
+                    ctx.write_str(&bits.to_string());
+                    if let Some(range) = auto_random_range {
+                        ctx.write_str(", ");
+                        ctx.write_str(&range.to_string());
+                    }
+                    ctx.write_str(")");
+                }
                 position.restore(ctx)
             }
             AlterTableSpec::ModifyColumn {
@@ -1271,6 +1315,8 @@ impl AlterTableSpec {
                 type_name,
                 default,
                 generated,
+                auto_random,
+                auto_random_range,
                 not_null,
                 charset,
                 collate,
@@ -1312,6 +1358,15 @@ impl AlterTableSpec {
                     ctx.write_str(" COMMENT '");
                     ctx.write_str(&comment.replace('\'', "''"));
                     ctx.write_str("'");
+                }
+                if let Some(bits) = auto_random {
+                    ctx.write_str(" AUTO_RANDOM(");
+                    ctx.write_str(&bits.to_string());
+                    if let Some(range) = auto_random_range {
+                        ctx.write_str(", ");
+                        ctx.write_str(&range.to_string());
+                    }
+                    ctx.write_str(")");
                 }
                 position.restore(ctx)
             }
@@ -1540,6 +1595,14 @@ impl AlterTableSpec {
                 ctx.write_str(" */");
                 Ok(())
             }
+            AlterTableSpec::Validation { with } => {
+                ctx.write_str(if *with {
+                    "WITH VALIDATION"
+                } else {
+                    "WITHOUT VALIDATION"
+                });
+                Ok(())
+            }
             AlterTableSpec::FirstPartition { bound } => {
                 ctx.write_str("FIRST PARTITION LESS THAN (");
                 ctx.write_str(bound);
@@ -1590,6 +1653,11 @@ impl AlterTableSpec {
                 }
                 Ok(())
             }
+            AlterTableSpec::DropForeignKey { name } => {
+                ctx.write_str("DROP FOREIGN KEY ");
+                ctx.write_name(name);
+                Ok(())
+            }
             AlterTableSpec::Attributes {
                 partition,
                 attributes,
@@ -1631,6 +1699,9 @@ impl AlterTableSpec {
 pub struct AlterTableStmt {
     pub table: TableName,
     pub specs: Vec<AlterTableSpec>,
+    /// True when the statement was written as `RENAME TABLE` (which lowers to
+    /// a single `RENAME TO` spec). DDL error text distinguishes the two.
+    pub from_rename_table: bool,
 }
 
 impl AlterTableStmt {

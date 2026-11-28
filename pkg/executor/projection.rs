@@ -14,6 +14,9 @@ pub struct ProjectionExec {
     /// Window plans emit the SELECT-list columns already; re-emit them as-is
     /// instead of re-evaluating window expressions outside `WindowExec`.
     passthrough: bool,
+    /// Keep only the leading columns (drops an aggregate's ORDER BY-only
+    /// trailing outputs, TiDB trims them in a Projection above the Sort).
+    trim: bool,
 }
 
 impl ProjectionExec {
@@ -25,6 +28,7 @@ impl ProjectionExec {
             subquery: None,
             opened: false,
             passthrough: false,
+            trim: false,
         }
     }
 
@@ -38,6 +42,21 @@ impl ProjectionExec {
             subquery: None,
             opened: false,
             passthrough: true,
+            trim: false,
+        }
+    }
+
+    /// Keep only the first `names.len()` child columns: the Sort/TopN above an
+    /// aggregate consumes ORDER BY-only trailing outputs, then trims them.
+    pub(crate) fn trim_trailing(names: Vec<String>, child: Box<dyn Executor>) -> Self {
+        Self {
+            exprs: Vec::new(),
+            names,
+            child,
+            subquery: None,
+            opened: false,
+            passthrough: false,
+            trim: true,
         }
     }
 
@@ -57,6 +76,18 @@ impl Executor for ProjectionExec {
     fn next(&mut self) -> Result<Option<Chunk>> {
         if self.passthrough {
             return self.child.next();
+        }
+        if self.trim {
+            let Some(input) = self.child.next()? else {
+                return Ok(None);
+            };
+            let width = self.names.len();
+            let mut chunk = Chunk::new(width, input.num_rows());
+            for i in 0..input.num_rows() {
+                let row = input.get_row(i);
+                chunk.append_row(row[..width.min(row.len())].to_vec());
+            }
+            return Ok(Some(chunk));
         }
         let Some(input) = self.child.next()? else {
             return Ok(None);

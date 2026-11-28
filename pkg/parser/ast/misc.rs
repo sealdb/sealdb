@@ -262,6 +262,11 @@ pub struct GrantStmt {
     pub with_grant: bool,
     /// TiDB dynamic privileges (`BACKUP_ADMIN`, `ROLE_ADMIN`, …) on `*.*`.
     pub dynamic_privs: Vec<String>,
+    /// `GRANT … IDENTIFIED BY 'pwd'`: when the account does not exist and
+    /// `NO_AUTO_CREATE_USER` is off, MySQL creates it with this password.
+    pub auth: Option<String>,
+    /// `GRANT … REQUIRE {SSL|X509|ISSUER|SUBJECT|CIPHER|NONE}`.
+    pub require: Option<RequireClause>,
 }
 
 impl GrantStmt {
@@ -322,6 +327,106 @@ impl RevokeStmt {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequireClause {
+    /// `REQUIRE NONE`: clears every SSL requirement.
+    pub none: bool,
+    /// `REQUIRE SSL` (`mysql.user.ssl_type = 'ANY'`).
+    pub ssl: bool,
+    /// `REQUIRE X509` (`mysql.user.ssl_type = 'X509'`).
+    pub x509: bool,
+    pub issuer: Option<String>,
+    pub subject: Option<String>,
+    pub cipher: Option<String>,
+}
+
+impl RequireClause {
+    pub fn is_empty(&self) -> bool {
+        !self.none
+            && !self.ssl
+            && !self.x509
+            && self.issuer.is_none()
+            && self.subject.is_none()
+            && self.cipher.is_none()
+    }
+
+    /// `mysql.user.ssl_type` / `mysql.global_priv` numeric `ssl_type`.
+    pub fn ssl_type(&self) -> i64 {
+        if self.ssl {
+            1
+        } else if self.x509 {
+            2
+        } else if self.issuer.is_some() || self.subject.is_some() || self.cipher.is_some() {
+            3
+        } else {
+            0
+        }
+    }
+
+    /// TiDB `mysql.global_priv.Priv` JSON fragment for the SSL fields.
+    pub fn priv_json(&self) -> String {
+        let mut parts = Vec::new();
+        let ssl_type = self.ssl_type();
+        if ssl_type != 0 {
+            parts.push(format!("\"ssl_type\":{ssl_type}"));
+        }
+        if let Some(cipher) = &self.cipher {
+            parts.push(format!("\"ssl_cipher\":{}", json_quote(cipher)));
+        }
+        if let Some(issuer) = &self.issuer {
+            parts.push(format!("\"x509_issuer\":{}", json_quote(issuer)));
+        }
+        if let Some(subject) = &self.subject {
+            parts.push(format!("\"x509_subject\":{}", json_quote(subject)));
+        }
+        format!("{{{}}}", parts.join(","))
+    }
+
+    /// `SHOW CREATE USER …` suffix: `REQUIRE CIPHER '…' ISSUER '…' SUBJECT '…'`.
+    pub fn restore(&self) -> String {
+        if self.ssl {
+            return "REQUIRE SSL".to_string();
+        }
+        if self.x509 {
+            return "REQUIRE X509".to_string();
+        }
+        let mut out = String::from("REQUIRE");
+        if let Some(cipher) = &self.cipher {
+            out.push_str(&format!(" CIPHER '{}'", escape_single_quote(cipher)));
+        }
+        if let Some(issuer) = &self.issuer {
+            out.push_str(&format!(" ISSUER '{}'", escape_single_quote(issuer)));
+        }
+        if let Some(subject) = &self.subject {
+            out.push_str(&format!(" SUBJECT '{}'", escape_single_quote(subject)));
+        }
+        if out == "REQUIRE" {
+            out.push_str(" NONE");
+        }
+        out
+    }
+}
+
+fn escape_single_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn json_quote(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// `CREATE USER 'u'@'%' [IDENTIFIED BY 'pwd']` (TiDB `CreateUserStmt`).
 #[derive(Clone, Debug)]
 pub struct CreateUserStmt {
@@ -362,22 +467,59 @@ impl DropUserStmt {
     }
 }
 
+/// `PASSWORD EXPIRE …` option of `CREATE USER` / `ALTER USER`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PasswordExpireOption {
+    /// Bare `PASSWORD EXPIRE`: mark the password expired, keep the lifetime.
+    Expire,
+    /// `PASSWORD EXPIRE DEFAULT`: lifetime returns to the global default (NULL).
+    Default,
+    /// `PASSWORD EXPIRE NEVER`: lifetime 0.
+    Never,
+    /// `PASSWORD EXPIRE INTERVAL n DAY`: lifetime `n` days.
+    Interval(u64),
+}
+
 #[derive(Clone, Debug)]
 pub struct UserSpec {
     pub user: UserIdentity,
+    /// `IDENTIFIED BY 'pwd'` password (plain text, encoded at execution).
     pub auth: Option<String>,
+    /// `IDENTIFIED WITH 'plugin'`.
+    pub auth_plugin: Option<String>,
+    /// `IDENTIFIED WITH 'plugin' AS 'hash'` (the string is already encoded).
+    pub auth_is_hash: bool,
     /// `RESOURCE GROUP name` user attribute.
     pub resource_group: Option<String>,
     /// `COMMENT '…'` user attribute.
     pub comment: Option<String>,
+    /// `REQUIRE …` SSL/TLS requirement.
+    pub require: Option<RequireClause>,
+    /// `PASSWORD EXPIRE …` (the last occurrence wins).
+    pub password_expire: Option<PasswordExpireOption>,
+    /// `PASSWORD HISTORY {DEFAULT | n}`; `None` when the clause is absent.
+    pub password_history: Option<Option<u64>>,
+    /// `PASSWORD REUSE INTERVAL {DEFAULT | n DAY}`; `None` when absent.
+    pub password_reuse: Option<Option<u64>>,
 }
 
 impl UserSpec {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         self.user.restore(ctx)?;
-        if let Some(auth) = &self.auth {
+        if let Some(plugin) = &self.auth_plugin {
+            ctx.write_str(" IDENTIFIED WITH ");
+            ctx.write_str(&format!("'{plugin}'"));
+            if let Some(auth) = &self.auth {
+                ctx.write_str(if self.auth_is_hash { " AS " } else { " BY " });
+                ctx.write_str(&format!("'{auth}'"));
+            }
+        } else if let Some(auth) = &self.auth {
             ctx.write_str(" IDENTIFIED BY ");
             ctx.write_str(&format!("'{auth}'"));
+        }
+        if let Some(require) = &self.require {
+            ctx.write_str(" ");
+            ctx.write_str(&require.restore());
         }
         if let Some(group) = &self.resource_group {
             ctx.write_str(" RESOURCE GROUP ");
@@ -387,6 +529,27 @@ impl UserSpec {
             ctx.write_str(" COMMENT ");
             ctx.write_str(&format!("'{comment}'"));
         }
+        match &self.password_expire {
+            Some(PasswordExpireOption::Expire) => ctx.write_str(" PASSWORD EXPIRE"),
+            Some(PasswordExpireOption::Default) => ctx.write_str(" PASSWORD EXPIRE DEFAULT"),
+            Some(PasswordExpireOption::Never) => ctx.write_str(" PASSWORD EXPIRE NEVER"),
+            Some(PasswordExpireOption::Interval(days)) => {
+                ctx.write_str(&format!(" PASSWORD EXPIRE INTERVAL {days} DAY"))
+            }
+            None => {}
+        }
+        if let Some(history) = self.password_history {
+            match history {
+                Some(days) => ctx.write_str(&format!(" PASSWORD HISTORY {days}")),
+                None => ctx.write_str(" PASSWORD HISTORY DEFAULT"),
+            }
+        }
+        if let Some(reuse) = self.password_reuse {
+            match reuse {
+                Some(days) => ctx.write_str(&format!(" PASSWORD REUSE INTERVAL {days} DAY")),
+                None => ctx.write_str(" PASSWORD REUSE INTERVAL DEFAULT"),
+            }
+        }
         Ok(())
     }
 
@@ -394,8 +557,14 @@ impl UserSpec {
         Self {
             user,
             auth,
+            auth_plugin: None,
+            auth_is_hash: false,
             resource_group: None,
             comment: None,
+            require: None,
+            password_expire: None,
+            password_history: None,
+            password_reuse: None,
         }
     }
 }
@@ -403,12 +572,16 @@ impl UserSpec {
 /// `ALTER USER 'u'@'%' IDENTIFIED BY 'pwd' | COMMENT '…' | RESOURCE GROUP g`.
 #[derive(Clone, Debug)]
 pub struct AlterUserStmt {
+    pub if_exists: bool,
     pub users: Vec<UserSpec>,
 }
 
 impl AlterUserStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("ALTER USER ");
+        if self.if_exists {
+            ctx.write_str("IF EXISTS ");
+        }
         for (i, spec) in self.users.iter().enumerate() {
             if i > 0 {
                 ctx.write_str(", ");
@@ -661,6 +834,8 @@ pub enum ShowStmtKind {
     /// tables never shadow the sequence namespace.
     CreateSequence,
     CreateDatabase,
+    /// `SHOW CREATE USER 'u'@'%'`: the account's `CREATE USER` DDL.
+    CreateUser,
     Index,
     Charset,
     Collation,
@@ -781,6 +956,12 @@ impl ShowStmt {
                 ctx.write_str("SHOW CREATE DATABASE ");
                 if let Some(db) = &self.db_name {
                     ctx.write_name(db);
+                }
+            }
+            ShowStmtKind::CreateUser => {
+                ctx.write_str("SHOW CREATE USER ");
+                if let Some(user) = &self.user {
+                    user.restore(ctx)?;
                 }
             }
             ShowStmtKind::Index => {

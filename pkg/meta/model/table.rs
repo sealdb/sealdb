@@ -4,6 +4,7 @@ use super::job::{STATE_PUBLIC, SchemaState};
 use super::partition::PartitionInfo;
 use sealdb_parser::model::CIStr;
 use sealdb_types::{EvalType, FieldType};
+use sealdb_util::collate::CollateMode;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 
@@ -311,8 +312,13 @@ pub struct ForeignKeyInfo {
     pub name: String,
     /// Local columns, in declaration order.
     pub cols: Vec<String>,
-    /// Referenced table (unqualified; TiDB rejects cross-schema references).
+    /// Referenced table, unqualified.
     pub ref_table: String,
+    /// Referenced database when the DDL spelled out `REFERENCES db.t`
+    /// (TiDB allows cross-schema foreign keys); `None` means the child
+    /// table's own schema.
+    #[serde(default)]
+    pub ref_schema: Option<String>,
     /// Referenced columns; empty means the referenced table's PRIMARY KEY.
     pub ref_cols: Vec<String>,
     #[serde(default)]
@@ -417,6 +423,54 @@ impl TableInfo {
             .iter()
             .map(|c| (c.id, c.field_type.clone()))
             .collect()
+    }
+
+    /// Collation sort-key mode of each index column, positionally. `None`
+    /// means "keep raw bytes" (non-string or `binary` charset). TiDB encodes
+    /// `collator.Key` into index keys so equal-under-collation values (`'a'`
+    /// and `'A'` under `utf8mb4_general_ci`) share one entry.
+    pub fn index_collations(&self, index: &IndexInfo) -> Vec<Option<CollateMode>> {
+        index
+            .columns
+            .iter()
+            .map(|col| {
+                let table_col = self.columns.get(col.offset as usize)?;
+                let ft = &table_col.field_type;
+                // Only the string family is encoded through the collator:
+                // `ENUM`/`SET` index values are stored as their numeric code and
+                // keep the raw bytes (TiDB `types.IsString`: char/blob/varchar).
+                if !matches!(
+                    ft.tp,
+                    sealdb_types::field_type::TYPE_STRING
+                        | sealdb_types::field_type::TYPE_VAR_STRING
+                        | sealdb_types::field_type::TYPE_VARCHAR
+                        | sealdb_types::field_type::TYPE_BLOB
+                        | sealdb_types::field_type::TYPE_TINY_BLOB
+                        | sealdb_types::field_type::TYPE_MEDIUM_BLOB
+                        | sealdb_types::field_type::TYPE_LONG_BLOB
+                ) {
+                    return None;
+                }
+                if ft.charset == "binary" || ft.collate == "binary" || ft.collate.is_empty() {
+                    return None;
+                }
+                let mode = CollateMode::from_name(&ft.collate);
+                (mode != CollateMode::Bin).then_some(mode)
+            })
+            .collect()
+    }
+
+    /// Whether any index column stores a key that cannot be turned back into the
+    /// column text (TiDB keeps a "restored data" copy in the index value and
+    /// still reads the index alone; SealDB does not store that copy yet, so the
+    /// covering read falls back to a table fetch).
+    ///
+    /// Only a mode that rewrites the bytes counts: `bin` keeps them verbatim,
+    /// while the legacy `*_bin` (PAD SPACE) collations drop trailing spaces,
+    /// `*_ci` / the UCA weight path replace the value with a sort key, and
+    /// `gbk_bin` re-encodes UTF-8 as GBK.
+    pub fn index_has_collation_key(&self, index: &IndexInfo) -> bool {
+        self.index_collations(index).iter().any(Option::is_some)
     }
 
     /// Integer clustered PRIMARY KEY column (`pk_is_handle`). Prefer the

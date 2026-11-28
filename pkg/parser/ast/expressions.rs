@@ -984,6 +984,67 @@ impl FuncCallExpr {
         {
             return arg.restore(ctx);
         }
+        // Hidden collation-derived comparison markers restore as the original
+        // `left <op> right` / `expr BETWEEN …` / `expr LIKE …` text.
+        if self.name.eq_ignore_ascii_case("__STR_CMP") && self.args.len() == 4 {
+            self.args[2].restore(ctx)?;
+            let op = match &self.args[1] {
+                ExprNode::Value(v) => match &v.datum {
+                    sealdb_types::Datum::Bytes(bytes) => {
+                        String::from_utf8_lossy(bytes).into_owned()
+                    }
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            ctx.write_str(&format!(" {op} "));
+            return self.args[3].restore(ctx);
+        }
+        if self.name.eq_ignore_ascii_case("__STR_BETWEEN") && self.args.len() == 4 {
+            self.args[1].restore(ctx)?;
+            ctx.write_str(" between ");
+            self.args[2].restore(ctx)?;
+            ctx.write_str(" and ");
+            return self.args[3].restore(ctx);
+        }
+        if self.name.eq_ignore_ascii_case("__STR_LIKE") && self.args.len() == 4 {
+            self.args[1].restore(ctx)?;
+            let not = matches!(
+                &self.args[3],
+                ExprNode::Value(v) if matches!(v.datum, sealdb_types::Datum::I64(1) | sealdb_types::Datum::U64(1))
+            );
+            ctx.write_str(if not { " not like " } else { " like " });
+            return self.args[2].restore(ctx);
+        }
+        if self.name.eq_ignore_ascii_case("__COLL_KEY") && !self.args.is_empty() {
+            return self.args[0].restore(ctx);
+        }
+        if (self.name.eq_ignore_ascii_case("__FIELD_COLL")
+            || self.name.eq_ignore_ascii_case("__FIND_IN_SET_COLL")
+            || self.name.eq_ignore_ascii_case("__INSTR_COLL")
+            || self.name.eq_ignore_ascii_case("__LOCATE_COLL"))
+            && !self.args.is_empty()
+        {
+            let shown = if self.name.eq_ignore_ascii_case("__FIELD_COLL") {
+                "field"
+            } else if self.name.eq_ignore_ascii_case("__FIND_IN_SET_COLL") {
+                "find_in_set"
+            } else if self.name.eq_ignore_ascii_case("__INSTR_COLL") {
+                "instr"
+            } else {
+                "locate"
+            };
+            ctx.write_str(shown);
+            ctx.write_str("(");
+            for (i, arg) in self.args.iter().skip(1).enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                arg.restore(ctx)?;
+            }
+            ctx.write_str(")");
+            return Ok(());
+        }
         // `IS [NOT] TRUE|FALSE|UNKNOWN` round-trips as a predicate.
         if let Some(suffix) = is_truth_suffix(&self.name)
             && let Some(arg) = self.args.first()

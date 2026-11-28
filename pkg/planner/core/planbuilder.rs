@@ -165,7 +165,7 @@ impl PlanBuilder {
                 // A comma join whose equality keys are pinned by constants
                 // keeps a CARTESIAN plan (`t1.b = t2.a` + `t1.b = 2333`).
                 let comma_folded_select;
-                let select = match fold_pinned_comma_join_where(select) {
+                let select = match fold_pinned_comma_join_where(select, is, current_db) {
                     Some(folded) => {
                         comma_folded_select = folded;
                         &comma_folded_select
@@ -198,13 +198,14 @@ impl PlanBuilder {
                 // `WHERE 1 = 1` → no filter). Runs after the partition/shard
                 // rewrites so their `or(0, …)` shapes stay intact.
                 let const_folded_select;
-                let select = match super::rule_constant_fold::fold_constant_select(select) {
-                    Some(folded) => {
-                        const_folded_select = folded;
-                        &const_folded_select
-                    }
-                    None => select,
-                };
+                let select =
+                    match super::rule_constant_fold::fold_constant_select(select, is, current_db) {
+                        Some(folded) => {
+                            const_folded_select = folded;
+                            &const_folded_select
+                        }
+                        None => select,
+                    };
                 // TiDB rewrites `ifnull(not_null_col, const)` to a cast and
                 // folds `isnull(not_null_col)` before planning (`ifnull(nb, 0)`
                 // → `cast(nb, bigint BINARY)`).
@@ -222,13 +223,14 @@ impl PlanBuilder {
                 // `or(…, 0)` shapes that need a second FoldConstant pass
                 // (`WHERE a IS NOT NULL` on a NOT NULL column → bare scan).
                 let refolded_select;
-                let select = match super::rule_constant_fold::fold_constant_select(select) {
-                    Some(folded) => {
-                        refolded_select = folded;
-                        &refolded_select
-                    }
-                    None => select,
-                };
+                let select =
+                    match super::rule_constant_fold::fold_constant_select(select, is, current_db) {
+                        Some(folded) => {
+                            refolded_select = folded;
+                            &refolded_select
+                        }
+                        None => select,
+                    };
                 // TiDB folds an unsatisfiable predicate (`a = 2 AND a = 3`)
                 // to `0` (or `NULL` from `col = NULL`) and plans a zero-row
                 // TableDual. A scalar aggregate still has to produce its one
@@ -666,8 +668,16 @@ impl PlanBuilder {
                         // ORDER BY a SELECT-list alias whose value needs Apply:
                         // sort the projected column (`Sort → Projection`).
                         plan = sorted;
-                    } else if need_sort && order_by_has_scalar_func(select) {
+                    } else if need_sort
+                        && order_by_has_scalar_func(select)
+                        && !needs_hash_agg(select)
+                        && !needs_window(select)
+                    {
                         // TiDB InjectProjBelowSort: Projection → Sort → Projection.
+                        // An aggregate's SELECT fields are output columns, not
+                        // expressions: re-projecting `count(1)` would look like a
+                        // scalar function call. SortExec resolves the statement's
+                        // ORDER BY against the aggregate output instead.
                         plan = inject_proj_below_sort(plan, select, is, current_db);
                         if let Some(lim) = select.limit {
                             plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), lim);
@@ -2092,7 +2102,14 @@ impl PlanBuilder {
         // same way (`t1.b = t2.a` + `t1.b = 2333` finds `t2.a = 2333`).
         let (left_derived, right_derived) =
             if matches!(map_join_type(first.tp), JoinType::Inner | JoinType::Cross) {
-                derive_join_key_constants(select, &first.left, &first.right, &first.on)
+                derive_join_key_constants(
+                    select,
+                    &first.left,
+                    &first.right,
+                    &first.on,
+                    is,
+                    current_db,
+                )
             } else {
                 (Vec::new(), Vec::new())
             };
@@ -9661,7 +9678,7 @@ fn wrap_output_projection(
     // key column / truncated value, so the projection restoring the table schema
     // is not an identity and TiDB keeps it
     // (`SELECT id` over `PRIMARY(name(2), id)`).
-    let lookup_keeps_projection = lookup_needs_projection(&plan, is, current_db);
+    let lookup_keeps_projection = lookup_needs_projection(&plan, select, is, current_db);
     // A derived window table emits its window result as an extra column, so the
     // outer SELECT-list projection is not a passthrough and TiDB prints its
     // qualified column names instead of eliding it as `colN`.
@@ -9798,8 +9815,19 @@ fn selection_reads_unprojected_columns(select: &SelectStmt, filter: &ExprNode) -
 /// virtual key column and a prefix part (`name(2)`) yields a truncated value, so
 /// the projection that restores the table schema is not an identity
 /// (`SELECT id` over `PRIMARY(name(2), id)`, `SELECT * … index(d_s(d(3)))`).
-fn lookup_needs_projection(plan: &PhysicalPlan, is: Option<&InfoSchema>, current_db: &str) -> bool {
-    let PhysicalPlan::IndexLookUpReader { table, index, .. } = plan else {
+fn lookup_needs_projection(
+    plan: &PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> bool {
+    let PhysicalPlan::IndexLookUpReader {
+        table,
+        index,
+        pushed,
+        ..
+    } = plan
+    else {
         return false;
     };
     let Some(is) = is else {
@@ -9817,14 +9845,70 @@ fn lookup_needs_projection(plan: &PhysicalPlan, is: Option<&InfoSchema>, current
     else {
         return false;
     };
-    idx.columns.iter().any(|part| {
+    if idx.columns.iter().any(|part| {
         part.length != -1
             || info
                 .columns
                 .iter()
                 .find(|col| col.name.o().eq_ignore_ascii_case(part.name.o()))
                 .is_some_and(|col| col.generated_expr.is_some() && !col.generated_stored)
-    })
+    }) {
+        return true;
+    }
+    // A plain-column double read is elided exactly like any other projection:
+    // `eliminatePhysicalProjection` drops it when its schema is positionally
+    // identical to the child's. An `IndexLookUpReader` inherits its table
+    // plan's schema, i.e. every column the query block reads (SELECT list plus
+    // the WHERE/range columns), in table column order. So
+    // `SELECT col1, col2 … WHERE col1 IN (…)` over `UNIQUE KEY(col1)` is an
+    // identity and TiDB prints the bare `IndexLookUp`, while
+    // `SELECT id … WHERE v < 'b'` over `KEY(v)` needs `v` as well and keeps
+    // `Projection db.t.id → IndexLookUp`.
+    let mut projected: Vec<&str> = Vec::new();
+    for field in &select.fields {
+        if is_star_field(&field.expr) {
+            // `SELECT *` re-lists the whole schema, so the projection is pruned.
+            return false;
+        }
+        let ExprNode::Column(col) = &field.expr else {
+            // A computed item always needs the projection, which `has_non_column`
+            // already handles.
+            return false;
+        };
+        projected.push(col.name.as_str());
+    }
+    let mut needed: Vec<String> = projected.iter().map(|name| name.to_string()).collect();
+    let mut add = |name: &str| {
+        if !needed.iter().any(|col| col.eq_ignore_ascii_case(name)) {
+            needed.push(name.to_string());
+        }
+    };
+    if let Some(selection) = &select.selection {
+        for (qualifier, name) in selection.referenced_columns() {
+            if qualifier
+                .as_deref()
+                .is_none_or(|qual| qual.eq_ignore_ascii_case(physical.as_deref().unwrap_or(table)))
+            {
+                add(&name);
+            }
+        }
+    }
+    if let Some(pushed) = pushed {
+        for (_, name) in pushed.referenced_columns() {
+            add(&name);
+        }
+    }
+    let child: Vec<&str> = info
+        .columns
+        .iter()
+        .map(|col| col.name.o())
+        .filter(|name| needed.iter().any(|col| col.eq_ignore_ascii_case(name)))
+        .collect();
+    child.len() != projected.len()
+        || child
+            .iter()
+            .zip(projected.iter())
+            .any(|(child, projected)| !child.eq_ignore_ascii_case(projected))
 }
 
 /// Cop-task `Projection` for a plain-column SELECT list over a single table
@@ -10165,7 +10249,11 @@ fn propagate_constant_select(select: &SelectStmt) -> Option<SelectStmt> {
 /// pinned value is mirrored onto the other key column, leaving only
 /// single-table filters. Only a plain two-table comma join is rewritten —
 /// outer/nested joins keep the equality as their key.
-fn fold_pinned_comma_join_where(select: &SelectStmt) -> Option<SelectStmt> {
+fn fold_pinned_comma_join_where(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<SelectStmt> {
     use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
 
@@ -10229,6 +10317,12 @@ fn fold_pinned_comma_join_where(select: &SelectStmt) -> Option<SelectStmt> {
             continue;
         };
         if value.is_null() {
+            continue;
+        }
+        // TiDB `tryToReplaceCond` collation guard (see
+        // `derive_join_key_constants`): the mirrored equality must compare
+        // under the target column's collation.
+        if !join_key_collation_matches_target(is, current_db, from_table, from, to_table, to) {
             continue;
         }
         let mirrored = ExprNode::Binary(BinaryOpExpr {
@@ -18908,9 +19002,24 @@ fn group_by_index_plan(
     stats: Option<&Handle>,
     current_db: &str,
 ) -> Option<PhysicalPlan> {
-    let group_cols = group_by_column_names(select)?;
+    let mut group_cols = group_by_column_names(select)?;
     if group_cols.is_empty() {
-        return None;
+        // `SELECT DISTINCT v` dedups on the projected columns, so an index on
+        // their prefix supplies the ordered keys the `STREAM_AGG()` shape needs.
+        if select.distinct && select.group_by.is_empty() && select_hint(&select.text, "stream_agg")
+        {
+            group_cols = select
+                .fields
+                .iter()
+                .filter_map(|field| match &field.expr {
+                    ExprNode::Column(column) => Some(column.name.clone()),
+                    _ => None,
+                })
+                .collect();
+        }
+        if group_cols.is_empty() {
+            return None;
+        }
     }
     for index in &info.indices {
         if index_ignored(from, index.name.o()) || index_is_multi_valued(info, index) {
@@ -19967,54 +20076,58 @@ fn build_agg_plan(
         }
     }
 
-    if select.distinct && select.group_by.is_empty() {
+    if select.distinct
+        && select.group_by.is_empty()
+        && !select.fields.iter().any(|f| is_agg_expr(&f.expr))
+    {
         // TiDB `AggregationEliminator`: `DISTINCT` over columns that contain a
         // unique key is a no-op (`tryToEliminateAggregation`), so the HashAgg
         // disappears and the unique index reader below is the whole plan.
         if distinct_by_unique_key(select, &plan, is, current_db) {
             return (plan, false);
         }
-        // SELECT DISTINCT without GROUP BY — dedup projected columns.
-        let keys = select
-            .fields
-            .iter()
-            .map(|f| {
-                f.as_name
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| f.orig_text.clone())
-                    .unwrap_or_else(|| f.expr.restore_string())
-            })
-            .collect();
-        return (
-            PhysicalPlan::Distinct {
-                keys,
-                // `SELECT DISTINCT *` keeps the full child row.
-                fields: if is_star_select(select) {
-                    Vec::new()
-                } else {
-                    select.fields.iter().map(|f| f.expr.clone()).collect()
-                },
-                names: if is_star_select(select) {
-                    Vec::new()
-                } else {
-                    select
-                        .fields
+        // TiDB plans `SELECT DISTINCT` as a de-duplicating aggregate: a
+        // `HashAgg` grouping the projected columns and re-exposing each one via
+        // `firstrow`, with a matching cop partial aggregate. `STREAM_AGG()`
+        // asks for the ordered `StreamAgg` shape, which needs an index-prefix
+        // read that keeps the group key order.
+        let group_refs: Vec<String> = if is_star_select(select) {
+            is.and_then(|is| is.table_by_name(&agg_db, table))
+                .map(|info| {
+                    info.columns
                         .iter()
-                        .enumerate()
-                        .map(|(i, f)| {
-                            f.as_name
-                                .clone()
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| f.orig_text.clone())
-                                .unwrap_or_else(|| format!("col{i}"))
-                        })
+                        .filter(|column| !column.hidden)
+                        .map(|column| format!("{db_qual}{table}.{}", column.name.o()))
                         .collect()
-                },
-                child: Box::new(plan),
-            },
-            false,
-        );
+                })
+                .unwrap_or_default()
+        } else {
+            select
+                .fields
+                .iter()
+                .map(|field| explain_col_ref(table, &field.expr))
+                .collect()
+        };
+        let group_info = group_refs.join(", ");
+        let firstrows = group_refs
+            .iter()
+            .map(|col| format!("funcs:firstrow({col})->{col}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let info = format!("group by:{group_info}, {firstrows}");
+        // The cop partial aggregate groups the same keys and lists no function
+        // (TiDB prints the dangling separator: `group by:…, `).
+        let cop = format!("group by:{group_info}, ");
+        let est = distinct_est_rows(select);
+        if select_hint(&select.text, "stream_agg")
+            && matches!(
+                plan,
+                PhysicalPlan::IndexReader { .. } | PhysicalPlan::IndexLookUpReader { .. }
+            )
+        {
+            return (PhysicalPlan::stream_agg(plan, info, cop, est), true);
+        }
+        return (PhysicalPlan::hash_agg_cop(plan, info, cop, est), false);
     }
 
     if select.group_by.is_empty() {
@@ -20311,16 +20424,23 @@ fn build_agg_plan(
         return build_group_concat_agg_plan(select, plan, concat, table, current_db, is, est);
     }
 
+    // `count(*)` reads no column: the cop partial aggregates `count(1)`.
     let agg_arg = select
         .fields
         .iter()
         .find_map(|f| match &f.expr {
-            ExprNode::Func(func) if is_agg_expr(&f.expr) => {
-                func.args.first().map(|a| explain_col_ref(table, a))
-            }
+            ExprNode::Func(func) if is_agg_expr(&f.expr) => func.args.first(),
             _ => None,
         })
-        .unwrap_or_else(|| format!("select.{table}.a"));
+        .map(|arg| match arg {
+            ExprNode::Value(value)
+                if matches!(&value.datum, sealdb_types::Datum::Bytes(bytes) if bytes == b"*") =>
+            {
+                "1".to_string()
+            }
+            other => explain_col_ref(table, other),
+        })
+        .unwrap_or_else(|| "1".to_string());
 
     let agg_fn = select
         .fields
@@ -20330,7 +20450,39 @@ fn build_agg_plan(
             _ => None,
         })
         .unwrap_or_else(|| "count".into());
-    let mut root_funcs = vec![format!("funcs:{agg_fn}(Column#{partial_col})->Column#5")];
+    // TiDB splits a single-table `GROUP BY` into two aggregation phases: the
+    // cop task groups and aggregates partially, the root aggregate folds the
+    // partial states and re-exposes the group keys via `firstrow`. The root
+    // output id follows the DataSource schema, and the partial state takes the
+    // id right after it (`count(*)` over `t(id, v)` → out `Column#4`, partial
+    // `Column#5`).
+    let cop_capable = matches!(
+        plan,
+        PhysicalPlan::TableReader { .. }
+            | PhysicalPlan::IndexReader { .. }
+            | PhysicalPlan::IndexLookUpReader { .. }
+    );
+    let out_col = if cop_capable {
+        scalar_agg_out_column(table, &agg_db, is).unwrap_or(5)
+    } else {
+        5
+    };
+    // A 2-phase aggregate allocates its cop partial state right after the
+    // aggregate output when the cop function reads no column (`count(*)/GROUP
+    // BY v` → output `Column#4`, partial `Column#5`). A grouped aggregate over
+    // an index still reserves the index-read ids TiDB allocates for the
+    // partial state, so it keeps the grouped-aggregate id the enclosing block
+    // reserved (`count(b) … GROUP BY a` → `Column#10`, `ORDER BY`/
+    // `LIMIT` shapes → `Column#15`/`Column#16`).
+    let partial_col =
+        if cop_capable && (agg_arg == "1" || matches!(plan, PhysicalPlan::TableReader { .. })) {
+            out_col + 1
+        } else {
+            partial_col
+        };
+    let mut root_funcs = vec![format!(
+        "funcs:{agg_fn}(Column#{partial_col})->Column#{out_col}"
+    )];
     let cop_funcs = [format!("{agg_fn}({agg_arg})->Column#{partial_col}")];
     // `SELECT <scalar expr over the group key>, MAX(e), QUOTE(i) … GROUP BY i`:
     // TiDB keeps a root `Projection` above the aggregate, so the aggregate only
@@ -20411,11 +20563,45 @@ fn build_agg_plan(
     }
     let info = format!("group by:{group_info}, {}", root_funcs.join(", "));
     let cop = format!("group by:{group_info}, funcs:{}", cop_funcs.join(", "));
-    if stream {
-        (PhysicalPlan::stream_agg(plan, info, cop, est), keep_order)
+    let agg = if stream {
+        PhysicalPlan::stream_agg(plan, info, cop, est)
+    } else if cop_capable {
+        PhysicalPlan::hash_agg_cop(plan, info, cop, est)
     } else {
-        (PhysicalPlan::hash_agg(plan, info, est), false)
+        PhysicalPlan::hash_agg(plan, info, est)
+    };
+    // TiDB renames the aggregate output back to the SELECT list with a root
+    // Projection: the aggregate names its group key after the expression
+    // (`db.t.v`), the projection re-exposes it as the select item
+    // (`Projection db.t.v, Column#4`). An aggregate-only SELECT list already
+    // matches the aggregate's own output names and needs no wrapper.
+    // HAVING builds its own output projection above the aggregate (and needs
+    // the aggregate itself as the rule's input), so it owns the wrapper.
+    if cop_capable
+        && select.having.is_none()
+        && select
+            .fields
+            .iter()
+            .any(|field| matches!(field.expr, ExprNode::Column(_)))
+    {
+        let exprs = select
+            .fields
+            .iter()
+            .map(|field| match &field.expr {
+                ExprNode::Column(_) => explain_col_ref(table, &field.expr),
+                _ => format!("Column#{out_col}"),
+            })
+            .collect();
+        return (
+            PhysicalPlan::Projection {
+                exprs,
+                child: Box::new(agg),
+                est_rows: None,
+            },
+            keep_order,
+        );
     }
+    (agg, if stream { keep_order } else { false })
 }
 
 /// `GROUP_CONCAT` over a single table (`TiDB buildAggregation`).
@@ -21254,6 +21440,20 @@ fn agg_est_rows(select: &SelectStmt) -> f64 {
     }
     if select.selection.is_some() {
         // Pseudo selectivity ~1/3 (TiDB unanalyzed `b>0`).
+        8000.0 / 3.0
+    } else {
+        8000.0
+    }
+}
+
+/// Row estimate of `SELECT DISTINCT` (TiDB `AggregationEliminator`). The dedup
+/// aggregate groups the projected columns, so the pseudo table keeps the 0.8
+/// dedup factor (`10000` rows → `8000`).
+fn distinct_est_rows(select: &SelectStmt) -> f64 {
+    if select.limit == Some(1) {
+        return 1.0;
+    }
+    if select.selection.is_some() {
         8000.0 / 3.0
     } else {
         8000.0
@@ -29666,9 +29866,218 @@ fn inl_hint_has_viable_inner(
             .filter(|t| hint.tables.iter().any(|h| table_matches_alias(t, h)))
             .collect(),
     };
-    candidates
-        .into_iter()
-        .any(|t| table_has_any_index(is, current_db, t))
+    let eq_pairs = join_eq_column_pairs(select);
+    candidates.into_iter().any(|t| {
+        table_has_any_index(is, current_db, t)
+            && index_collation_allows_inner(is, current_db, t, &eq_pairs)
+    })
+}
+
+/// One cross-table `col = col` join key: `(left alias, left column, right
+/// alias, right column)`, aliases lowercased.
+type JoinEqPair = (String, String, String, String);
+
+/// Collect the `col = col` join keys of `select` (JOIN … ON plus WHERE).
+fn join_eq_column_pairs(select: &SelectStmt) -> Vec<JoinEqPair> {
+    let tables = select.join_tables();
+    let mut out = Vec::new();
+    for join in &select.joins {
+        collect_join_eq_pairs(&join.on, &tables, &mut out);
+    }
+    if let Some(selection) = &select.selection {
+        collect_join_eq_pairs(selection, &tables, &mut out);
+    }
+    out
+}
+
+fn collect_join_eq_pairs(expr: &ExprNode, tables: &[&TableName], out: &mut Vec<JoinEqPair>) {
+    for conjunct in expr.split_cnf() {
+        let ExprNode::Binary(bin) = conjunct else {
+            continue;
+        };
+        if bin.op != Op::Eq {
+            continue;
+        }
+        let (ExprNode::Column(left), ExprNode::Column(right)) =
+            (bin.left.as_ref(), bin.right.as_ref())
+        else {
+            continue;
+        };
+        let (Some(lt), Some(rt)) = (left.table.clone(), right.table.clone()) else {
+            continue;
+        };
+        if !tables.iter().any(|t| table_matches_alias(t, &lt))
+            || !tables.iter().any(|t| table_matches_alias(t, &rt))
+        {
+            continue;
+        }
+        out.push((
+            lt.to_ascii_lowercase(),
+            left.name.clone(),
+            rt.to_ascii_lowercase(),
+            right.name.clone(),
+        ));
+    }
+}
+
+/// A collated join key can only probe an inner index when the index keeps the
+/// join's derived collation. TiDB falls back to the other side otherwise
+/// (`t2.b` is `ascii_bin` while `t1.b = t2.b` compares under
+/// `utf8mb4_general_ci`, so `INL_HASH_JOIN(t2)` cannot probe `t2`).
+///
+/// Returns `true` when the check is inconclusive (unknown column, non-string
+/// key, or no index starting with the key) so the hint stays applicable.
+fn index_collation_allows_inner(
+    is: &InfoSchema,
+    current_db: &str,
+    table: &TableName,
+    eq_pairs: &[JoinEqPair],
+) -> bool {
+    let Some(pair) = eq_pairs.iter().find_map(|(lt, lc, rt, rc)| {
+        if table_matches_alias(table, lt) {
+            Some((lc, rt.as_str(), rc))
+        } else if table_matches_alias(table, rt) {
+            Some((rc, lt.as_str(), lc))
+        } else {
+            None
+        }
+    }) else {
+        return true;
+    };
+    let (own_col, peer_alias, peer_col) = pair;
+    let (db, name) = table.qualified(current_db);
+    let Some(info) = is.table_by_name(&db, &name) else {
+        return true;
+    };
+    // IndexJoin probes the inner index's *leading* key; only a key that starts
+    // with this join column is affected by the collation check.
+    let uses_leading_key = info.indices.iter().any(|idx| {
+        idx.columns
+            .first()
+            .is_some_and(|c| c.name.o().eq_ignore_ascii_case(own_col))
+    });
+    if !uses_leading_key {
+        return true;
+    }
+    let Some(own_ft) = string_key_field_type(info, own_col) else {
+        return true;
+    };
+    let Some(peer_ft) = eq_pairs_peer_field_type(is, current_db, peer_alias, peer_col) else {
+        return true;
+    };
+    let Some(collation) = derive_join_collation(&own_ft, &peer_ft) else {
+        return true;
+    };
+    let own_collation = own_ft.collate.to_ascii_lowercase();
+    own_collation == collation.to_ascii_lowercase()
+}
+
+fn string_key_field_type<'a>(
+    info: &'a sealdb_meta::TableInfo,
+    column: &str,
+) -> Option<&'a sealdb_types::field_type::FieldType> {
+    let ft = table_column_field_type(info, column)?;
+    is_collated_string(ft).then_some(ft)
+}
+
+fn table_column_field_type<'a>(
+    info: &'a sealdb_meta::TableInfo,
+    column: &str,
+) -> Option<&'a sealdb_types::field_type::FieldType> {
+    info.columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(column))
+        .map(|c| &c.field_type)
+}
+
+/// TiDB `tryToReplaceCond` collation guard: `t1.a = t2.a` may only be mirrored
+/// as `t2.a = <const>` when the equality's derived collation equals the target
+/// column's collation. A raw constant would otherwise filter rows the
+/// collation-aware join keeps (`utf8mb4_general_ci` key vs `utf8_bin` target
+/// drops `'A'`). `true` means the mirror is allowed.
+fn join_key_collation_matches_target(
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    from_table: &TableName,
+    from: &ColumnNameExpr,
+    to_table: &TableName,
+    to: &ColumnNameExpr,
+) -> bool {
+    let Some(is) = is else {
+        return true;
+    };
+    let lookup = |table: &TableName, column: &str| {
+        let (db, name) = table.qualified(current_db);
+        is.table_by_name(&db, &name)
+            .and_then(|info| table_column_field_type(info, column))
+    };
+    let (Some(from_ft), Some(to_ft)) = (lookup(from_table, &from.name), lookup(to_table, &to.name))
+    else {
+        return true;
+    };
+    if !is_collated_string(from_ft) || !is_collated_string(to_ft) {
+        return true;
+    }
+    match derive_join_collation(from_ft, to_ft) {
+        Some(collation) => collation.eq_ignore_ascii_case(&to_ft.collate),
+        None => true,
+    }
+}
+
+fn eq_pairs_peer_field_type<'a>(
+    is: &'a InfoSchema,
+    current_db: &str,
+    peer_alias: &str,
+    peer_col: &str,
+) -> Option<&'a sealdb_types::field_type::FieldType> {
+    // The peer is addressed by alias; resolve through the tables visible in
+    // the current schema (aliases match the table name for these statements).
+    let info = is.table_by_name(current_db, peer_alias)?;
+    string_key_field_type(info, peer_col)
+}
+
+pub(super) fn is_collated_string(ft: &sealdb_types::field_type::FieldType) -> bool {
+    ft.eval_type() == sealdb_types::field_type::EvalType::String
+        && !ft.charset.is_empty()
+        && !ft.charset.eq_ignore_ascii_case("binary")
+        && !ft.collate.eq_ignore_ascii_case("binary")
+}
+
+/// Collation a `col = col` comparison runs under (MySQL/TiDB coercion): a
+/// binary side defers to the other side, otherwise the wider charset wins.
+/// Returns `None` when the pair does not determine a unique collation.
+pub(super) fn derive_join_collation(
+    own: &sealdb_types::field_type::FieldType,
+    peer: &sealdb_types::field_type::FieldType,
+) -> Option<String> {
+    let own_charset = own.charset.to_ascii_lowercase();
+    let peer_charset = peer.charset.to_ascii_lowercase();
+    let own_collation = own.collate.to_ascii_lowercase();
+    let peer_collation = peer.collate.to_ascii_lowercase();
+    if own_collation == peer_collation {
+        return Some(own_collation);
+    }
+    if own_charset == "binary" {
+        return Some(peer_collation);
+    }
+    if peer_charset == "binary" {
+        return Some(own_collation);
+    }
+    if own_charset == peer_charset {
+        return None;
+    }
+    let rank = |charset: &str| match charset {
+        "utf8mb4" => 4,
+        "utf8mb3" | "utf8" | "gbk" => 3,
+        "latin1" => 2,
+        "ascii" => 1,
+        _ => 0,
+    };
+    match rank(&own_charset).cmp(&rank(&peer_charset)) {
+        std::cmp::Ordering::Greater => Some(own_collation),
+        std::cmp::Ordering::Less => Some(peer_collation),
+        std::cmp::Ordering::Equal => None,
+    }
 }
 
 fn table_has_any_index(is: &InfoSchema, current_db: &str, table: &TableName) -> bool {
@@ -32174,6 +32583,11 @@ fn index_covers_needed(
     info: &sealdb_meta::TableInfo,
     from: &TableName,
 ) -> bool {
+    // A collation-keyed string index stores sort-key bytes, which cannot be
+    // turned back into the original text. TiDB keeps a copy of the original
+    // values in the index value ("restored data") and still reads the index
+    // alone; SealDB does not store that copy yet, so the executor fetches the
+    // rows while keeping the index-only plan shape (`IndexReader`).
     select_covers_index_for(select, Some(&from.name), info, index)
         && info.index_covers(index, join_keys)
 }
@@ -32227,6 +32641,8 @@ pub fn derive_join_key_constants(
     left: &TableName,
     right: &TableName,
     on: &ExprNode,
+    is: Option<&InfoSchema>,
+    current_db: &str,
 ) -> (Vec<ExprNode>, Vec<ExprNode>) {
     use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ExprNode};
     use sealdb_parser::opcode::Op;
@@ -32271,7 +32687,15 @@ pub fn derive_join_key_constants(
     };
     // Mirror the constant onto the column of the other side.
     let mirror = |from: &ColumnNameExpr, to: &ColumnNameExpr, to_table: &TableName| {
-        pinned(from, if owned_by(from, left) { left } else { right }).map(|value| {
+        let from_table = if owned_by(from, left) { left } else { right };
+        // TiDB `tryToReplaceCond` skips the mirror when the join key's derived
+        // collation differs from the target column's (`t1.a = t2.a` compares
+        // under `utf8mb4_general_ci`, so `t2.a` (`utf8_bin`) must not see
+        // `t2.a = 'a'`).
+        if !join_key_collation_matches_target(is, current_db, from_table, from, to_table, to) {
+            return None;
+        }
+        pinned(from, from_table).map(|value| {
             ExprNode::Binary(BinaryOpExpr {
                 op: Op::Eq,
                 left: Box::new(ExprNode::Column(ColumnNameExpr {

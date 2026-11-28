@@ -152,6 +152,24 @@ pub const ERR_FORBID_SCHEMA_CHANGE: i32 = 1450;
 pub const ERR_CANNOT_ADD_FOREIGN: i32 = 1215;
 /// MySQL `ER_FK_DUP_NAME`: two foreign keys share a constraint name.
 pub const ERR_FK_DUP_NAME: i32 = 1826;
+/// TiDB `ErrDependentByForeignKey`: a column needed by a local foreign key
+/// cannot be dropped.
+pub const ERR_DEPENDENT_BY_FOREIGN_KEY: i32 = 1828;
+/// TiDB `ErrForeignKeyColumnCannotChange`: the referencing (child) column of a
+/// foreign key cannot keep its definition under the requested change.
+pub const ERR_FK_COLUMN_CANNOT_CHANGE: i32 = 1832;
+/// TiDB `ErrDropIndexNeededInForeignKey`: an index that a foreign key (added
+/// by the same ALTER) relies on cannot be dropped.
+pub const ERR_DROP_INDEX_NEEDED_IN_FK: i32 = 1553;
+/// TiDB `ErrCannotDropOrTruncateReferencedByFK`: a table still referenced by
+/// another table's foreign key cannot be dropped.
+pub const ERR_CANNOT_DROP_TABLE_REFERENCED_BY_FK: i32 = 3730;
+/// TiDB `ErrForeignKeyColumnCannotChangeChild`: the referenced (parent) column
+/// cannot change because a child table's foreign key depends on it.
+pub const ERR_FK_COLUMN_CANNOT_CHANGE_CHILD: i32 = 1833;
+/// TiDB `ErrDependentByReferencedTable`: a column referenced by another
+/// table's foreign key cannot be dropped.
+pub const ERR_DEPENDENT_BY_REFERENCED_TABLE: i32 = 1829;
 /// MySQL `ER_UNSUPPORTED_DDL_OPERATION` (TiDB `ErrUnsupportedDDLOperation`).
 pub const ERR_UNSUPPORTED_DDL_OPERATION: i32 = 8200;
 pub const ERR_NO_PARTITION_FOR_GIVEN_VALUE: i32 = 1526;
@@ -174,6 +192,9 @@ pub const ERR_CANT_CREATE_USER_WITH_GRANT: i32 = 1410;
 /// MySQL `ER_COLUMNACCESS_DENIED_ERROR`: the user may not use a specific
 /// column for the statement's command (1143).
 pub const ERR_COLUMNACCESS_DENIED_ERROR: i32 = 1143;
+/// MySQL `ER_ILLEGAL_GRANT_FOR_TABLE`: privilege not valid at the granted
+/// level, e.g. `GRANT CREATE TEMPORARY TABLES ON db.t` (1144).
+pub const ERR_ILLEGAL_GRANT_FOR_TABLE: i32 = 1144;
 /// TiDB `ErrViewNoExplain`: EXPLAIN/SHOW on a VIEW without the needed
 /// privileges on the view / underlying tables.
 pub const ERR_VIEW_NO_EXPLAIN: i32 = 1345;
@@ -368,3 +389,6 @@ pub const ERR_CANNOT_USER: i32 = 1396;
 /// TiDB `ErrRoleNotGranted` (3530): `SHOW GRANTS … USING r` where `r` is not
 /// granted to the displayed account.
 pub const ERR_ROLE_NOT_GRANTED: i32 = 3530;
+/// TiDB `ErrIllegalPrivilegeLevel` (3619): a dynamic privilege may only be
+/// granted/revoked at the global level (`GRANT BACKUP_ADMIN ON db.*`).
+pub const ERR_ILLEGAL_PRIVILEGE_LEVEL: i32 = 3619;

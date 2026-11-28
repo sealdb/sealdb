@@ -607,6 +607,20 @@ impl Domain {
         }
     }
 
+    /// Global password-reuse policy (`password_history` /
+    /// `password_reuse_interval` sysvars; both default to 0).
+    pub fn password_policy(&self) -> sealdb_privilege::PasswordPolicy {
+        let read = |name: &str| {
+            self.global_override(name)
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        sealdb_privilege::PasswordPolicy {
+            history: read("password_history"),
+            reuse_days: read("password_reuse_interval"),
+        }
+    }
+
     pub fn set_global_sql_mode(&self, mode: String) {
         self.global_vars
             .lock()
@@ -950,7 +964,13 @@ impl Domain {
 
     /// Apply `stmt`. Autocommit (`persist`) writes meta immediately;
     /// an explicit txn leaves meta in memory until [`persist_schema`].
-    pub fn execute_ddl(&self, stmt: &Statement, current_db: &str, persist: bool) -> Result<()> {
+    pub fn execute_ddl(
+        &self,
+        stmt: &Statement,
+        current_db: &str,
+        persist: bool,
+        fk_checks: bool,
+    ) -> Result<()> {
         let mut inner = self.inner.lock().expect("domain ddl lock");
         let id = inner.jobs.last().map(|job| job.id + 1).unwrap_or(1);
         inner.jobs.push(Job::from_stmt(id, stmt, current_db));
@@ -961,6 +981,7 @@ impl Domain {
             stmt,
             current_db,
             self.storage.as_ref(),
+            fk_checks,
         );
         if let Some(job) = inner.jobs.last_mut() {
             job.state = if result.is_ok() {

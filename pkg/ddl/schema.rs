@@ -59,9 +59,25 @@ fn apply_schema_charset_collation(
     Ok(())
 }
 
-pub fn drop_schema(meta: &mut Mutator, is: &InfoSchema, stmt: &DropDatabaseStmt) -> Result<()> {
+pub fn drop_schema(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &DropDatabaseStmt,
+    fk_checks: bool,
+) -> Result<()> {
     match is.schema_by_name(&stmt.name) {
         Some(db) => {
+            // TiDB also runs the 3730 check for `DROP DATABASE`: a table in
+            // another schema whose foreign key points into this database
+            // blocks the drop (unless `foreign_key_checks=0`).
+            if fk_checks {
+                let dropped: Vec<(String, String)> = is
+                    .schema_tables(&db.name.o().to_string())
+                    .iter()
+                    .map(|tbl| (db.name.o().to_string(), tbl.name.o().to_string()))
+                    .collect();
+                crate::table::check_drop_tables_referenced_by_fk(is, &dropped)?;
+            }
             meta.drop_database(db.id)?;
             meta.gen_schema_version()?;
             Ok(())

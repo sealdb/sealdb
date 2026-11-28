@@ -18,15 +18,18 @@ use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_CANT_DROP_FIELD_OR_KEY,
     ERR_CANT_REMOVE_ALL_FIELDS, ERR_COLUMN_HAS_EXPRESSION_INDEX_DEPENDENT,
-    ERR_COLUMN_WITH_GENERATED_DEPENDENCIES, ERR_DEPENDENT_BY_GENERATED_COLUMN,
-    ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL, ERR_DUP_FIELDNAME, ERR_DUP_KEYNAME,
-    ERR_FK_INCOMPATIBLE_COLUMNS, ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST,
-    ERR_NO_SUCH_TABLE, ERR_OPT_ON_TEMPORARY_TABLE, ERR_PK_INDEX_CANT_BE_INVISIBLE,
-    ERR_PRIMARY_CANT_HAVE_NULL, ERR_TABLE_EXISTS, ERR_TABLE_MUST_HAVE_COLUMNS, ERR_TOO_MANY_FIELDS,
-    ERR_TTL_DROP_COLUMN, ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG,
-    ERR_UNKNOWN_PARTITION, ERR_UNSUPPORTED_DDL_OPERATION, ERR_UNSUPPORTED_MODIFY_CHARSET,
-    ERR_UNSUPPORTED_ON_CACHE_TABLE, ERR_UNSUPPORTED_ON_GENERATED_COLUMN,
-    ERR_WARN_TABLE_TYPE_NOT_SUPPORT_FULLTEXT, ERR_WRONG_OBJECT, Error, Result,
+    ERR_COLUMN_WITH_GENERATED_DEPENDENCIES, ERR_DEPENDENT_BY_FOREIGN_KEY,
+    ERR_DEPENDENT_BY_GENERATED_COLUMN, ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL,
+    ERR_DEPENDENT_BY_REFERENCED_TABLE, ERR_DROP_INDEX_NEEDED_IN_FK, ERR_DUP_FIELDNAME,
+    ERR_DUP_KEYNAME, ERR_FK_COLUMN_CANNOT_CHANGE, ERR_FK_COLUMN_CANNOT_CHANGE_CHILD,
+    ERR_FK_INCOMPATIBLE_COLUMNS, ERR_FORBID_SCHEMA_CHANGE, ERR_INVALID_AUTO_RANDOM,
+    ERR_KEY_DOES_NOT_EXIST, ERR_NO_SUCH_TABLE, ERR_OPT_ON_TEMPORARY_TABLE,
+    ERR_PK_INDEX_CANT_BE_INVISIBLE, ERR_PRIMARY_CANT_HAVE_NULL, ERR_TABLE_EXISTS,
+    ERR_TABLE_MUST_HAVE_COLUMNS, ERR_TOO_MANY_FIELDS, ERR_TTL_DROP_COLUMN, ERR_TTL_FK_REFERENCED,
+    ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG, ERR_UNKNOWN_PARTITION,
+    ERR_UNSUPPORTED_DDL_OPERATION, ERR_UNSUPPORTED_MODIFY_CHARSET, ERR_UNSUPPORTED_ON_CACHE_TABLE,
+    ERR_UNSUPPORTED_ON_GENERATED_COLUMN, ERR_WARN_TABLE_TYPE_NOT_SUPPORT_FULLTEXT,
+    ERR_WRONG_OBJECT, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -73,9 +76,14 @@ pub fn alter_table(
     // temporary tables go through the normal path (options unsupported on
     // temporary tables are refused individually).
     if target.temporary && !target.on_commit_delete_rows {
+        let ddl = if stmt.from_rename_table {
+            "RENAME TABLE"
+        } else {
+            "ALTER TABLE"
+        };
         return Err(Error::new(
             ERR_UNSUPPORTED_DDL_OPERATION,
-            "TiDB doesn't support ALTER TABLE for local temporary table",
+            format!("TiDB doesn't support {ddl} for local temporary table"),
         ));
     }
     // TiDB `checkMultiSchemaInfo` (multi-spec ALTER): the same column may not
@@ -142,6 +150,48 @@ pub fn alter_table(
                         "You can't delete all columns with ALTER TABLE; use DROP TABLE instead",
                     )
                 });
+            }
+        }
+        // TiDB `checkOperateDropIndexUseByForeignKey`: an index dropped by this
+        // statement cannot also be the only one backing a foreign key added in
+        // the same statement (1553).
+        let dropping: Vec<&str> = stmt
+            .specs
+            .iter()
+            .filter_map(|spec| match spec {
+                AlterTableSpec::DropIndex { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !dropping.is_empty() {
+            for spec in &stmt.specs {
+                let AlterTableSpec::AddForeignKey(fk) = spec else {
+                    continue;
+                };
+                let dropped = current.indices.iter().find(|index| {
+                    dropping
+                        .iter()
+                        .any(|name| index.name.o().eq_ignore_ascii_case(name))
+                        && index_covers_columns(index, &fk.columns)
+                });
+                let Some(dropped) = dropped else {
+                    continue;
+                };
+                let remaining = current.indices.iter().any(|index| {
+                    !dropping
+                        .iter()
+                        .any(|name| index.name.o().eq_ignore_ascii_case(name))
+                        && index_covers_columns(index, &fk.columns)
+                });
+                if !remaining {
+                    return Err(Error::new(
+                        ERR_DROP_INDEX_NEEDED_IN_FK,
+                        format!(
+                            "Cannot drop index '{}': needed in a foreign key constraint",
+                            dropped.name.o()
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -223,6 +273,8 @@ pub fn alter_table(
                 type_name,
                 default,
                 generated,
+                auto_random,
+                auto_random_range,
                 not_null,
                 charset,
                 collate,
@@ -241,6 +293,8 @@ pub fn alter_table(
                     Some(type_name),
                     default.as_deref(),
                     generated.as_ref(),
+                    *auto_random,
+                    *auto_random_range,
                     *not_null,
                     charset.as_deref(),
                     collate.as_deref(),
@@ -255,6 +309,8 @@ pub fn alter_table(
                 type_name,
                 default,
                 generated,
+                auto_random,
+                auto_random_range,
                 not_null,
                 charset,
                 collate,
@@ -272,6 +328,8 @@ pub fn alter_table(
                     Some(type_name),
                     default.as_deref(),
                     generated.as_ref(),
+                    *auto_random,
+                    *auto_random_range,
                     *not_null,
                     charset.as_deref(),
                     collate.as_deref(),
@@ -287,6 +345,8 @@ pub fn alter_table(
                 stmt,
                 old_name,
                 new_name,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -515,6 +575,16 @@ pub fn alter_table(
                     format!("Unsupported {msg}"),
                 ));
             }
+            AlterTableSpec::Validation { with } => {
+                return Err(Error::new(
+                    ERR_UNSUPPORTED_DDL_OPERATION,
+                    if *with {
+                        "ALTER TABLE WITH VALIDATION is currently unsupported"
+                    } else {
+                        "ALTER TABLE WITHOUT VALIDATION is currently unsupported"
+                    },
+                ));
+            }
             AlterTableSpec::FirstPartition { bound } => {
                 crate::partition::first_partition(
                     meta,
@@ -560,6 +630,9 @@ pub fn alter_table(
             }
             AlterTableSpec::AddForeignKey(fk) => {
                 add_foreign_key_spec(meta, &snapshot, stmt, fk, current_db)?
+            }
+            AlterTableSpec::DropForeignKey { name } => {
+                drop_foreign_key(meta, &snapshot, stmt, name, current_db)?
             }
             AlterTableSpec::Attributes {
                 partition,
@@ -647,6 +720,29 @@ fn convert_charset(
         .map(str::to_string)
         .unwrap_or_else(|| default_collation_for_charset(charset));
     let mut updated = info.clone();
+    // TiDB `checkAlterTableCharset` (8200): converting an indexed column to an
+    // incompatible collation would have to rewrite its index keys.
+    for col in &info.columns {
+        if !is_charset_convertible(&col.field_type) {
+            continue;
+        }
+        if col.field_type.collate.eq_ignore_ascii_case(&collation) {
+            continue;
+        }
+        if !compatible_collate(&col.field_type.collate, &collation)
+            && is_indexed_column(&info, col.name.o())
+        {
+            return Err(Error::new(
+                ERR_UNSUPPORTED_MODIFY_CHARSET,
+                format!(
+                    "Unsupported converting collation of column '{}' from '{}' to '{}' when index is defined on it.",
+                    col.name.o().to_ascii_lowercase(),
+                    col.field_type.collate,
+                    collation.to_ascii_lowercase()
+                ),
+            ));
+        }
+    }
     for col in &mut updated.columns {
         if is_charset_convertible(&col.field_type) {
             col.field_type.charset = charset.to_string();
@@ -1040,6 +1136,8 @@ fn add_column(
     if column.not_null {
         new_col.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
     }
+    // TiDB `decodeEnumSetBinaryLiteralToUTF8` for `ADD COLUMN`.
+    crate::create_table::decode_enum_set_binary_literals(&mut new_col.field_type);
     validate_display_width(new_col.name.o(), &new_col.field_type)?;
     validate_default_literal(
         new_col.name.o(),
@@ -1378,6 +1476,17 @@ fn same_generated_expr(left: &str, right: &str) -> bool {
 }
 
 /// Is `name` part of any index key?
+/// TiDB `collate.CompatibleCollate`: two collations whose stored data can be
+/// reinterpreted without rewriting rows or index keys.
+fn compatible_collate(a: &str, b: &str) -> bool {
+    let a = a.to_ascii_lowercase();
+    let b = b.to_ascii_lowercase();
+    let general = |c: &str| c == "utf8mb4_general_ci" || c == "utf8_general_ci";
+    let bin = |c: &str| c == "utf8mb4_bin" || c == "utf8_bin" || c == "latin1_bin";
+    let unicode = |c: &str| c == "utf8mb4_unicode_ci" || c == "utf8_unicode_ci";
+    (general(&a) && general(&b)) || (bin(&a) && bin(&b)) || (unicode(&a) && unicode(&b)) || a == b
+}
+
 fn is_indexed_column(info: &TableInfo, name: &str) -> bool {
     info.indices.iter().any(|idx| {
         idx.columns
@@ -1446,6 +1555,49 @@ fn drop_column(
             ERR_TTL_DROP_COLUMN,
             format!("Cannot drop column '{name}': needed in TTL config"),
         ));
+    }
+    // TiDB `checkIsDropColumnInForeignKey` (1828): a column that a local
+    // foreign key references cannot be dropped.
+    if let Some(fk) = info
+        .foreign_keys
+        .iter()
+        .find(|fk| fk.cols.iter().any(|c| c.eq_ignore_ascii_case(name)))
+    {
+        return Err(Error::new(
+            ERR_DEPENDENT_BY_FOREIGN_KEY,
+            format!(
+                "Cannot drop column '{name}': needed in a foreign key constraint '{}'",
+                fk.name
+            ),
+        ));
+    }
+    // TiDB `checkIsDropColumnInReferencedTable` (1829): a column referenced by
+    // a foreign key of any table (including a self-reference) cannot be
+    // dropped either.
+    for db in is.all_schemas() {
+        let db_name = db.name.o().to_string();
+        if !db_name.eq_ignore_ascii_case(&schema) {
+            continue;
+        }
+        for child in is.schema_tables(&db_name) {
+            for fk in &child.foreign_keys {
+                if !fk.ref_table.eq_ignore_ascii_case(info.name.o()) {
+                    continue;
+                }
+                let ref_cols = referenced_columns(fk, &info);
+                if ref_cols.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                    return Err(Error::new(
+                        ERR_DEPENDENT_BY_REFERENCED_TABLE,
+                        format!(
+                            "Cannot drop column '{name}': needed in a foreign key constraint \
+                             '{}' of table '{}'",
+                            fk.name,
+                            child.name.o()
+                        ),
+                    ));
+                }
+            }
+        }
     }
     if info.indices.iter().any(|idx| {
         idx.columns
@@ -1602,6 +1754,8 @@ fn change_column(
     type_name: Option<&str>,
     default: Option<&str>,
     generated: Option<&GeneratedColumn>,
+    auto_random: Option<u32>,
+    auto_random_range: Option<u32>,
     not_null: Option<bool>,
     charset: Option<&str>,
     collate: Option<&str>,
@@ -1676,6 +1830,45 @@ fn change_column(
             ),
         ));
     }
+    // TiDB resolves the new definition's collation before the charset rules
+    // below, so an unusable collation is 1273 even when the charset would also
+    // change (8200).
+    if let Some(collate) = collate
+        && let Some(err) = sealdb_parser::charset::collation_validation_error(collate)
+    {
+        return Err(err);
+    }
+    // TiDB `checkModifyTypes` → `collate.CompatibleCollate` (8200): an indexed
+    // column may not move to an incompatible collation, because the stored
+    // index keys would have to be rewritten.
+    if let Some(collate) = collate {
+        let old_collate = info.columns[pos].field_type.collate.clone();
+        if !compatible_collate(&old_collate, collate) && is_indexed_column(&info, old_name) {
+            return Err(Error::new(
+                ERR_UNSUPPORTED_MODIFY_CHARSET,
+                format!(
+                    "Unsupported modifying collation of column '{}' from '{}' to '{}' when index is defined on it.",
+                    old_name.to_ascii_lowercase(),
+                    old_collate,
+                    collate.to_ascii_lowercase()
+                ),
+            ));
+        }
+    }
+    // TiDB `checkAutoRandom` (8216): `AUTO_RANDOM(shard[, range])` keeps its
+    // range bits for the life of the column, and the bits left for the
+    // incremental part must stay large enough.
+    if let Some(shard) = auto_random {
+        let old_range = info.columns[pos].auto_random_range.unwrap_or(64);
+        let new_range = auto_random_range.unwrap_or(64);
+        if info.columns[pos].auto_random.is_some() && new_range != old_range {
+            return Err(Error::new(
+                ERR_INVALID_AUTO_RANDOM,
+                "Invalid auto random: alter the range bits of auto_random column is not supported",
+            ));
+        }
+        crate::create_table::validate_auto_random_bits(Some(shard), auto_random_range, &new_ft)?;
+    }
     // TiDB `ErrUnsupportedModifyCharset` (8200): a column's charset is fixed
     // once created, so `MODIFY … CHARACTER SET x` on a different charset fails.
     let old_charset = info.columns[pos].field_type.charset.clone();
@@ -1693,6 +1886,8 @@ fn change_column(
     if let Some(collate) = collate {
         new_ft.collate = collate.to_string();
     }
+    // TiDB `decodeEnumSetBinaryLiteralToUTF8` for `MODIFY COLUMN`.
+    crate::create_table::decode_enum_set_binary_literals(&mut new_ft);
     let renaming = !old_name.eq_ignore_ascii_case(new_name);
     if renaming && used_by_partition_function(&info, old_name) {
         return Err(partition_column_dependency(old_name));
@@ -1772,10 +1967,10 @@ fn change_column(
     } else if !old_generated && generated.is_some_and(|g| g.stored) {
         return Err(unsupported_generated("modifying a stored column"));
     }
+    // TiDB `checkModifyColumnWithForeignKeyConstraint`: runs for every MODIFY,
+    // even when the type only grows (a DECIMAL flen/scale change is refused).
+    check_foreign_key_column_change(is, &schema, &info, &info.columns[pos], new_name, &new_ft)?;
     if changed {
-        // TiDB `checkModifyColumnWithForeignKeyConstraint`: a type change that
-        // makes a FK's referencing/referenced columns disagree is 3780.
-        check_foreign_key_column_change(is, &schema, &info, &info.columns[pos], new_name, &new_ft)?;
         // A BLOB/TEXT target cannot carry a full-column index key (1170).
         check_blob_index_length(&info, old_name, &new_ft, new_name)?;
     }
@@ -1848,6 +2043,10 @@ fn change_column(
     let previous = info.columns[pos].name.o().to_string();
     info.columns[pos].name = CIStr::new(new_name);
     info.columns[pos].field_type = new_ft;
+    if let Some(shard) = auto_random {
+        info.columns[pos].auto_random = Some(shard);
+        info.columns[pos].auto_random_range = auto_random_range;
+    }
     if let Some(comment) = comment {
         info.columns[pos].comment = Some(comment.to_string());
     }
@@ -3124,6 +3323,16 @@ fn check_foreign_key_column_change(
         if new_ft.tp != ref_col.field_type.tp {
             return Err(incompatible(new_name, ref_col.name.o(), &fk.name));
         }
+        if !acceptable_fk_column_change(new_ft, old_ft, &ref_col.field_type) {
+            return Err(Error::new(
+                ERR_FK_COLUMN_CANNOT_CHANGE,
+                format!(
+                    "Cannot change column '{}': used in a foreign key constraint '{}'",
+                    old_col.name.o(),
+                    fk.name
+                ),
+            ));
+        }
     }
     // Parent side: other tables reference this column.
     for db in is.all_schemas() {
@@ -3156,10 +3365,61 @@ fn check_foreign_key_column_change(
                 if new_ft.tp != child_col.field_type.tp {
                     return Err(incompatible(child_col.name.o(), old_col.name.o(), &fk.name));
                 }
+                if !acceptable_fk_column_change(new_ft, old_ft, &child_col.field_type) {
+                    return Err(Error::new(
+                        ERR_FK_COLUMN_CANNOT_CHANGE_CHILD,
+                        format!(
+                            "Cannot change column '{}': used in a foreign key constraint '{}' of \
+                             table '{db_name}.{}'",
+                            old_col.name.o(),
+                            fk.name,
+                            child.name.o()
+                        ),
+                    ));
+                }
             }
         }
     }
     Ok(())
+}
+
+/// TiDB `isAcceptableForeignKeyColumnChange`: an integer type may change its
+/// display width freely; every other type may not shrink below the original or
+/// the paired column, and DECIMAL must keep flen/decimals unchanged.
+fn acceptable_fk_column_change(
+    new_ft: &FieldType,
+    original_ft: &FieldType,
+    related_ft: &FieldType,
+) -> bool {
+    use sealdb_types::field_type::{
+        TYPE_INT24, TYPE_LONG, TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SHORT, TYPE_TINY,
+    };
+    if matches!(
+        new_ft.tp,
+        TYPE_TINY | TYPE_SHORT | TYPE_INT24 | TYPE_LONG | TYPE_LONG_LONG
+    ) {
+        return true;
+    }
+    if new_ft.flen < related_ft.flen || new_ft.flen < original_ft.flen {
+        return false;
+    }
+    if new_ft.tp == TYPE_NEW_DECIMAL
+        && (new_ft.flen != original_ft.flen || new_ft.decimal != original_ft.decimal)
+    {
+        return false;
+    }
+    true
+}
+
+/// Whether `index` starts with exactly `cols` (TiDB
+/// `IsIndexPrefixCovered`), the shape a foreign key needs on its local columns.
+fn index_covers_columns(index: &sealdb_meta::IndexInfo, cols: &[String]) -> bool {
+    index.columns.len() >= cols.len()
+        && index
+            .columns
+            .iter()
+            .zip(cols.iter())
+            .all(|(index_col, col)| index_col.name.o().eq_ignore_ascii_case(col))
 }
 
 /// Columns a foreign key references: its explicit list, or the parent's
@@ -3271,6 +3531,41 @@ fn add_foreign_key_spec(
     }
     let position = info.foreign_keys.len();
     crate::create_table::add_foreign_key(&mut info, fk, position)?;
+    meta.update_table(db.id, &info)?;
+    meta.gen_schema_version()?;
+    Ok(())
+}
+
+/// `ALTER TABLE t DROP FOREIGN KEY name` (TiDB `AlterTableDropForeignKey`):
+/// metadata-only, the constraint is removed and an unknown name reports 1091.
+fn drop_foreign_key(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &AlterTableStmt,
+    name: &str,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let mut info = is.table_by_name(&schema, &table).cloned().ok_or_else(|| {
+        Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        )
+    })?;
+    let Some(pos) = info
+        .foreign_keys
+        .iter()
+        .position(|fk| fk.name.eq_ignore_ascii_case(name))
+    else {
+        return Err(Error::new(
+            ERR_CANT_DROP_FIELD_OR_KEY,
+            format!("Can't DROP '{name}'; check that column/key exists"),
+        ));
+    };
+    info.foreign_keys.remove(pos);
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(())

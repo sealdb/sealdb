@@ -72,6 +72,7 @@ pub fn execute_ddl(
     stmt: &Statement,
     current_db: &str,
     storage: &dyn Storage,
+    fk_checks: bool,
 ) -> Result<()> {
     validate_identifiers(stmt)?;
     match stmt {
@@ -79,7 +80,7 @@ pub fn execute_ddl(
             schema::create_schema(meta, is, s)?;
         }
         Statement::DropDatabase(s) => {
-            schema::drop_schema(meta, is, s)?;
+            schema::drop_schema(meta, is, s, fk_checks)?;
         }
         Statement::AlterDatabase(s) => {
             schema::alter_schema(meta, is, s, current_db)?;
@@ -100,7 +101,7 @@ pub fn execute_ddl(
             sequence::alter_sequence(meta, is, s, current_db)?;
         }
         Statement::DropTable(s) => {
-            table::drop_table(meta, is, s, current_db)?;
+            table::drop_table(meta, is, s, current_db, fk_checks)?;
         }
         Statement::TruncateTable(s) => {
             table::truncate_table(meta, is, s, current_db, storage)?;

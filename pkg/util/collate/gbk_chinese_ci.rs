@@ -48,7 +48,11 @@ pub fn compare(a: &str, b: &str) -> Ordering {
 
 /// Sort key bytes (TiDB `KeyWithoutTrimRightSpace` after trim).
 pub fn key(s: &str) -> Vec<u8> {
-    let s = truncate_trailing_space(s);
+    key_no_trim(truncate_trailing_space(s))
+}
+
+/// TiDB `KeyWithoutTrimRightSpace`: encode every rune, trailing spaces kept.
+pub fn key_no_trim(s: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(s.len() * 2);
     for r in s.chars() {
         let u16 = sort_key(r);

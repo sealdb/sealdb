@@ -1,7 +1,7 @@
 use sealdb_errno::{ERR_DUP_ENTRY, Error, Result};
 use sealdb_kv::Transaction;
 use sealdb_meta::{IndexInfo, TableInfo};
-use sealdb_tablecodec::{encode_index_key, encode_row_key_with_handle};
+use sealdb_tablecodec::{encode_index_key_collated, encode_row_key_with_handle};
 use sealdb_types::Datum;
 
 pub(crate) fn index_values(index: &IndexInfo, values: &[Datum]) -> Vec<Datum> {
@@ -162,7 +162,14 @@ pub(crate) fn write_index_keys(
         // so the row never conflicts with itself.
         let mut written: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for entry in index_value_variants(info, index, values) {
-            let key = encode_index_key(physical_id, index.id, &entry, handle, index.unique);
+            let key = encode_index_key_collated(
+                physical_id,
+                index.id,
+                &entry,
+                handle,
+                index.unique,
+                &info.index_collations(index),
+            );
             if !written.insert(key.as_bytes().to_vec()) {
                 continue;
             }
@@ -210,7 +217,14 @@ pub(crate) fn delete_index_keys(
             continue;
         }
         for entry in index_value_variants(info, index, values) {
-            let key = encode_index_key(physical_id, index.id, &entry, handle, index.unique);
+            let key = encode_index_key_collated(
+                physical_id,
+                index.id,
+                &entry,
+                handle,
+                index.unique,
+                &info.index_collations(index),
+            );
             txn.delete(key.as_bytes())?;
         }
     }

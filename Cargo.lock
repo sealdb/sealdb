@@ -2135,6 +2135,7 @@ dependencies = [
  "aes",
  "chrono",
  "chrono-tz",
+ "flate2",
  "regex",
  "sealdb-errno",
  "sealdb-meta",
@@ -2142,6 +2143,7 @@ dependencies = [
  "sealdb-types",
  "sealdb-util",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "time",
 ]
@@ -2220,6 +2222,7 @@ dependencies = [
  "sealdb-parser",
  "sealdb-statistics",
  "sealdb-types",
+ "sealdb-util",
  "serde",
  "serde_json",
  "snap",

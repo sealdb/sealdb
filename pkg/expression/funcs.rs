@@ -112,7 +112,9 @@ const FUNCS: &[FuncMeta] = &[
     meta("DATABASE", FuncCategory::Info, 0, 0, true),
     meta("SCHEMA", FuncCategory::Info, 0, 0, true),
     meta("TIDB_DECODE_BINARY_PLAN", FuncCategory::Info, 1, 1, true),
+    meta("TIDB_DECODE_SQL_DIGESTS", FuncCategory::Info, 1, 2, true),
     meta("TIDB_DECODE_PLAN", FuncCategory::Info, 1, 1, true),
+    meta("TIDB_ENCODE_SQL_DIGEST", FuncCategory::Info, 1, 1, true),
     meta("VITESS_HASH", FuncCategory::Miscellaneous, 1, 1, true),
 ];
 

@@ -271,7 +271,7 @@ impl Executor for InsertExec {
                 };
                 let rowid = rowid_override(&self.stmt.columns, base)?;
                 let previous = INSERT_SELECT_SOURCE.with(|flag| flag.replace(true));
-                let mapped = map_insert_row(info, &self.stmt.columns, base, i + 1);
+                let mapped = map_insert_row(info, &self.stmt.columns, base, &[], i + 1);
                 INSERT_SELECT_SOURCE.with(|flag| flag.set(previous));
                 pending.push(PendingRow {
                     values: mapped?,
@@ -393,6 +393,18 @@ impl Executor for InsertExec {
                             ERR_RECORD_FILE_FULL,
                             format!("The table '{table_name}' is full"),
                         ));
+                    }
+                    // TiDB `Foreign_Key_Check` on INSERT: a non-NULL key with
+                    // no parent row is 1452 (or a warning under IGNORE).
+                    let violation = crate::update::fk_insert_violation(
+                        &self.domain,
+                        txn,
+                        &schema,
+                        info,
+                        values,
+                    )?;
+                    if crate::update::apply_fk_outcome(violation, ignore)? {
+                        continue;
                     }
                     match write_row(txn, &self.domain, info, values, *rowid) {
                         Ok((handle, physical_id)) => {
@@ -932,6 +944,10 @@ fn eval_insert_row(
     row_no: usize,
 ) -> Result<(Vec<Datum>, Option<i64>)> {
     let mut values = Vec::with_capacity(row.len());
+    // Parallel to `values`: whether the value is a *binary* string (`UNHEX`,
+    // `0x…`), which TiDB converts to a column charset by truncating instead of
+    // substituting `?`.
+    let mut binary_values = Vec::with_capacity(row.len());
     let mut deferred_warnings = Vec::new();
     for (i, expr) in row.iter().enumerate() {
         // `DEFAULT` in VALUES: use the column default (NULL when none). A
@@ -942,6 +958,7 @@ fn eval_insert_row(
                 None => Datum::Null,
             };
             values.push(value);
+            binary_values.push(false);
             continue;
         }
         // Writing a generated column is only legal via bare `DEFAULT` or
@@ -976,13 +993,18 @@ fn eval_insert_row(
                     )
                 })?;
             values.push(column_default_value(col)?);
+            binary_values.push(false);
             continue;
         }
         // TiDB reports the column-assignment out-of-range warning before a
         // CAST expression's own truncation warning, so hold the latter until
         // after the row has been assigned to its columns.
         let start = sealdb_expression::warnings_len();
+        // Drop a marker left over from planning-time constant folding.
+        let _ = sealdb_expression::take_binary_value();
         let value = subquery.eval(expr, &[], &[])?;
+        let binary_value =
+            sealdb_expression::take_binary_value() || matches!(&value, Datum::Bit(_));
         // TiDB binary literals (`0x…` / `x'…'`) are strings in a character
         // context: `INSERT INTO vc VALUES (0x5c27090a)` stores the raw bytes,
         // not the decimal value of the literal.
@@ -1000,9 +1022,10 @@ fn eval_insert_row(
             deferred_warnings = sealdb_expression::take_warnings_from(start);
         }
         values.push(value);
+        binary_values.push(binary_value);
     }
     let rowid = rowid_override(columns, &values)?;
-    let mapped = map_insert_row(info, columns, &values, row_no)?;
+    let mapped = map_insert_row(info, columns, &values, &binary_values, row_no)?;
     for (code, message) in deferred_warnings {
         sealdb_expression::note_warning(code, message);
     }
@@ -1240,6 +1263,7 @@ fn map_insert_row(
     info: &sealdb_meta::TableInfo,
     columns: &[String],
     row: &[Datum],
+    binary: &[bool],
     row_no: usize,
 ) -> Result<Vec<Datum>> {
     CAST_ROW_NO.with(|cell| cell.set(row_no));
@@ -1266,8 +1290,9 @@ fn map_insert_row(
         }
         // Cast literals to column FieldType (UNSIGNED BIGINT / DECIMAL scale).
         let mut values = vec![Datum::Null; info.columns.len()];
-        for (col, v) in visible.iter().zip(row.iter()) {
-            values[col.offset as usize] = cast_for_column(v, col)?;
+        for (idx, (col, v)) in visible.iter().zip(row.iter()).enumerate() {
+            values[col.offset as usize] =
+                cast_for_column_impl(v, col, binary.get(idx).copied().unwrap_or(false))?;
         }
         fill_generated_columns(info, &mut values)?;
         return Ok(values);
@@ -1281,7 +1306,11 @@ fn map_insert_row(
             .iter()
             .position(|c| c.eq_ignore_ascii_case(col.name.o()))
         {
-            values.push(cast_for_column(&row[idx], col)?);
+            values.push(cast_for_column_impl(
+                &row[idx],
+                col,
+                binary.get(idx).copied().unwrap_or(false),
+            )?);
         } else {
             values.push(column_default_value(col)?);
         }
@@ -1546,6 +1575,13 @@ pub(crate) fn fill_generated_columns(
 }
 
 pub(crate) fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
+    cast_for_column_impl(v, col, false)
+}
+
+/// `binary` marks a source value that is a binary string (`UNHEX`, `0x…`):
+/// converting it to a `utf8` (utf8mb3) column truncates at the first
+/// four-byte character instead of substituting `?`.
+fn cast_for_column_impl(v: &Datum, col: &sealdb_meta::ColumnInfo, binary: bool) -> Result<Datum> {
     if matches!(col.field_type.tp, TYPE_ENUM | TYPE_SET) {
         return cast_enum_set(v, &col.field_type, col.name.o());
     }
@@ -1588,7 +1624,7 @@ pub(crate) fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Resul
     if let Datum::Bytes(bytes) = v
         && col.field_type.is_character_type()
     {
-        match charset_convert(&col.field_type.charset, bytes) {
+        match charset_convert(&col.field_type.charset, bytes, binary) {
             CharsetOutcome::Fine => {}
             CharsetOutcome::Converted {
                 offending,
@@ -2620,20 +2656,27 @@ enum CharsetOutcome {
 /// the value: characters the charset cannot encode become MySQL's `?`
 /// replacement. A malformed UTF-8 sequence ends the value at the last valid
 /// boundary, mirroring TiDB's `Charset.Convert` (the valid prefix is kept).
-fn charset_convert(charset: &str, bytes: &[u8]) -> CharsetOutcome {
+fn charset_convert(charset: &str, bytes: &[u8], binary: bool) -> CharsetOutcome {
     let charset = charset.to_ascii_lowercase();
     if charset == "binary" {
         return CharsetOutcome::Fine;
     }
+    // `@@tidb_skip_utf8_check` / `@@tidb_skip_ascii_check` disable the
+    // corresponding 1366 validation; the bytes are stored verbatim.
+    let skip_utf8_validity =
+        matches!(charset.as_str(), "utf8" | "utf8mb4") && sealdb_expression::skip_utf8_check();
+    let skip_ascii_validity = charset == "ascii" && sealdb_expression::skip_ascii_check();
+    let allow_mb4 = !sealdb_expression::check_mb4_value();
     let mut converted = Vec::with_capacity(bytes.len());
     let mut offending: Option<Vec<u8>> = None;
     match std::str::from_utf8(bytes) {
         Ok(text) => {
             for ch in text.chars() {
                 let representable = match charset.as_str() {
-                    "ascii" => ch.is_ascii(),
-                    // utf8 is MySQL's utf8mb3: only the BMP is representable.
-                    "utf8" => ch.len_utf8() <= 3,
+                    "ascii" => skip_ascii_validity || ch.is_ascii(),
+                    // utf8 is MySQL's utf8mb3: only the BMP is representable
+                    // unless `tidb_check_mb4_value_in_utf8` is OFF.
+                    "utf8" => allow_mb4 || ch.len_utf8() <= 3,
                     // The shipped GBK table is a small subset; accept the
                     // Unicode blocks GBK covers so ordinary CJK text is not
                     // mistaken for an unconvertible character.
@@ -2660,21 +2703,37 @@ fn charset_convert(charset: &str, bytes: &[u8]) -> CharsetOutcome {
                         let mut buf = [0u8; 4];
                         offending = Some(ch.encode_utf8(&mut buf).as_bytes().to_vec());
                     }
+                    // A binary source (`UNHEX`, `0x…`) into a `utf8` (utf8mb3)
+                    // column is truncated at the four-byte character; a
+                    // character source substitutes `?` instead.
+                    if charset == "utf8" && !allow_mb4 && binary {
+                        break;
+                    }
                     converted.push(b'?');
                 }
             }
         }
         Err(err) => {
+            // Invalid UTF-8 bytes are stored verbatim when the column's charset
+            // check is disabled.
+            if skip_utf8_validity || skip_ascii_validity {
+                return CharsetOutcome::Fine;
+            }
             let valid = err.valid_up_to();
             converted.extend_from_slice(&bytes[..valid]);
             // ASCII conversion names the whole invalid tail (TiDB ascii
             // encoder reports every remaining byte); the UTF-8 checkpoints
             // report the first bad byte.
             let tail = &bytes[valid..];
-            offending = Some(if charset == "ascii" {
-                tail.to_vec()
-            } else {
-                vec![tail[0]]
+            offending = Some(match charset.as_str() {
+                // ASCII conversion names the whole invalid tail (TiDB ascii
+                // encoder reports every remaining byte).
+                "ascii" => tail.to_vec(),
+                // GBK reads a lead byte plus its trail byte as one unit, so a
+                // trailing `\xFF\xFF` is one unrepresentable chunk.
+                "gbk" if tail[0] >= 0x80 => tail[..tail.len().min(2)].to_vec(),
+                // The UTF-8 checkpoints report the first bad byte.
+                _ => vec![tail[0]],
             });
         }
     }

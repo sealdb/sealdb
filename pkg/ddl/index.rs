@@ -13,7 +13,7 @@ use sealdb_kv::Storage;
 use sealdb_meta::{IndexInfo, Mutator, TableInfo};
 use sealdb_parser::ast::{CreateIndexStmt, DropIndexStmt, IndexDef, TableName};
 use sealdb_tablecodec::{
-    decode_handle_from_row_key, decode_row, encode_index_key, encode_index_seek_key,
+    decode_handle_from_row_key, decode_row, encode_index_key_collated, encode_index_seek_key,
     encode_row_key_with_handle, gen_table_record_prefix, next_prefix,
 };
 use sealdb_types::Datum;
@@ -45,7 +45,7 @@ pub fn create_index(
             columns: stmt.columns.clone(),
             unique: stmt.unique,
             primary: false,
-            global: false,
+            global: stmt.global,
             nonclustered: false,
             clustered: false,
             invisible: stmt.invisible,
@@ -88,6 +88,14 @@ pub fn add_index(
     crate::create_table::check_index_name(&index.name, index.primary)?;
     let (schema, name) = resolve_name(table, current_db)?;
     let (db_id, mut info) = load_table(is, &schema, &name)?;
+    // TiDB `checkGlobalIndex`: a GLOBAL index only makes sense on a partitioned
+    // table (8200).
+    if index.global && info.partition.is_none() {
+        return Err(Error::new(
+            sealdb_errno::ERR_UNSUPPORTED_DDL_OPERATION,
+            "Unsupported Global Index on non-partitioned table",
+        ));
+    }
     if info
         .indices
         .iter()
@@ -294,7 +302,14 @@ pub(crate) fn backfill_index(
                 .collect();
             // Unique indexes omit the handle from the key; a second row with the
             // same indexed values is 1062 even during write-reorg backfill.
-            let ikey = encode_index_key(physical_id, index.id, &idx_vals, handle, index.unique);
+            let ikey = encode_index_key_collated(
+                physical_id,
+                index.id,
+                &idx_vals,
+                handle,
+                index.unique,
+                &info.index_collations(index),
+            );
             if index.unique && txn.get(ikey.as_bytes())?.is_some() {
                 let entry = idx_vals
                     .iter()
@@ -317,6 +332,163 @@ pub(crate) fn backfill_index(
         }
     }
     txn.commit()
+}
+
+/// `ADMIN RECOVER INDEX table index`: re-add index entries that are missing
+/// from the storage layer. Returns TiDB's `(ADDED_COUNT, SCAN_COUNT)` pair —
+/// the number of entries written and the number of table rows scanned.
+pub fn recover_index(
+    storage: &dyn Storage,
+    info: &TableInfo,
+    index: &IndexInfo,
+) -> Result<(i64, i64)> {
+    let mut added = 0i64;
+    let mut scanned = 0i64;
+    let mut txn = storage.begin()?;
+    for physical_id in info.physical_ids() {
+        let start = gen_table_record_prefix(physical_id);
+        let end = next_prefix(start.as_bytes());
+        let pairs = txn.scan(start.as_bytes(), &end)?;
+        for (key, raw) in pairs {
+            let handle = decode_handle_from_row_key(&key)?;
+            let decoded = decode_row(&raw, &info.col_field_types());
+            let values: Vec<Datum> = info
+                .columns
+                .iter()
+                .map(|col| {
+                    decoded
+                        .iter()
+                        .find(|(id, _)| *id == col.id)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Datum::Null)
+                })
+                .collect();
+            scanned += 1;
+            // Partial index: only rows satisfying the predicate are indexed.
+            if let Some(text) = &index.where_clause {
+                let names: Vec<String> = info
+                    .columns
+                    .iter()
+                    .map(|col| col.name.o().to_string())
+                    .collect();
+                if !sealdb_expression::eval_where_text(text, &names, &values) {
+                    continue;
+                }
+            }
+            let idx_vals: Vec<Datum> = index
+                .columns
+                .iter()
+                .map(|col| {
+                    values
+                        .get(col.offset as usize)
+                        .cloned()
+                        .unwrap_or(Datum::Null)
+                })
+                .collect();
+            let ikey = encode_index_key_collated(
+                physical_id,
+                index.id,
+                &idx_vals,
+                handle,
+                index.unique,
+                &info.index_collations(index),
+            );
+            // An entry already in place (including a unique key held by another
+            // row) is left untouched; recovery only fills the gaps.
+            if txn.get(ikey.as_bytes())?.is_some() {
+                continue;
+            }
+            txn.set(
+                ikey.as_bytes(),
+                encode_row_key_with_handle(physical_id, handle).as_bytes(),
+            )?;
+            added += 1;
+        }
+    }
+    txn.commit()?;
+    Ok((added, scanned))
+}
+
+/// `ADMIN CHECK INDEX <t> <idx> (lo, hi), …`: TiDB reports the rows whose row
+/// handle falls in one of the half-open `[lo, hi)` ranges, so a mismatch found
+/// by the check can be inspected. Output columns are the index columns followed
+/// by the handle, ordered by index key.
+pub fn check_index_ranges(
+    storage: &dyn Storage,
+    info: &TableInfo,
+    index: &IndexInfo,
+    ranges: &[(i64, i64)],
+) -> Result<Vec<Vec<Datum>>> {
+    fn cmp_key(left: &Datum, right: &Datum) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (left, right) {
+            (Datum::Null, Datum::Null) => Ordering::Equal,
+            (Datum::Null, _) => Ordering::Less,
+            (_, Datum::Null) => Ordering::Greater,
+            (Datum::I64(a), Datum::I64(b)) => a.cmp(b),
+            (Datum::U64(a), Datum::U64(b)) => a.cmp(b),
+            (Datum::I64(a), Datum::U64(b)) => (*a as i128).cmp(&(*b as i128)),
+            (Datum::U64(a), Datum::I64(b)) => (*a as i128).cmp(&(*b as i128)),
+            (a, b) => a.display().cmp(&b.display()),
+        }
+    }
+    let column_names: Vec<String> = info
+        .columns
+        .iter()
+        .map(|col| col.name.o().to_string())
+        .collect();
+    let mut rows = Vec::new();
+    let mut txn = storage.begin()?;
+    for physical_id in info.physical_ids() {
+        let start = gen_table_record_prefix(physical_id);
+        let end = next_prefix(start.as_bytes());
+        for (key, raw) in txn.scan(start.as_bytes(), &end)? {
+            let Ok(handle) = decode_handle_from_row_key(&key) else {
+                continue;
+            };
+            if !ranges.iter().any(|(lo, hi)| handle >= *lo && handle < *hi) {
+                continue;
+            }
+            let decoded = decode_row(&raw, &info.col_field_types());
+            let values: Vec<Datum> = info
+                .columns
+                .iter()
+                .map(|col| {
+                    decoded
+                        .iter()
+                        .find(|(id, _)| *id == col.id)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Datum::Null)
+                })
+                .collect();
+            // Partial indexes only hold the rows that satisfy their predicate.
+            if let Some(text) = &index.where_clause
+                && !sealdb_expression::eval_where_text(text, &column_names, &values)
+            {
+                continue;
+            }
+            let mut row: Vec<Datum> = index
+                .columns
+                .iter()
+                .map(|col| {
+                    values
+                        .get(col.offset as usize)
+                        .cloned()
+                        .unwrap_or(Datum::Null)
+                })
+                .collect();
+            row.push(Datum::I64(handle));
+            rows.push(row);
+        }
+    }
+    rows.sort_by(|left, right| {
+        left.iter()
+            .zip(right.iter())
+            .map(|(a, b)| cmp_key(a, b))
+            .find(|ordering| *ordering != std::cmp::Ordering::Equal)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(rows)
 }
 
 pub(crate) fn drop_index_keys(storage: &dyn Storage, info: &TableInfo, idx_id: i64) -> Result<()> {

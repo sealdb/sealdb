@@ -82,6 +82,95 @@ impl Executor for UpdateExec {
 }
 
 impl UpdateExec {
+    /// `mysql.password_history` is a virtual table served from the privilege
+    /// manager, so its `UPDATE` (used by password-policy tests to age rows)
+    /// rewrites the manager's copy instead of table storage.
+    fn is_password_history_update(&self) -> bool {
+        let schema = self
+            .stmt
+            .table
+            .schema
+            .as_deref()
+            .filter(|schema| !schema.is_empty())
+            .unwrap_or(&self.current_db);
+        schema.eq_ignore_ascii_case("mysql")
+            && self
+                .stmt
+                .table
+                .resolve_name()
+                .eq_ignore_ascii_case("password_history")
+    }
+
+    fn update_password_history(&mut self, info: &TableInfo) -> Result<()> {
+        use sealdb_types::{Time, TimeType};
+        let col_names = col_names(info);
+        let mut assignments = self.stmt.list.clone();
+        for item in &mut assignments {
+            if item
+                .table
+                .as_deref()
+                .is_some_and(|table| table.eq_ignore_ascii_case(&self.stmt.table.name))
+            {
+                item.table = None;
+            }
+        }
+        let mut matched: Vec<(Vec<Datum>, i64, i64)> = Vec::new();
+        for row in self.domain.privilege().password_history_rows() {
+            let mut ts = Time::from_unix_secs(
+                row.timestamp_micros.div_euclid(1_000_000),
+                TimeType::Timestamp,
+            );
+            ts.micro = row.timestamp_micros.rem_euclid(1_000_000) as u32;
+            ts.fsp = 6;
+            let values = vec![
+                Datum::Bytes(row.host.clone().into_bytes()),
+                Datum::Bytes(row.user.clone().into_bytes()),
+                Datum::Time(ts),
+                Datum::Bytes(row.password.clone().into_bytes()),
+            ];
+            if let Some(filter) = &self.stmt.selection
+                && !eval_filter(filter, &col_names, &values)?
+            {
+                continue;
+            }
+            matched.push((values, row.timestamp_micros, 0));
+        }
+        sort_rows_by(&mut matched, &self.stmt.order_by, &col_names, |row| &row.0);
+        if let Some(limit) = self.stmt.limit {
+            matched.truncate(limit as usize);
+        }
+        let affected = matched.len() as u64;
+        for (values, old_micros, _) in matched {
+            let mut new_values = values.clone();
+            apply_assignments(
+                &assignments,
+                &col_names,
+                &values,
+                col_names.len(),
+                Some(&mut new_values),
+                None,
+            )?;
+            cast_assigned_values(&assignments, info, &col_names, &mut new_values)?;
+            let Datum::Time(new_ts) = &new_values[2] else {
+                continue;
+            };
+            let new_micros = new_ts.to_unix_micros();
+            if new_micros == old_micros {
+                continue;
+            }
+            let host = String::from_utf8_lossy(&values[0].as_bytes()).into_owned();
+            let user = String::from_utf8_lossy(&values[1].as_bytes()).into_owned();
+            self.domain
+                .privilege()
+                .set_password_history_timestamp(&user, &host, old_micros, new_micros);
+        }
+        crate::internal::note_dml_affected(affected);
+        crate::internal::set_dml_info(format!(
+            "Rows matched: {affected}  Changed: {affected}  Warnings: {}",
+            sealdb_expression::warnings_len()
+        ));
+        Ok(())
+    }
     fn open_stmt(&mut self) -> Result<()> {
         if let Some(join) = self.stmt.join.clone() {
             if self.stmt.additional_joins.is_empty() {
@@ -104,6 +193,9 @@ impl UpdateExec {
             ));
         }
         let info = load_table(&self.domain, &self.current_db, &self.stmt.table)?;
+        if self.is_password_history_update() {
+            return self.update_password_history(&info);
+        }
         // `SET _tidb_rowid = …`: TiDB only accepts an explicit row handle on a
         // heap table with `tidb_opt_write_row_id`, otherwise 1105 (and a
         // single-integer PK table has no such column, 1054).
@@ -284,8 +376,20 @@ impl UpdateExec {
             .map(|((scanned, new_values), _)| (scanned, new_values))
             .collect();
         let changed = writes.len() as u64;
-        self.txn
-            .with_txn(|txn| apply_row_updates(txn, &info, &writes))?;
+        self.txn.with_txn(|txn| {
+            apply_row_updates(txn, &info, &writes)?;
+            for (scanned, new_values) in &writes {
+                apply_update_cascades(
+                    txn,
+                    &self.domain,
+                    &self.current_db,
+                    &info,
+                    &scanned.values,
+                    new_values,
+                )?;
+            }
+            Ok(())
+        })?;
         crate::internal::note_dml_affected(changed);
         crate::internal::set_dml_info(format!(
             "Rows matched: {matched_count}  Changed: {changed}  Warnings: {}",
@@ -849,8 +953,9 @@ pub(crate) fn apply_assignments(
 /// `(db, child table, fk, referenced table)` that blocks this UPDATE.
 type FkViolation = (i32, String);
 
-/// Body TiDB renders for both 1451 and 1452 (`… constaint fails (...)`).
-fn fk_failure_body(
+/// Body TiDB renders for both 1451 and 1452 (`… constaint fails (...)`),
+/// including the `ON DELETE` / `ON UPDATE` actions `FKInfo.String` appends.
+pub(crate) fn fk_failure_body(
     db: &str,
     child: &TableInfo,
     fk: &sealdb_meta::ForeignKeyInfo,
@@ -862,8 +967,15 @@ fn fk_failure_body(
     } else {
         fk.ref_cols.join("`, `")
     };
+    let mut actions = String::new();
+    if fk.on_delete_cascade {
+        actions.push_str(" ON DELETE CASCADE");
+    }
+    if fk.on_update_cascade {
+        actions.push_str(" ON UPDATE CASCADE");
+    }
     format!(
-        "(`{db}`.`{}`, CONSTRAINT `{}` FOREIGN KEY (`{columns}`) REFERENCES `{parent}` (`{refs}`))",
+        "(`{db}`.`{}`, CONSTRAINT `{}` FOREIGN KEY (`{columns}`) REFERENCES `{parent}` (`{refs}`){actions})",
         child.name.o(),
         fk.name
     )
@@ -933,6 +1045,88 @@ pub(crate) fn fk_child_violation(
         };
         let physical = sealdb_planner::core::prune_partitions(&parent, None);
         let parent_rows = scan_table(txn, &parent, RowLock::None, LockWait::Block, &physical)?;
+        let exists = parent_rows.iter().any(|row| {
+            ref_idx.iter().zip(&key_values).all(|(&i, value)| {
+                !row.values[i].is_null()
+                    && (row.values[i] == *value
+                        || sealdb_expression::datum_sql_eq(&row.values[i], value).unwrap_or(false))
+            })
+        });
+        if !exists {
+            return Ok(Some((
+                ERR_NO_REFERENCED_ROW_2,
+                format!(
+                    "Cannot add or update a child row: a foreign key constraint fails {}",
+                    fk_failure_body(db, info, fk, parent.name.o())
+                ),
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Child-side FK check for a freshly inserted row (`1452`): every local
+/// foreign key whose values are all non-NULL must find a parent row. Unlike
+/// an UPDATE, the cascading action does not matter here.
+pub(crate) fn fk_insert_violation(
+    domain: &Domain,
+    txn: &mut dyn sealdb_kv::Transaction,
+    db: &str,
+    info: &TableInfo,
+    values: &[Datum],
+) -> Result<Option<FkViolation>> {
+    if !sealdb_planner::core::foreign_key_checks() {
+        return Ok(None);
+    }
+    let names = col_names(info);
+    for fk in &info.foreign_keys {
+        let Some(local): Option<Vec<usize>> = fk
+            .cols
+            .iter()
+            .map(|c| names.iter().position(|n| n.eq_ignore_ascii_case(c)))
+            .collect()
+        else {
+            continue;
+        };
+        let key_values: Vec<Datum> = local.iter().map(|&i| values[i].clone()).collect();
+        if key_values.iter().any(Datum::is_null) {
+            continue;
+        }
+        let parent_schema = fk.ref_schema.as_deref().unwrap_or(db);
+        let Some(parent) = domain
+            .infoschema()
+            .table_by_name(parent_schema, &fk.ref_table)
+            .cloned()
+        else {
+            continue;
+        };
+        let parent_names = col_names(&parent);
+        let ref_cols: Vec<String> = if fk.ref_cols.is_empty() {
+            parent
+                .indices
+                .iter()
+                .find(|idx| idx.primary)
+                .map(|idx| idx.columns.iter().map(|c| c.name.o().to_string()).collect())
+                .unwrap_or_default()
+        } else {
+            fk.ref_cols.clone()
+        };
+        let Some(ref_idx): Option<Vec<usize>> = ref_cols
+            .iter()
+            .map(|c| parent_names.iter().position(|n| n.eq_ignore_ascii_case(c)))
+            .collect()
+        else {
+            continue;
+        };
+        let physical = sealdb_planner::core::prune_partitions(&parent, None);
+        let parent_rows = crate::table_reader::scan_table_in_txn(
+            txn,
+            &parent,
+            RowLock::None,
+            LockWait::Block,
+            &physical,
+            None,
+        )?;
         let exists = parent_rows.iter().any(|row| {
             ref_idx.iter().zip(&key_values).all(|(&i, value)| {
                 !row.values[i].is_null()
@@ -1525,6 +1719,14 @@ pub(crate) fn enforce_truncating_comparisons(
     };
     let mut messages = Vec::new();
     collect_truncating(info, filter, &mut messages);
+    // TiDB only reports the 1292 in strict DML: a non-strict session compares
+    // the truncated value silently (`update sc set a = 4 where a > '1x'`).
+    if !ignore
+        && !(sealdb_expression::sql_mode_flag("STRICT_TRANS_TABLES")
+            || sealdb_expression::sql_mode_flag("STRICT_ALL_TABLES"))
+    {
+        return Ok(());
+    }
     for message in messages {
         if ignore {
             sealdb_expression::note_warning(
@@ -1640,6 +1842,160 @@ fn has_truncating_numeric_prefix(text: &str) -> bool {
 
 /// Rewrite one row: drop old index keys, delete the old record if the handle or
 /// partition moved, then put the new row and unique/secondary indexes.
+/// Child tables whose foreign key references `parent` with `cascade`, with the
+/// parent's schema resolved the way the FK was declared.
+fn cascade_targets(
+    domain: &Domain,
+    parent_db: &str,
+    parent: &TableInfo,
+    on_update: bool,
+) -> Vec<(TableInfo, sealdb_meta::ForeignKeyInfo)> {
+    let is = domain.infoschema();
+    let mut out = Vec::new();
+    for schema in is.all_schemas() {
+        let db = schema.name.o().to_string();
+        for child in is.schema_tables(&db) {
+            for fk in &child.foreign_keys {
+                if fk.ref_table.eq_ignore_ascii_case(parent.name.o())
+                    && fk
+                        .ref_schema
+                        .as_deref()
+                        .unwrap_or(&db)
+                        .eq_ignore_ascii_case(parent_db)
+                    && (if on_update {
+                        fk.on_update_cascade
+                    } else {
+                        fk.on_delete_cascade
+                    })
+                {
+                    out.push((child.clone(), fk.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Columns of `table` named by `cols`, in order.
+fn column_positions(table: &TableInfo, cols: &[String]) -> Option<Vec<usize>> {
+    let names = col_names(table);
+    cols.iter()
+        .map(|c| names.iter().position(|n| n.eq_ignore_ascii_case(c)))
+        .collect()
+}
+
+/// Referenced columns of `fk` on the parent table (PRIMARY KEY when omitted).
+fn fk_parent_columns(fk: &sealdb_meta::ForeignKeyInfo, parent: &TableInfo) -> Vec<String> {
+    if !fk.ref_cols.is_empty() {
+        return fk.ref_cols.clone();
+    }
+    parent
+        .indices
+        .iter()
+        .find(|idx| idx.primary)
+        .map(|idx| idx.columns.iter().map(|c| c.name.o().to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn key_matches(row_values: &[Datum], columns: &[usize], key: &[Datum]) -> bool {
+    columns.iter().zip(key).all(|(&i, want)| {
+        !row_values[i].is_null()
+            && (row_values[i] == *want
+                || sealdb_expression::datum_sql_eq(&row_values[i], want).unwrap_or(false))
+    })
+}
+
+/// `ON UPDATE CASCADE`: child rows that referenced the parent's old key follow
+/// it to the new value.
+pub(crate) fn apply_update_cascades(
+    txn: &mut dyn Transaction,
+    domain: &Domain,
+    parent_db: &str,
+    parent: &TableInfo,
+    old_values: &[Datum],
+    new_values: &[Datum],
+) -> Result<()> {
+    if !sealdb_planner::core::foreign_key_checks() {
+        return Ok(());
+    }
+    for (child, fk) in cascade_targets(domain, parent_db, parent, true) {
+        let ref_cols = fk_parent_columns(&fk, parent);
+        let (Some(parent_idx), Some(child_idx)) = (
+            column_positions(parent, &ref_cols),
+            column_positions(&child, &fk.cols),
+        ) else {
+            continue;
+        };
+        let old_key: Vec<Datum> = parent_idx.iter().map(|&i| old_values[i].clone()).collect();
+        let new_key: Vec<Datum> = parent_idx.iter().map(|&i| new_values[i].clone()).collect();
+        if old_key == new_key || old_key.iter().any(Datum::is_null) {
+            continue;
+        }
+        let physical = sealdb_planner::core::prune_partitions(&child, None);
+        let rows = crate::table_reader::scan_table_in_txn(
+            txn,
+            &child,
+            RowLock::None,
+            LockWait::Block,
+            &physical,
+            None,
+        )?;
+        for row in rows {
+            if !key_matches(&row.values, &child_idx, &old_key) {
+                continue;
+            }
+            let mut updated = row.values.clone();
+            for (&i, value) in child_idx.iter().zip(new_key.iter()) {
+                updated[i] = value.clone();
+            }
+            apply_row_update(txn, &child, &row, updated)?;
+        }
+    }
+    Ok(())
+}
+
+/// `ON DELETE CASCADE`: deleting a parent row deletes the child rows that
+/// reference it.
+pub(crate) fn apply_delete_cascades(
+    txn: &mut dyn Transaction,
+    domain: &Domain,
+    parent_db: &str,
+    parent: &TableInfo,
+    values: &[Datum],
+) -> Result<()> {
+    if !sealdb_planner::core::foreign_key_checks() {
+        return Ok(());
+    }
+    for (child, fk) in cascade_targets(domain, parent_db, parent, false) {
+        let ref_cols = fk_parent_columns(&fk, parent);
+        let (Some(parent_idx), Some(child_idx)) = (
+            column_positions(parent, &ref_cols),
+            column_positions(&child, &fk.cols),
+        ) else {
+            continue;
+        };
+        let key: Vec<Datum> = parent_idx.iter().map(|&i| values[i].clone()).collect();
+        if key.iter().any(Datum::is_null) {
+            continue;
+        }
+        let physical = sealdb_planner::core::prune_partitions(&child, None);
+        let rows = crate::table_reader::scan_table_in_txn(
+            txn,
+            &child,
+            RowLock::None,
+            LockWait::Block,
+            &physical,
+            None,
+        )?;
+        for row in rows {
+            if key_matches(&row.values, &child_idx, &key) {
+                crate::delete::apply_row_delete(txn, &child, &row)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn apply_row_update(
     txn: &mut dyn Transaction,
     info: &TableInfo,

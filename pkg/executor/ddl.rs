@@ -13,6 +13,7 @@ pub struct DDLExec {
     stmt: Statement,
     current_db: String,
     persist: bool,
+    fk_checks: bool,
     done: bool,
 }
 
@@ -22,6 +23,7 @@ impl DDLExec {
         stmt: Statement,
         current_db: impl Into<String>,
         persist: bool,
+        fk_checks: bool,
     ) -> Self {
         // `CREATE VIEW` without an explicit definer stores the connection user
         // (`root@%`), like TiDB; `SHOW CREATE VIEW` prints it verbatim.
@@ -41,6 +43,7 @@ impl DDLExec {
             stmt,
             current_db: current_db.into(),
             persist,
+            fk_checks,
             done: false,
         }
     }
@@ -49,7 +52,7 @@ impl DDLExec {
 impl Executor for DDLExec {
     fn open(&mut self) -> Result<()> {
         self.domain
-            .execute_ddl(&self.stmt, &self.current_db, self.persist)
+            .execute_ddl(&self.stmt, &self.current_db, self.persist, self.fk_checks)
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {

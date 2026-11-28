@@ -171,6 +171,19 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
             "Table_priv",
             "Column_priv",
         ])),
+        // `mysql.columns_priv` / `mysql.global_grants` are backed by the
+        // privilege manager as well (one row per column grant / dynamic
+        // privilege).
+        "columns_priv" => Ok(empty(&[
+            "Host",
+            "DB",
+            "User",
+            "Table_name",
+            "Column_name",
+            "Timestamp",
+            "Column_priv",
+        ])),
+        "global_grants" => Ok(empty(&["USER", "HOST", "PRIV", "WITH_GRANT_OPTION"])),
         other => Err(Error::new(
             ERR_NO_SUCH_TABLE,
             format!("Table 'information_schema.{other}' doesn't exist"),

@@ -87,9 +87,28 @@ pub fn encode_index_datum(buf: &mut Vec<u8>, value: &Datum) {
 }
 
 pub fn encode_index_values(values: &[Datum]) -> Vec<u8> {
+    encode_index_values_collated(values, &[])
+}
+
+/// Encode index columns, replacing string values by their collation sort key
+/// when `modes[i]` is set (TiDB `codec.EncodeKey` with `collator.Key`).
+pub fn encode_index_values_collated(
+    values: &[Datum],
+    modes: &[Option<sealdb_util::collate::CollateMode>],
+) -> Vec<u8> {
     let mut buf = Vec::new();
-    for value in values {
-        encode_index_datum(&mut buf, value);
+    for (i, value) in values.iter().enumerate() {
+        match (value, modes.get(i).copied().flatten()) {
+            (Datum::Bytes(bytes), Some(mode)) => match sealdb_util::collate::key_bytes(mode, bytes)
+            {
+                Some(key) => {
+                    buf.push(3);
+                    encode_bytes(&mut buf, &key);
+                }
+                None => encode_index_datum(&mut buf, value),
+            },
+            _ => encode_index_datum(&mut buf, value),
+        }
     }
     buf
 }
@@ -102,7 +121,19 @@ pub fn encode_index_key(
     handle: i64,
     unique: bool,
 ) -> Key {
-    let mut encoded = encode_index_values(values);
+    encode_index_key_collated(table_id, idx_id, values, handle, unique, &[])
+}
+
+/// `encode_index_key` with per-column collation sort keys.
+pub fn encode_index_key_collated(
+    table_id: i64,
+    idx_id: i64,
+    values: &[Datum],
+    handle: i64,
+    unique: bool,
+    modes: &[Option<sealdb_util::collate::CollateMode>],
+) -> Key {
+    let mut encoded = encode_index_values_collated(values, modes);
     // Unique indexes allow repeated NULLs (SQL semantics), so those entries
     // keep the handle suffix and never collide with each other.
     if !unique || values.iter().any(|v| v.is_null()) {
@@ -113,6 +144,20 @@ pub fn encode_index_key(
 
 pub fn encode_index_seek_prefix(table_id: i64, idx_id: i64, values: &[Datum]) -> Key {
     encode_index_seek_key(table_id, idx_id, &encode_index_values(values))
+}
+
+/// `encode_index_seek_prefix` with per-column collation sort keys.
+pub fn encode_index_seek_prefix_collated(
+    table_id: i64,
+    idx_id: i64,
+    values: &[Datum],
+    modes: &[Option<sealdb_util::collate::CollateMode>],
+) -> Key {
+    encode_index_seek_key(
+        table_id,
+        idx_id,
+        &encode_index_values_collated(values, modes),
+    )
 }
 
 pub fn decode_handle_from_index_key(key: &[u8]) -> Result<i64> {

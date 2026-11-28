@@ -38,6 +38,9 @@ pub struct ColumnInfo {
     /// when the column is not an auto-random column).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_random: Option<u32>,
+    /// TiDB `AUTO_RANDOM(n, m)` range bits (`TableInfo.AutoRandomRangeBits`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_random_range: Option<u32>,
     /// TiDB `ColumnInfo.Hidden`: an internal column backing an expression index
     /// (`_V$_idx_0`). Hidden columns are stored in the row but never shown to
     /// clients (`SELECT *`, `SHOW CREATE TABLE`, `information_schema`).
@@ -63,6 +66,7 @@ impl ColumnInfo {
             origin_default_expr: None,
             auto_increment: false,
             auto_random: None,
+            auto_random_range: None,
             hidden: false,
             comment: None,
         }

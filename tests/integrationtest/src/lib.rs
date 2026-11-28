@@ -808,11 +808,23 @@ fn new_session(storage: Arc<dyn sealdb_kv::Storage>) -> Session {
 /// - `tidb_enable_clustered_index = 'int_only'`: a non-integer PRIMARY KEY
 ///   (`binary(2)`) stays a secondary unique index, so `EXPLAIN` prints
 ///   `table:t, index:PRIMARY(a)` instead of `clustered index:PRIMARY(a)`.
+/// - `collation_connection = utf8mb4_general_ci`: `go-sql-driver/mysql` (what
+///   mysql-tester connects with) sends `SET NAMES utf8mb4 COLLATE
+///   utf8mb4_general_ci` during the handshake, and the goldens encode it:
+///   string literals take that collation
+///   (`COLLATION(ifnull(concat(NULL),'~'))` is `utf8mb4_general_ci`) and
+///   `SHOW CREATE VIEW` records it for the session.
 fn init_driver_session(session: &Session) {
     if let Err(err) = session.execute_stmt("SET @@session.tidb_enable_clustered_index = 'int_only'")
     {
         eprintln!(
             "[warn] session default tidb_enable_clustered_index: {} ({})",
+            err.message, err.code
+        );
+    }
+    if let Err(err) = session.execute_stmt("SET NAMES utf8mb4 COLLATE utf8mb4_general_ci") {
+        eprintln!(
+            "[warn] session default connection collation: {} ({})",
             err.message, err.code
         );
     }

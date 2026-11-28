@@ -27,6 +27,11 @@ pub struct FieldType {
     /// `ENUM`/`SET` members in declaration order (TiDB `FieldType.Elems`).
     #[serde(rename = "Elems", default, skip_serializing_if = "Option::is_none")]
     pub elems: Option<Vec<String>>,
+    /// Per-member `ElemIsBinaryLit` (TiDB `FieldType.elemIsBinaryLit`): members
+    /// still needing the column-charset → UTF-8 rewrite. Transient — `ddl`
+    /// clears it while building the column (`decodeEnumSetBinaryLiteralToUTF8`).
+    #[serde(skip)]
+    pub elem_is_binary_lit: Vec<bool>,
     #[serde(skip)]
     pub unsigned: bool,
 }
@@ -41,6 +46,7 @@ impl Default for FieldType {
             charset: "utf8mb4".to_string(),
             collate: "utf8mb4_bin".to_string(),
             elems: None,
+            elem_is_binary_lit: Vec::new(),
             unsigned: false,
         }
     }

@@ -17,4 +17,6 @@ pub mod view;
 
 pub use create_table::build_table_info;
 pub use ddl::execute_ddl;
+pub use index::check_index_ranges;
+pub use index::recover_index;
 pub use table::{clear_table_keys, clear_table_keys_in_txn};

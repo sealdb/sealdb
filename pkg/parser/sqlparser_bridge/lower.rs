@@ -27,13 +27,14 @@ use crate::ast::misc::{
     DropRoleStmt, DropStatsStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt,
     FlashBackTableStmt, FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel,
     GrantLevelType, GrantRoleStmt, GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt,
-    LoadStatsStmt, LockStatsStmt, LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt,
-    PrivElem, PrivilegeType, RecommendIndexStmt, RecoverTableStmt, ReleaseSavepointStmt,
-    RenameUserStmt, RepairTableStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt,
-    SetAssignment, SetBindingStmt, SetDefaultRoleStmt, SetPwdStmt, SetResourceGroupStmt,
-    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind,
-    ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt, TableLockItem, TableLockType,
-    TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
+    LoadStatsStmt, LockStatsStmt, LockTablesStmt, OptimizeTableStmt, PasswordExpireOption,
+    PlanReplayerStmt, PrepareStmt, PrivElem, PrivilegeType, RecommendIndexStmt, RecoverTableStmt,
+    ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt, RequireClause, RevokeRoleStmt,
+    RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetBindingStmt, SetDefaultRoleStmt,
+    SetPwdStmt, SetResourceGroupStmt, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope,
+    ShowStmt, ShowStmtKind, ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt,
+    TableLockItem, TableLockType, TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec,
+    UserToUser,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
@@ -79,6 +80,21 @@ thread_local! {
     /// whether the original named GLOBAL.
     static PENDING_DROP_GLOBAL_TEMP: std::cell::RefCell<Vec<bool>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// SQL text captured for select-list naming (`SelectField::orig_text`).
+    /// EXECUTE parses the parameter-bound SQL but TiDB keeps the prepared
+    /// template's `?` markers in projection names; the session supplies the
+    /// unbound text here.
+    static PROJECTION_TEXT_SOURCE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Parse `f` while capturing select-list projection texts from `name_sql`
+/// instead of the parsed SQL.
+pub fn with_projection_text_source<T>(name_sql: &str, f: impl FnOnce() -> T) -> T {
+    let previous = PROJECTION_TEXT_SOURCE.with(|cell| cell.replace(Some(name_sql.to_string())));
+    let out = f();
+    PROJECTION_TEXT_SOURCE.with(|cell| *cell.borrow_mut() = previous);
+    out
 }
 
 /// Take CHECK constraints captured for the next CREATE TABLE.
@@ -118,6 +134,19 @@ pub enum AdminOp {
     UnsetBdr,
     /// `ADMIN SHOW BDR ROLE`
     ShowBdr,
+    /// `ADMIN RECOVER INDEX <table> <index>`: re-add missing index entries.
+    RecoverIndex { table: TableName, index: String },
+    /// `ADMIN CHECK TABLE <table>[, …]`: consistency check (no result rows).
+    CheckTable { tables: Vec<TableName> },
+    /// `ADMIN CHECK INDEX <table> <index> [(lo, hi), …]`: a ranged check
+    /// reports the covered rows.
+    CheckIndex {
+        table: TableName,
+        index: String,
+        ranges: Vec<(i64, i64)>,
+    },
+    /// `ADMIN CHECKSUM TABLE <table>[, …]`.
+    ChecksumTable { tables: Vec<TableName> },
     /// Any other `ADMIN` command (SUPER-gated no-op until implemented).
     Other,
 }
@@ -187,17 +216,217 @@ use sqlparser::ast::{
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 
+/// TiDB's MySQL-compatible syntax error prefix.
+const SYNTAX_ERROR_PREFIX: &str = "You have an error in your SQL syntax; check the manual that \
+     corresponds to your TiDB version for the right syntax to use";
+
+/// Translate a sqlparser failure into the TiDB-shaped syntax error
+/// (`line %d column %d near "%s"`).
+///
+/// TiDB's lexer treats a digit-led word such as `0when` as a single
+/// identifier, so `THEN 0when (c0 > 0) THEN …` parses as a function call and
+/// the error surfaces at the token after the call. sqlparser instead splits
+/// the word and reports the identifier part, so when the reported token is
+/// the letter tail of such a word, advance past the call before reporting.
+fn tidb_parse_error(sql: &str, e: &sqlparser::parser::ParserError) -> Error {
+    let text = e.to_string();
+    if let Some(found) = parser_error_found_token(&text)
+        && let Some(pos) = tidb_error_after_digit_led_call(sql, &found)
+    {
+        return tidb_syntax_error_at(sql, pos);
+    }
+    // `DROP FOREIGN KEY if exists …`: sqlparser accepts `if` as the constraint
+    // name and trips over `exists`, while TiDB rejects the keyword `if` it
+    // cannot use as a name.
+    if let Some(found) = parser_error_found_token(&text)
+        && found.eq_ignore_ascii_case("exists")
+        && let Some(offset) = parser_error_offset(sql, &text)
+        && let Some(keyword) = previous_word_start(sql, offset)
+        && keyword_word(sql, keyword).is_some_and(|word| word.eq_ignore_ascii_case("if"))
+    {
+        return tidb_syntax_error_at(sql, keyword);
+    }
+    Error::new(
+        ERR_PARSE_ERROR,
+        format!("You have an error in your SQL syntax: {text}"),
+    )
+}
+
+/// Byte offset of sqlparser's `at Line: L, Column: C` (1-based) position.
+fn parser_error_offset(sql: &str, text: &str) -> Option<usize> {
+    let (_, position) = text.rsplit_once("at Line: ")?;
+    let (line, column) = position.split_once(',')?;
+    let line: usize = line.trim().parse().ok()?;
+    let column: usize = column.trim().strip_prefix("Column: ")?.parse().ok()?;
+    let mut current_line = 1usize;
+    let mut line_start = 0usize;
+    for (i, ch) in sql.char_indices() {
+        if current_line == line {
+            break;
+        }
+        if ch == '\n' {
+            current_line += 1;
+            line_start = i + 1;
+        }
+    }
+    if current_line != line {
+        return None;
+    }
+    let mut count = 1usize;
+    for (i, _) in sql[line_start..].char_indices() {
+        if count == column {
+            return Some(line_start + i);
+        }
+        count += 1;
+    }
+    None
+}
+
+/// The identifier word starting at `start`.
+fn keyword_word<'a>(sql: &'a str, start: usize) -> Option<&'a str> {
+    let len = sql[start..]
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count();
+    (len > 0).then(|| &sql[start..start + len])
+}
+
+/// Start offset of the word that ends just before `offset` (skipping blanks).
+fn previous_word_start(sql: &str, offset: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut end = offset;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    (start < end).then_some(start)
+}
+
+/// The token sqlparser reported after `found:` (`… found: when at Line: …`).
+fn parser_error_found_token(text: &str) -> Option<String> {
+    let found = text.split_once("found: ")?.1;
+    let found = found
+        .split_once(" at Line: ")
+        .map_or(found, |(token, _)| token);
+    let token = found.trim().trim_matches(|c| c == '\'' || c == '"');
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Offset of the token TiDB would reject after treating a digit-led word as an
+/// identifier (a function call when followed by a parenthesised list).
+fn tidb_error_after_digit_led_call(sql: &str, found: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let lower_found = found.to_ascii_lowercase();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        if !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let word_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let word = &sql[word_start..i];
+        if !word.starts_with(|c: char| c.is_ascii_digit())
+            || !word.chars().any(|c| c.is_ascii_alphabetic())
+            || word.len() <= lower_found.len()
+        {
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if !lower.ends_with(&lower_found) {
+            continue;
+        }
+        let split = word.len() - lower_found.len();
+        if split == 0 || !word.as_bytes()[split - 1].is_ascii_digit() {
+            continue;
+        }
+        // TiDB parses `0when (...)` as a call; the next token is the error.
+        let mut pos = i;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos < bytes.len() && bytes[pos] == b'(' {
+            let close = matching_paren(bytes, pos)?;
+            pos = close + 1;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+        }
+        return (pos < bytes.len()).then_some(pos);
+    }
+    None
+}
+
+/// TiDB `ErrParse` message for the token starting at `pos`: the reported
+/// column is the position just past that token, and `near` is the rest of the
+/// statement from the token.
+fn tidb_syntax_error_at(sql: &str, pos: usize) -> Error {
+    let before = &sql[..pos];
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let token_len = sql[pos..]
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .count()
+        .max(1);
+    // TiDB's reader resets `Col` to 0 on a newline and then increments for the
+    // newline itself, so every line after the first reports one extra column.
+    let column = pos - line_start + token_len + usize::from(line > 1);
+    let near = &sql[pos..];
+    Error::new(
+        ERR_PARSE_ERROR,
+        format!("{SYNTAX_ERROR_PREFIX} line {line} column {column} near \"{near}\" "),
+    )
+}
+
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     crate::parser::reset_derived_update_aliases();
     // Capture before rewrite so projection names keep TiDB `field.Text()` spelling
-    // (spaces around unary ops, `!` not `__sealdb_bang`, etc.).
-    let projection_texts = capture_select_projections(sql);
+    // (spaces around unary ops, `!` not `__sealdb_bang`, etc.). An outer
+    // `with_projection_text_source` overrides it for parameterized EXECUTE
+    // (TiDB names keep the prepared template's `?` markers).
+    let name_sql = PROJECTION_TEXT_SOURCE
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| sql.to_string());
+    let projection_texts = capture_select_projections(&name_sql);
     // `DESCRIBE tbl <literal|garbage>` must be rejected on the original text:
     // the `SHOW COLUMNS` rewrite below would otherwise consume the token.
     reject_describe_column_syntax(sql)?;
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
     // MySQL `SET @v := expr`: sqlparser's SET grammar only knows `=` / `TO`.
     let rewritten = rewrite_set_assign_operator(&rewritten);
+    // MySQL `SET CHARACTER SET <charset>` (no sqlparser grammar).
+    let rewritten = rewrite_set_character_set(&rewritten);
     // TiDB `/*T![clustered_index] clustered */` → keyword before MySQL version
     // comments are expanded (the "T" comment is otherwise an ordinary comment).
     let rewritten = rewrite_tidb_clustered_comment(&rewritten);
@@ -211,6 +440,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // MySQL `ZEROFILL` is not in sqlparser; rewrite to UNSIGNED + marker comment
     // so DDL can set the zerofill flag (EXCHANGE 1736).
     let rewritten = rewrite_zerofill(&rewritten);
+    // MySQL `VARCHAR(10) BINARY`: the column attribute sets the charset's
+    // `_bin` collation; sqlparser has no such option, so carry it in a marker.
+    let rewritten = rewrite_binary_column_attribute(&rewritten);
     // TiDB `REAL(M,D)` is `DOUBLE(M,D)`; sqlparser's `REAL` takes no precision.
     let rewritten = rewrite_real_type_precision(&rewritten);
     // MySQL binary literal `0b101`: sqlparser only knows `0x…`, so spell the
@@ -218,6 +450,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_mysql_bit_literals(&rewritten);
     // MySQL column `CHARSET gbk`: sqlparser's column option is `CHARACTER SET`.
     let rewritten = rewrite_mysql_column_charset(&rewritten);
+    // `CHARSET(expr)` is a reserved keyword in sqlparser, so spell the function
+    // with an internal marker name.
+    let rewritten = rewrite_charset_function(&rewritten);
     // TiDB `db.table.column` column names in CREATE TABLE / ALTER … MODIFY.
     let rewritten = rewrite_qualified_column_names(&rewritten);
     // `ENUM("a", "b")` / `SET("a", "b")`: double-quoted members are MySQL
@@ -296,6 +531,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_create_database_placement(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let (rewritten, alter_parts) = extract_alter_partitions(&rewritten)?;
+    // sqlparser rejects `GRANT … IDENTIFIED BY|REQUIRE …`; strip it before the
+    // role/grant text splitter would consume the statement up to the grantees.
+    let (rewritten, grant_suffix_ops) = extract_grant_auth_suffix(&rewritten)?;
     // sqlparser rejects MySQL `GRANT/REVOKE role TO/FROM user` (no ON).
     let (rewritten, role_ops) = extract_role_grants(&rewritten)?;
     // sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`.
@@ -326,12 +564,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_as_of_timestamp(&rewritten);
     // MySQL 8 / TiDB `x MEMBER OF (json_array)` — no sqlparser grammar.
     let rewritten = rewrite_member_of(&rewritten);
-    let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
-        Error::new(
-            ERR_PARSE_ERROR,
-            format!("You have an error in your SQL syntax: {e}"),
-        )
-    })?;
+    let stmts =
+        Parser::parse_sql(&dialect(), &rewritten).map_err(|e| tidb_parse_error(&rewritten, &e))?;
     let mut flags = pessimistic_flags.into_iter();
     let mut ttls = ttls.into_iter();
     let mut create_affinities = create_affinities.into_iter();
@@ -342,6 +576,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut prepares = prepares.into_iter();
     let mut role_ops = role_ops.into_iter();
     let mut user_ops = user_ops.into_iter();
+    let mut grant_suffix_ops = grant_suffix_ops.into_iter();
     let mut analyze_extras = analyze_extras.into_iter();
     let mut binding_ops = binding_ops.into_iter();
     let mut misc_ops = misc_ops.into_iter();
@@ -411,6 +646,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                         .specs
                         .push(AlterTableSpec::UnsupportedPartitionOp(msg));
                 }
+                AlterPartOp::Validation { with } => {
+                    alter.specs.push(AlterTableSpec::Validation { with });
+                }
                 AlterPartOp::FirstPartition(bound) => {
                     alter.specs.push(AlterTableSpec::FirstPartition { bound });
                 }
@@ -453,6 +691,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                 AlterPartOp::Options(options) => {
                     for (name, value) in options {
                         validate_table_option(&name)?;
+                        validate_alter_charset_option(&name, &value)?;
                         alter
                             .specs
                             .push(AlterTableSpec::TableOption { name, value });
@@ -526,6 +765,12 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         {
             lowered = op;
         }
+        if let Statement::Grant(grant) = &mut lowered
+            && let Some(Some((auth, require, _))) = grant_suffix_ops.next()
+        {
+            grant.auth = auth;
+            grant.require = require;
+        }
         if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_binding__"))
             && let Some(op) = binding_ops.next().flatten()
         {
@@ -553,7 +798,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         if let Statement::CreateView(view) = &mut lowered {
             // CREATE VIEW AS SELECT … — capture the view body's select-list
             // texts so unnamed window/expression columns keep TiDB names.
-            let body_texts = capture_select_projections_after_as(sql);
+            let body_texts = capture_select_projections_after_as(&name_sql);
             attach_projection_texts(&mut view.select, body_texts.as_ref());
         }
         out.push(lowered);
@@ -1834,6 +2079,51 @@ pub const ZEROFILL_COMMENT_MARKER: &str = "__sealdb_zerofill__";
 /// `INT ZEROFILL` → `INT UNSIGNED COMMENT '__sealdb_zerofill__'` (ZEROFILL
 /// implies UNSIGNED in MySQL). When UNSIGNED is already present, only the
 /// marker comment is injected.
+/// MySQL `CHARSET(expr)` (a string function, not the `CHARACTER SET` column
+/// option): sqlparser only accepts an identifier before `(` and `CHARSET` is a
+/// reserved keyword, so rename the call to [`SEALDB_CHARSET_FN`].
+fn rewrite_charset_function(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            if b == b'\\' && q != b'`' {
+                if let Some(ch) = sql[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(b, b'\'' | b'"' | b'`') {
+            quote = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if keyword_at(bytes, i, "CHARSET") {
+            let next = skip_ws(bytes, i + "CHARSET".len());
+            if next < bytes.len() && bytes[next] == b'(' {
+                out.push_str(SEALDB_CHARSET_FN);
+                i += "CHARSET".len();
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn rewrite_zerofill(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 32);
@@ -1881,6 +2171,107 @@ fn rewrite_zerofill(sql: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// Marker comment carrying the MySQL `BINARY` column attribute through
+/// sqlparser (stripped in DDL).
+pub const BINARY_ATTR_COMMENT_MARKER: &str = "__sealdb_binary_attr__";
+
+/// `VARCHAR(10) BINARY`: the MySQL `BINARY` column attribute is not in
+/// sqlparser's column grammar. Rewrite it into the marker comment; DDL then
+/// switches the column to the `_bin` collation of its charset
+/// (TiDB `OverwriteCollationWithBinaryFlag`). Only the attribute spelling is
+/// touched: `BINARY` as a type (`BINARY(1)`), `CHARSET binary`, `COLLATE
+/// binary`, `CAST(… AS BINARY)` and the unary operator all stay.
+fn rewrite_binary_column_attribute(sql: &str) -> String {
+    let trimmed = sql.trim_start();
+    let bytes_all = trimmed.as_bytes();
+    // The attribute only exists inside CREATE TABLE column definitions.
+    if !keyword_at(bytes_all, 0, "CREATE") {
+        return sql.to_string();
+    }
+    let Some(table_kw) = find_keyword(trimmed, "TABLE") else {
+        return sql.to_string();
+    };
+    let Some(body_start) = trimmed[table_kw..].find('(') else {
+        return sql.to_string();
+    };
+    let body_start = table_kw + body_start;
+    let bytes = sql.as_bytes();
+    // Account for the trim offset between `trimmed` and `sql`.
+    let offset = sql.len() - trimmed.len();
+    let body_start = body_start + offset;
+    let mut out = String::with_capacity(sql.len() + 16);
+    out.push_str(&sql[..body_start]);
+    let mut i = body_start;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            if b == b'\\' && q != b'`' {
+                if let Some(ch) = sql[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(b, b'\'' | b'"' | b'`') {
+            quote = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if keyword_at(bytes, i, "BINARY") {
+            let prev = out.trim_end().as_bytes().last().copied();
+            let next = skip_ws(bytes, i + "BINARY".len());
+            let next_byte = bytes.get(next).copied();
+            // `varchar(10) binary` is the attribute; `a binary(1)` is a type.
+            if prev == Some(b')') && next_byte != Some(b'(') {
+                out.push_str(&format!("COMMENT '{BINARY_ATTR_COMMENT_MARKER}'"));
+                i += "BINARY".len();
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Find `keyword` outside quotes, returning its byte offset.
+fn find_keyword(sql: &str, keyword: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' && q != b'`' {
+                i += 1;
+            } else if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(b, b'\'' | b'"' | b'`') {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if keyword_at(bytes, i, keyword) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// TiDB `REAL(M,D)` behaves like `DOUBLE(M,D)`, but sqlparser's `REAL` takes
@@ -2204,6 +2595,13 @@ fn rewrite_bit_literal_members(list: &str) -> String {
     out
 }
 
+/// Leading marker of an ENUM/SET member rewritten from a binary literal
+/// (`0xBAEC`, `b'101'`). The member's quoted literal holds the raw bytes as
+/// Latin-1 characters; `ddl` decodes them from the column charset to UTF-8
+/// (TiDB `decodeEnumSetBinaryLiteralToUTF8`) and drops the marker. The marker
+/// is private-use and cannot collide with a byte (all bytes are ≤ `U+00FF`).
+pub const BINARY_ELEM_MARKER: char = '\u{E000}';
+
 /// `b'10101'` → `'\x15'` spelled as a quoted literal of the byte characters.
 fn bit_member_bytes(bits: &str) -> Option<String> {
     let bit_len = bits.len();
@@ -2216,6 +2614,7 @@ fn bit_member_bytes(bits: &str) -> Option<String> {
         value = (value << 1) | u128::from(bit == b'1');
     }
     let mut out = String::from("'");
+    out.push(BINARY_ELEM_MARKER);
     for index in (0..byte_len).rev() {
         let byte = (value >> (index * 8)) as u8;
         match byte {
@@ -2234,6 +2633,7 @@ fn hex_member_bytes(hex: &str) -> Option<String> {
         return None;
     }
     let mut out = String::from("'");
+    out.push(BINARY_ELEM_MARKER);
     let digits = hex.as_bytes();
     for pair in digits.chunks(2) {
         let text = std::str::from_utf8(pair).ok()?;
@@ -2462,7 +2862,8 @@ fn rewrite_mysql_column_charset(sql: &str) -> String {
         }
         if keyword_at(bytes, i, "charset") {
             let after = skip_ws(bytes, i + "charset".len());
-            if after < bytes.len() && bytes[after] != b'=' {
+            // `CHARSET(expr)` is the string function, not the column option.
+            if after < bytes.len() && bytes[after] != b'=' && bytes[after] != b'(' {
                 out.push_str("CHARACTER SET");
                 i += "charset".len();
                 continue;
@@ -2817,20 +3218,31 @@ fn rewrite_auto_random_option(sql: &str) -> String {
         if keyword_at(bytes, i, "AUTO_RANDOM") {
             let mut j = skip_ws(bytes, i + "AUTO_RANDOM".len());
             let mut bits = DEFAULT_AUTO_RANDOM_SHARD_BITS;
+            let mut range: Option<u32> = None;
             if j < bytes.len()
                 && bytes[j] == b'('
                 && let Some(close) = matching_paren(bytes, j)
             {
-                if let Some(first) = sql[j + 1..close].split(',').next()
+                let mut parts = sql[j + 1..close].split(',');
+                if let Some(first) = parts.next()
                     && let Ok(n) = first.trim().parse::<u32>()
                 {
                     bits = n;
+                }
+                if let Some(second) = parts.next()
+                    && let Ok(n) = second.trim().parse::<u32>()
+                {
+                    range = Some(n);
                 }
                 j = close + 1;
             }
             out.push_str("COMMENT '");
             out.push_str(AUTO_RANDOM_MARKER_PREFIX);
             out.push_str(&bits.to_string());
+            if let Some(range) = range {
+                out.push('_');
+                out.push_str(&range.to_string());
+            }
             out.push_str("__'");
             i = j;
             continue;
@@ -2840,12 +3252,56 @@ fn rewrite_auto_random_option(sql: &str) -> String {
     out
 }
 
+/// Decode an `AUTO_RANDOM` marker comment into `(shard_bits, range_bits)`;
+/// the range is absent when the clause only spelled the shard bits.
+fn parse_auto_random_marker(comment: &str) -> Option<(u32, Option<u32>)> {
+    let rest = comment
+        .strip_prefix(AUTO_RANDOM_MARKER_PREFIX)?
+        .strip_suffix("__")?;
+    match rest.split_once('_') {
+        Some((shard, range)) => Some((shard.parse().ok()?, Some(range.parse().ok()?))),
+        None => Some((rest.parse().ok()?, None)),
+    }
+}
+
 fn lower_auto_random(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<u32> {
     options.iter().find_map(|opt| match &opt.option {
-        sqlparser::ast::ColumnOption::Comment(comment) => comment
-            .strip_prefix(AUTO_RANDOM_MARKER_PREFIX)
-            .and_then(|rest| rest.strip_suffix("__"))
-            .and_then(|bits| bits.parse().ok()),
+        sqlparser::ast::ColumnOption::Comment(comment) => {
+            parse_auto_random_marker(comment).map(|(shard, _)| shard)
+        }
+        _ => None,
+    })
+}
+
+/// `AUTO_RANDOM(shard_bits, range_bits)` range bits, when the clause spelled
+/// them (`None` otherwise, including for a non-auto-random column).
+fn lower_auto_random_range(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<u32> {
+    options.iter().find_map(|opt| match &opt.option {
+        sqlparser::ast::ColumnOption::Comment(comment) => {
+            parse_auto_random_marker(comment).and_then(|(_, range)| range)
+        }
+        _ => None,
+    })
+}
+
+/// `AUTO_RANDOM(shard_bits, range_bits)` range bits of an `ALTER TABLE
+/// … CHANGE/MODIFY COLUMN` option list.
+fn lower_column_option_auto_random_range(options: &[sqlparser::ast::ColumnOption]) -> Option<u32> {
+    options.iter().find_map(|opt| match opt {
+        sqlparser::ast::ColumnOption::Comment(comment) => {
+            parse_auto_random_marker(comment).and_then(|(_, range)| range)
+        }
+        _ => None,
+    })
+}
+
+/// `AUTO_RANDOM[(shard_bits)]` shard bits of an `ALTER TABLE … CHANGE/MODIFY
+/// COLUMN` option list.
+fn lower_column_option_auto_random(options: &[sqlparser::ast::ColumnOption]) -> Option<u32> {
+    options.iter().find_map(|opt| match opt {
+        sqlparser::ast::ColumnOption::Comment(comment) => {
+            parse_auto_random_marker(comment).map(|(shard, _)| shard)
+        }
         _ => None,
     })
 }
@@ -3099,19 +3555,86 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
             }
             if keyword_at(bytes, after_admin, "CHECK") {
                 let after_check = skip_ws(bytes, after_admin + "CHECK".len());
-                // `ADMIN CHECK TABLE t` / `ADMIN CHECK INDEX t idx` — the
-                // integrity check is a verification no-op for now.
-                for target in ["TABLE", "INDEX"] {
-                    if keyword_at(bytes, after_check, target) {
-                        PENDING_ADMIN_OP.with(|cell| *cell.borrow_mut() = Some(AdminOp::Other));
-                        out.push_str("DO 0");
-                        let mut j = after_check + target.len();
-                        while j < bytes.len() && bytes[j] != b';' {
-                            j += 1;
-                        }
-                        i = j;
-                        continue 'stmt;
+                // `ADMIN CHECK TABLE t[, …]`
+                if keyword_at(bytes, after_check, "TABLE")
+                    && let Ok((tables, after_tables)) =
+                        parse_table_name_list(bytes, skip_ws(bytes, after_check + "TABLE".len()))
+                {
+                    PENDING_ADMIN_OP.with(|cell| {
+                        *cell.borrow_mut() = Some(AdminOp::CheckTable { tables });
+                    });
+                    out.push_str("DO 0");
+                    let mut j = after_tables;
+                    while j < bytes.len() && bytes[j] != b';' {
+                        j += 1;
                     }
+                    i = j;
+                    continue 'stmt;
+                }
+                // `ADMIN CHECK INDEX t idx [(lo, hi), …]`
+                if keyword_at(bytes, after_check, "INDEX")
+                    && let Ok((table, after_table)) =
+                        parse_table_name(bytes, skip_ws(bytes, after_check + "INDEX".len()))
+                    && let Ok((index, after_index)) =
+                        parse_quoted_or_ident(bytes, skip_ws(bytes, after_table))
+                    && !index.is_empty()
+                {
+                    let (ranges, after_ranges) = parse_handle_ranges(bytes, after_index);
+                    PENDING_ADMIN_OP.with(|cell| {
+                        *cell.borrow_mut() = Some(AdminOp::CheckIndex {
+                            table,
+                            index,
+                            ranges,
+                        });
+                    });
+                    out.push_str("DO 0");
+                    let mut j = after_ranges;
+                    while j < bytes.len() && bytes[j] != b';' {
+                        j += 1;
+                    }
+                    i = j;
+                    continue 'stmt;
+                }
+            }
+            if keyword_at(bytes, after_admin, "CHECKSUM") {
+                let after_checksum = skip_ws(bytes, after_admin + "CHECKSUM".len());
+                if keyword_at(bytes, after_checksum, "TABLE")
+                    && let Ok((tables, after_tables)) =
+                        parse_table_name_list(bytes, skip_ws(bytes, after_checksum + "TABLE".len()))
+                {
+                    PENDING_ADMIN_OP.with(|cell| {
+                        *cell.borrow_mut() = Some(AdminOp::ChecksumTable { tables });
+                    });
+                    out.push_str("DO 0");
+                    let mut j = after_tables;
+                    while j < bytes.len() && bytes[j] != b';' {
+                        j += 1;
+                    }
+                    i = j;
+                    continue 'stmt;
+                }
+            }
+            if keyword_at(bytes, after_admin, "RECOVER") {
+                // `ADMIN RECOVER INDEX <table> <index>`: record the target so
+                // the session can re-add missing index entries.
+                let after_recover = skip_ws(bytes, after_admin + "RECOVER".len());
+                if keyword_at(bytes, after_recover, "INDEX")
+                    && let Ok((table, after_table)) =
+                        parse_table_name(bytes, after_recover + "INDEX".len())
+                    && let Ok((index, after_index)) =
+                        parse_quoted_or_ident(bytes, skip_ws(bytes, after_table))
+                    && !index.is_empty()
+                {
+                    let mut j = after_index;
+                    while j < bytes.len() && bytes[j] != b';' {
+                        j += 1;
+                    }
+                    PENDING_ADMIN_OP.with(|cell| {
+                        *cell.borrow_mut() = Some(AdminOp::RecoverIndex { table, index });
+                    });
+                    out.push_str("DO 0");
+                    i = j;
+                    continue;
                 }
             }
             if keyword_at(bytes, after_admin, "RELOAD") {
@@ -4574,6 +5097,8 @@ fn lower_grant(grant: &Grant) -> Result<Statement> {
         users: lower_grantees(&grant.grantees)?,
         with_grant: grant.with_grant_option,
         dynamic_privs: Vec::new(),
+        auth: None,
+        require: None,
     }))
 }
 
@@ -4850,6 +5375,8 @@ fn apply_with_materialize(
 
 /// Marker fn for TiDB `opcode.Not2` (`!`). Rewritten from `!(...)` before parse.
 const SEALDB_BANG_FN: &str = "__sealdb_bang";
+/// `CHARSET(expr)` marker: sqlparser treats `CHARSET` as a reserved keyword.
+const SEALDB_CHARSET_FN: &str = "__sealdb_charset";
 /// Marker for `CAST(x AS CHAR CHARSET cs)`, which sqlparser cannot parse.
 const SEALDB_CAST_CHARSET_FN: &str = "__sealdb_cast_charset";
 
@@ -5329,8 +5856,13 @@ fn strip_tidb_create_table_options(sql: &str) -> Result<String> {
                 }
                 // `UNIQUE INDEX idx(id) GLOBAL` — partition-independent index.
                 // sqlparser has no GLOBAL index option, so pass it through as an
-                // index COMMENT marker recovered in `index_def_global`.
-                if word == "global" && out.trim_end().ends_with(')') {
+                // index COMMENT marker recovered in `index_def_global`. A
+                // column-level `KEY GLOBAL` carries the same option on the
+                // column's implicit PRIMARY KEY constraint.
+                if word == "global"
+                    && (out.trim_end().ends_with(')')
+                        || out.trim_end().to_ascii_lowercase().ends_with("key"))
+                {
                     out.push_str(" COMMENT '");
                     out.push_str(GLOBAL_INDEX_MARKER);
                     out.push('\'');
@@ -7447,13 +7979,39 @@ fn push_analyze_head(out: &mut String, head: &str, partitions: Option<&[String]>
     out.push(')');
 }
 
-/// sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`.
+/// sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`, `SHOW CREATE USER` and
+/// `GRANT … IDENTIFIED BY|REQUIRE …`.
 fn extract_user_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut ops = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        if keyword_at(bytes, i, "SHOW") {
+            let after_show = skip_ws(bytes, i + "SHOW".len());
+            if keyword_at(bytes, after_show, "CREATE") {
+                let after_create = skip_ws(bytes, after_show + "CREATE".len());
+                if keyword_at(bytes, after_create, "USER") {
+                    let (user, end) =
+                        read_user_identity(bytes, skip_ws(bytes, after_create + "USER".len()))?;
+                    out.push_str("SET NAMES '__sealdb_user__'");
+                    ops.push(Some(Statement::Show(ShowStmt {
+                        kind: ShowStmtKind::CreateUser,
+                        db_name: None,
+                        table: None,
+                        user: Some(user),
+                        using_roles: Vec::new(),
+                        full: false,
+                        pattern: None,
+                        column: None,
+                        var_scope: ShowVarScope::Session,
+                        filter: None,
+                    })));
+                    i = end;
+                    continue;
+                }
+            }
+        }
         if keyword_at(bytes, i, "CREATE") {
             let after = skip_ws(bytes, i + "CREATE".len());
             if keyword_at(bytes, after, "USER") {
@@ -7489,6 +8047,167 @@ fn extract_user_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
         i += ch.len_utf8();
     }
     Ok((out, ops))
+}
+
+/// `GRANT … IDENTIFIED BY 'pwd' | REQUIRE … | WITH GRANT OPTION` suffix that
+/// sqlparser's GRANT grammar does not take. Rewrites each privilege grant to
+/// its plain form and returns one entry per grant statement, aligned with the
+/// lowered `Statement::Grant`s (`None` when the statement has no suffix).
+fn extract_grant_auth_suffix(
+    sql: &str,
+) -> Result<(
+    String,
+    Vec<Option<(Option<String>, Option<RequireClause>, bool)>>,
+)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut ops: Vec<Option<(Option<String>, Option<RequireClause>, bool)>> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "GRANT") && !preceded_by_keyword(bytes, i, "SHOW") {
+            if let Some(end) = statement_end(bytes, i)
+                && let Some((suffix, has_on)) = scan_grant_suffix(bytes, i, end)
+            {
+                if !has_on {
+                    i = push_sql_char(&mut out, sql, i);
+                    continue;
+                }
+                match suffix {
+                    Some(start) => {
+                        let (auth, require, with_grant) =
+                            parse_grant_auth_suffix(bytes, start, end)?;
+                        out.push_str(sql[i..start].trim_end());
+                        if with_grant {
+                            out.push_str(" WITH GRANT OPTION");
+                        }
+                        ops.push(Some((auth, require, with_grant)));
+                    }
+                    None => {
+                        out.push_str(&sql[i..end]);
+                        ops.push(None);
+                    }
+                }
+                i = end;
+                continue;
+            }
+        }
+        if let Some(end) = skip_comment_or_literal(bytes, i) {
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    Ok((out, ops))
+}
+
+/// End of the current statement (the `;` at the top level, or end of input).
+fn statement_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if let Some(end) = skip_comment_or_literal(bytes, i) {
+            i = end;
+            continue;
+        }
+        if bytes[i] == b';' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    Some(bytes.len())
+}
+
+/// For a `GRANT …` statement: whether it has an `ON` clause, and where the
+/// trailing `IDENTIFIED` / `REQUIRE` clause starts (if any). `TO` before the
+/// suffix keeps `GRANT role TO user` out.
+fn scan_grant_suffix(bytes: &[u8], from: usize, end: usize) -> Option<(Option<usize>, bool)> {
+    let mut i = from + "GRANT".len();
+    let mut has_on = false;
+    let mut after_to = false;
+    while i < end {
+        if let Some(next) = skip_comment_or_literal(bytes, i) {
+            i = next;
+            continue;
+        }
+        if keyword_at(bytes, i, "ON") {
+            has_on = true;
+        } else if keyword_at(bytes, i, "TO") {
+            after_to = true;
+        } else if after_to
+            && (keyword_at(bytes, i, "IDENTIFIED") || keyword_at(bytes, i, "REQUIRE"))
+        {
+            return Some((Some(i), has_on));
+        }
+        i += 1;
+    }
+    Some((None, has_on))
+}
+
+fn parse_grant_auth_suffix(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Result<(Option<String>, Option<RequireClause>, bool)> {
+    let mut i = start;
+    let mut auth = None;
+    let mut require = None;
+    loop {
+        i = skip_ws(bytes, i);
+        if i >= end {
+            break;
+        }
+        if keyword_at(bytes, i, "IDENTIFIED") {
+            i = skip_ws(bytes, i + "IDENTIFIED".len());
+            if !keyword_at(bytes, i, "BY") {
+                return Err(Error::unsupported("IDENTIFIED without BY"));
+            }
+            i = skip_ws(bytes, i + "BY".len());
+            if keyword_at(bytes, i, "PASSWORD") {
+                i = skip_ws(bytes, i + "PASSWORD".len());
+            }
+            let (pwd, after) = read_quoted_or_ident(bytes, i);
+            auth = Some(pwd);
+            i = skip_ws(bytes, after);
+            continue;
+        }
+        if keyword_at(bytes, i, "REQUIRE") {
+            let (clause, after) = parse_require_clause(bytes, skip_ws(bytes, i + "REQUIRE".len()))?;
+            require = Some(clause);
+            i = skip_ws(bytes, after);
+            continue;
+        }
+        break;
+    }
+    let mut with_grant = false;
+    if keyword_at(bytes, i, "WITH") {
+        let after_with = skip_ws(bytes, i + "WITH".len());
+        if keyword_at(bytes, after_with, "GRANT") {
+            let after_grant = skip_ws(bytes, after_with + "GRANT".len());
+            if keyword_at(bytes, after_grant, "OPTION") {
+                with_grant = true;
+                i = skip_ws(bytes, after_grant + "OPTION".len());
+            }
+        }
+    }
+    if i < end && bytes[i] != b';' {
+        return Err(unexpected_user_option(bytes, i));
+    }
+    Ok((auth, require, with_grant))
+}
+
+/// Whether the keyword at `i` is immediately preceded by the word `keyword`
+/// (`SHOW CREATE …` must not be mistaken for `CREATE …`).
+fn preceded_by_keyword(bytes: &[u8], i: usize, keyword: &str) -> bool {
+    let mut j = i;
+    while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    let kw = keyword.as_bytes();
+    if j < kw.len() {
+        return false;
+    }
+    let start = j - kw.len();
+    bytes[start..j].eq_ignore_ascii_case(kw) && (start == 0 || !is_ident_byte(bytes[start - 1]))
 }
 
 /// Extract MySQL/TiDB stmts sqlparser lacks or mishandles: `DO`, `SET PASSWORD`,
@@ -8593,6 +9312,51 @@ fn parse_table_name_list(bytes: &[u8], mut i: usize) -> Result<(Vec<TableName>, 
     Ok((tables, i))
 }
 
+/// Parse the `[(lo, hi), …]` handle ranges of `ADMIN CHECK INDEX <t> <idx>`.
+/// TiDB treats each range as half-open `[lo, hi)` over the row handle.
+fn parse_handle_ranges(bytes: &[u8], mut i: usize) -> (Vec<(i64, i64)>, usize) {
+    fn number(bytes: &[u8], mut i: usize) -> Option<(i64, usize)> {
+        i = skip_ws(bytes, i);
+        let start = i;
+        if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+            i += 1;
+        }
+        let digits = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits {
+            return None;
+        }
+        let text = std::str::from_utf8(&bytes[start..i]).ok()?;
+        Some((text.parse().ok()?, i))
+    }
+    let mut ranges = Vec::new();
+    let mut j = skip_ws(bytes, i);
+    while j < bytes.len() && bytes[j] == b'(' {
+        let Some((lo, after_lo)) = number(bytes, j + 1) else {
+            break;
+        };
+        let after_lo = skip_ws(bytes, after_lo);
+        if after_lo >= bytes.len() || bytes[after_lo] != b',' {
+            break;
+        }
+        let Some((hi, after_hi)) = number(bytes, after_lo + 1) else {
+            break;
+        };
+        let after_hi = skip_ws(bytes, after_hi);
+        if after_hi >= bytes.len() || bytes[after_hi] != b')' {
+            break;
+        }
+        ranges.push((lo, hi));
+        j = skip_ws(bytes, after_hi + 1);
+        if j < bytes.len() && bytes[j] == b',' {
+            j = skip_ws(bytes, j + 1);
+        }
+    }
+    (ranges, j)
+}
+
 fn parse_alter_database(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
     i = skip_ws(bytes, i);
     let end = stmt_end(bytes, i);
@@ -8690,18 +9454,15 @@ fn parse_create_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
     loop {
         i = skip_ws(bytes, i);
         let (user, after_user) = read_user_identity(bytes, i)?;
-        let (auth, resource_group, comment, after_opts) =
-            parse_user_options(bytes, skip_ws(bytes, after_user))?;
+        let (opts, after_opts) = parse_user_options(bytes, skip_ws(bytes, after_user))?;
         i = after_opts;
-        users.push(UserSpec {
-            user,
-            auth,
-            resource_group,
-            comment,
-        });
+        users.push(opts.into_spec(user));
         if i < bytes.len() && bytes[i] == b',' {
             i += 1;
             continue;
+        }
+        if i < bytes.len() && bytes[i] != b';' {
+            return Err(unexpected_user_option(bytes, i));
         }
         break;
     }
@@ -8717,22 +9478,83 @@ fn parse_create_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
     ))
 }
 
+/// Parsed user-attribute suffix shared by `CREATE USER` and `ALTER USER`.
+#[derive(Default)]
+struct ParsedUserOptions {
+    auth: Option<String>,
+    auth_plugin: Option<String>,
+    auth_is_hash: bool,
+    resource_group: Option<String>,
+    comment: Option<String>,
+    require: Option<RequireClause>,
+    password_expire: Option<PasswordExpireOption>,
+    password_history: Option<Option<u64>>,
+    password_reuse: Option<Option<u64>>,
+}
+
+impl ParsedUserOptions {
+    fn into_spec(self, user: UserIdentity) -> UserSpec {
+        UserSpec {
+            user,
+            auth: self.auth,
+            auth_plugin: self.auth_plugin,
+            auth_is_hash: self.auth_is_hash,
+            resource_group: self.resource_group,
+            comment: self.comment,
+            require: self.require,
+            password_expire: self.password_expire,
+            password_history: self.password_history,
+            password_reuse: self.password_reuse,
+        }
+    }
+}
+
+/// Read an unsigned decimal literal; `None` leaves `i` untouched so the caller
+/// can report TiDB's 1064 at the offending byte.
+fn read_uint(bytes: &[u8], i: usize) -> Option<(u64, usize)> {
+    let mut j = i;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == i {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes[i..j]).ok()?;
+    text.parse::<u64>().ok().map(|value| (value, j))
+}
+
 /// Parse a user-attribute suffix shared by `CREATE USER` and `ALTER USER`:
-/// `IDENTIFIED BY 'pwd'` / `COMMENT '…'` / `RESOURCE GROUP name`, in any
-/// order.
-fn parse_user_options(
-    bytes: &[u8],
-    mut i: usize,
-) -> Result<(Option<String>, Option<String>, Option<String>, usize)> {
-    let mut auth = None;
-    let mut resource_group = None;
-    let mut comment = None;
+/// `IDENTIFIED [WITH 'plugin'] [BY 'pwd'|AS 'hash']` / `REQUIRE …` /
+/// `COMMENT '…'` / `RESOURCE GROUP name` / `PASSWORD EXPIRE …` /
+/// `PASSWORD HISTORY n` / `PASSWORD REUSE INTERVAL n DAY`, in any order.
+fn parse_user_options(bytes: &[u8], mut i: usize) -> Result<(ParsedUserOptions, usize)> {
+    let mut opts = ParsedUserOptions::default();
     loop {
         i = skip_ws(bytes, i);
         if keyword_at(bytes, i, "IDENTIFIED") {
             i = skip_ws(bytes, i + "IDENTIFIED".len());
             if keyword_at(bytes, i, "WITH") {
-                return Err(Error::unsupported("IDENTIFIED WITH"));
+                i = skip_ws(bytes, i + "WITH".len());
+                let (plugin, after_plugin) = read_quoted_or_ident(bytes, i);
+                if plugin.is_empty() {
+                    return Err(Error::unsupported("IDENTIFIED WITH without plugin"));
+                }
+                opts.auth_plugin = Some(plugin);
+                i = skip_ws(bytes, after_plugin);
+                if keyword_at(bytes, i, "BY") {
+                    i = skip_ws(bytes, i + "BY".len());
+                    let (pwd, after_pwd) = read_quoted_or_ident(bytes, i);
+                    opts.auth = Some(pwd);
+                    opts.auth_is_hash = false;
+                    i = skip_ws(bytes, after_pwd);
+                } else if keyword_at(bytes, i, "AS") {
+                    i = skip_ws(bytes, i + "AS".len());
+                    let (hash, after_hash) = read_quoted_or_ident(bytes, i);
+                    opts.auth = Some(hash);
+                    opts.auth_is_hash = true;
+                    i = skip_ws(bytes, after_hash);
+                }
+                continue;
             }
             if !keyword_at(bytes, i, "BY") {
                 return Err(Error::unsupported("IDENTIFIED without BY"));
@@ -8742,14 +9564,20 @@ fn parse_user_options(
                 i = skip_ws(bytes, i + "PASSWORD".len());
             }
             let (pwd, after_pwd) = read_quoted_or_ident(bytes, i);
-            auth = Some(pwd);
+            opts.auth = Some(pwd);
             i = skip_ws(bytes, after_pwd);
+            continue;
+        }
+        if keyword_at(bytes, i, "REQUIRE") {
+            let (clause, after) = parse_require_clause(bytes, skip_ws(bytes, i + "REQUIRE".len()))?;
+            opts.require = Some(clause);
+            i = skip_ws(bytes, after);
             continue;
         }
         if keyword_at(bytes, i, "COMMENT") {
             let start = skip_ws(bytes, i + "COMMENT".len());
             let (text, end) = read_quoted_or_ident(bytes, start);
-            comment = Some(text);
+            opts.comment = Some(text);
             i = skip_ws(bytes, end);
             continue;
         }
@@ -8760,41 +9588,275 @@ fn parse_user_options(
             }
             i = skip_ws(bytes, i + "GROUP".len());
             let (group, end) = read_quoted_or_ident(bytes, i);
-            resource_group = Some(group);
+            opts.resource_group = Some(group);
             i = skip_ws(bytes, end);
             continue;
         }
+        if keyword_at(bytes, i, "PASSWORD") {
+            let after = skip_ws(bytes, i + "PASSWORD".len());
+            if keyword_at(bytes, after, "EXPIRE") {
+                let mut j = skip_ws(bytes, after + "EXPIRE".len());
+                if keyword_at(bytes, j, "DEFAULT") {
+                    opts.password_expire = Some(PasswordExpireOption::Default);
+                    j = skip_ws(bytes, j + "DEFAULT".len());
+                } else if keyword_at(bytes, j, "NEVER") {
+                    opts.password_expire = Some(PasswordExpireOption::Never);
+                    j = skip_ws(bytes, j + "NEVER".len());
+                } else if keyword_at(bytes, j, "INTERVAL") {
+                    let value_at = skip_ws(bytes, j + "INTERVAL".len());
+                    let Some((days, after_days)) = read_uint(bytes, value_at) else {
+                        i = value_at;
+                        break;
+                    };
+                    let day_at = skip_ws(bytes, after_days);
+                    if !keyword_at(bytes, day_at, "DAY") {
+                        i = day_at;
+                        break;
+                    }
+                    opts.password_expire = Some(PasswordExpireOption::Interval(days));
+                    j = skip_ws(bytes, day_at + "DAY".len());
+                } else {
+                    opts.password_expire = Some(PasswordExpireOption::Expire);
+                }
+                i = j;
+                continue;
+            }
+            if keyword_at(bytes, after, "HISTORY") {
+                let value_at = skip_ws(bytes, after + "HISTORY".len());
+                if keyword_at(bytes, value_at, "DEFAULT") {
+                    opts.password_history = Some(None);
+                    i = skip_ws(bytes, value_at + "DEFAULT".len());
+                    continue;
+                }
+                let Some((count, after_count)) = read_uint(bytes, value_at) else {
+                    i = value_at;
+                    break;
+                };
+                opts.password_history = Some(Some(count));
+                i = skip_ws(bytes, after_count);
+                continue;
+            }
+            if keyword_at(bytes, after, "REUSE") {
+                let interval_at = skip_ws(bytes, after + "REUSE".len());
+                if !keyword_at(bytes, interval_at, "INTERVAL") {
+                    i = interval_at;
+                    break;
+                }
+                let value_at = skip_ws(bytes, interval_at + "INTERVAL".len());
+                if keyword_at(bytes, value_at, "DEFAULT") {
+                    opts.password_reuse = Some(None);
+                    i = skip_ws(bytes, value_at + "DEFAULT".len());
+                    continue;
+                }
+                let Some((days, after_days)) = read_uint(bytes, value_at) else {
+                    i = value_at;
+                    break;
+                };
+                let day_at = skip_ws(bytes, after_days);
+                if !keyword_at(bytes, day_at, "DAY") {
+                    i = day_at;
+                    break;
+                }
+                opts.password_reuse = Some(Some(days));
+                i = skip_ws(bytes, day_at + "DAY".len());
+                continue;
+            }
+        }
         break;
     }
-    Ok((auth, resource_group, comment, i))
+    Ok((opts, i))
 }
 
-/// `ALTER USER 'u'@'%' {IDENTIFIED BY 'pwd' | COMMENT '…' | RESOURCE GROUP g}`
+/// TiDB 1064 for a trailing user option the grammar does not take
+/// (`CREATE USER u require ssl ssl`): the reported column is the last byte of
+/// the offending token and `near` starts at that token.
+fn unexpected_user_option(bytes: &[u8], i: usize) -> Error {
+    let token_len = bytes[i..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+        .count()
+        .max(1);
+    syntax_error_at(bytes, i, i + token_len - 1)
+}
+
+/// TLS cipher names TiDB accepts in `REQUIRE CIPHER '…'`
+/// (`pkg/util/collate` / `sql/auth` keep the same list).
+const SUPPORTED_CIPHERS: &[&str] = &[
+    "AES128-GCM-SHA256",
+    "AES256-GCM-SHA384",
+    "AES128-CBC-SHA",
+    "AES256-CBC-SHA",
+    "DES-CBC3-SHA",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+    "RC4-SHA",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+];
+
+/// TiDB validates an X509 name as a `/attr=value` sequence whose attribute is
+/// a known DN field and whose value holds no `=` (`invalid X509_NAME input`).
+fn valid_x509_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('/') else {
+        return false;
+    };
+    for part in rest.split('/') {
+        let Some((attr, value)) = part.split_once('=') else {
+            return false;
+        };
+        if value.is_empty() || value.contains('=') {
+            return false;
+        }
+        let known = ["C", "ST", "L", "O", "OU", "CN"]
+            .iter()
+            .any(|field| attr.eq_ignore_ascii_case(field));
+        if !known {
+            return false;
+        }
+    }
+    true
+}
+
+/// `REQUIRE {NONE|SSL|X509|ISSUER '…'|SUBJECT '…'|CIPHER '…'}` (clauses may be
+/// joined by `AND`, as in `GRANT … REQUIRE issuer '…' and subject '…'`).
+fn parse_require_clause(bytes: &[u8], mut i: usize) -> Result<(RequireClause, usize)> {
+    let mut clause = RequireClause::default();
+    loop {
+        i = skip_ws(bytes, i);
+        if keyword_at(bytes, i, "NONE") {
+            if clause.none {
+                break;
+            }
+            clause.none = true;
+            i += "NONE".len();
+            continue;
+        }
+        if keyword_at(bytes, i, "SSL") {
+            if clause.ssl {
+                break;
+            }
+            clause.ssl = true;
+            i += "SSL".len();
+            continue;
+        }
+        if keyword_at(bytes, i, "X509") {
+            if clause.x509 {
+                break;
+            }
+            clause.x509 = true;
+            i += "X509".len();
+            continue;
+        }
+        if keyword_at(bytes, i, "AND") {
+            i += "AND".len();
+            continue;
+        }
+        let kind = if keyword_at(bytes, i, "ISSUER") {
+            Some(("ISSUER", "ISSUER".len()))
+        } else if keyword_at(bytes, i, "SUBJECT") {
+            Some(("SUBJECT", "SUBJECT".len()))
+        } else if keyword_at(bytes, i, "CIPHER") {
+            Some(("CIPHER", "CIPHER".len()))
+        } else {
+            None
+        };
+        let Some((name, len)) = kind else {
+            break;
+        };
+        // Duplicates are rejected while parsing (TiDB's grammar does the same,
+        // before any X509 name is validated).
+        let slot = match name {
+            "ISSUER" => &mut clause.issuer,
+            "SUBJECT" => &mut clause.subject,
+            _ => &mut clause.cipher,
+        };
+        if slot.is_some() {
+            return Err(Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                format!("Duplicate require {name} clause"),
+            ));
+        }
+        let value_at = skip_ws(bytes, i + len);
+        let (value, after) = read_quoted_or_ident(bytes, value_at);
+        // MySQL unescapes the quoted literal before it reaches the server, so
+        // `'/CN=TiDB\OU=PingCAP'` is seen as `/CN=TiDBOU=PingCAP`.
+        let value = match value_at < bytes.len() && matches!(bytes[value_at], b'\'' | b'"') {
+            true => unescape_mysql_literal(&value, bytes[value_at]),
+            false => value,
+        };
+        *slot = Some(value);
+        i = skip_ws(bytes, after);
+    }
+    // Semantic checks run after the clause list is complete.
+    if let Some(issuer) = &clause.issuer
+        && !valid_x509_name(issuer)
+    {
+        return Err(Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            format!("invalid X509_NAME input: {issuer}"),
+        ));
+    }
+    if let Some(subject) = &clause.subject
+        && !valid_x509_name(subject)
+    {
+        return Err(Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            format!("invalid X509_NAME input: {subject}"),
+        ));
+    }
+    if let Some(cipher) = &clause.cipher
+        && !SUPPORTED_CIPHERS
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(cipher))
+    {
+        return Err(Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            format!("Unsupported cipher suit: {cipher}"),
+        ));
+    }
+    Ok((clause, i))
+}
+
+/// `ALTER USER [IF EXISTS] 'u'@'%' {IDENTIFIED … | COMMENT '…' | PASSWORD …}`
 /// — sqlparser has no MySQL grammar for it.
 fn parse_alter_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let if_exists = if keyword_at(bytes, i, "IF") {
+        let after_if = skip_ws(bytes, i + "IF".len());
+        if keyword_at(bytes, after_if, "EXISTS") {
+            i = skip_ws(bytes, after_if + "EXISTS".len());
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     let mut users = Vec::new();
     loop {
         i = skip_ws(bytes, i);
         let (user, after_user) = read_user_identity(bytes, i)?;
-        let (auth, resource_group, comment, after_opts) =
-            parse_user_options(bytes, skip_ws(bytes, after_user))?;
-        users.push(UserSpec {
-            user,
-            auth,
-            resource_group,
-            comment,
-        });
+        let (opts, after_opts) = parse_user_options(bytes, skip_ws(bytes, after_user))?;
+        users.push(opts.into_spec(user));
         i = after_opts;
         if i < bytes.len() && bytes[i] == b',' {
             i += 1;
             continue;
+        }
+        if i < bytes.len() && bytes[i] != b';' {
+            return Err(unexpected_user_option(bytes, i));
         }
         break;
     }
     if users.is_empty() {
         return Err(Error::unsupported("ALTER USER without users"));
     }
-    Ok((Statement::AlterUser(AlterUserStmt { users }), i))
+    Ok((Statement::AlterUser(AlterUserStmt { if_exists, users }), i))
 }
 
 fn parse_drop_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
@@ -8982,6 +10044,8 @@ fn try_parse_dynamic_grant(bytes: &[u8], start: usize) -> Result<Option<(Stateme
             users,
             with_grant,
             dynamic_privs: privs,
+            auth: None,
+            require: None,
         }),
         end,
     )))
@@ -9070,6 +10134,8 @@ fn try_parse_table_priv_grant(bytes: &[u8], start: usize) -> Result<Option<(Stat
             users,
             with_grant,
             dynamic_privs,
+            auth: None,
+            require: None,
         }),
         end,
     )))
@@ -9103,6 +10169,15 @@ fn try_parse_table_priv_revoke(bytes: &[u8], start: usize) -> Result<Option<(Sta
         (privs, dynamic_privs, after)
     };
     let mut i = skip_ws(bytes, after);
+    // `REVOKE priv, GRANT OPTION ON …`: revoke the named privileges *and*
+    // their grant option.
+    if keyword_at(bytes, i, "GRANT") {
+        let after_grant = skip_ws(bytes, i + "GRANT".len());
+        if keyword_at(bytes, after_grant, "OPTION") {
+            grant_option = true;
+            i = skip_ws(bytes, after_grant + "OPTION".len());
+        }
+    }
     if !keyword_at(bytes, i, "ON") {
         return Ok(None);
     }
@@ -9136,6 +10211,14 @@ fn parse_table_priv_list(
     let mut dynamic_privs = Vec::new();
     loop {
         i = skip_ws(bytes, i);
+        // `REVOKE SELECT, GRANT OPTION ON …`: the trailing grant-option clause
+        // ends the privilege list (handled by the caller).
+        if keyword_at(bytes, i, "GRANT") {
+            let after_grant = skip_ws(bytes, i + "GRANT".len());
+            if keyword_at(bytes, after_grant, "OPTION") {
+                break;
+            }
+        }
         // TiDB dynamic privileges (`CONNECTION_ADMIN`, `ROLE_ADMIN`, …) live in
         // the same list as static ones but have their own grant table.
         let (dyns, next) = parse_dynamic_priv_list(bytes, i)?;
@@ -9278,7 +10361,15 @@ fn parse_table_priv_level(bytes: &[u8], mut i: usize) -> Result<Option<(GrantLev
     if bytes.get(i) == Some(&b'*') {
         let mut j = skip_ws(bytes, i + 1);
         if bytes.get(j) != Some(&b'.') {
-            return Ok(None);
+            // MySQL accepts `GRANT … ON *` as the global level.
+            return Ok(Some((
+                GrantLevel {
+                    level: GrantLevelType::Global,
+                    db_name: String::new(),
+                    table_name: String::new(),
+                },
+                skip_ws(bytes, i + 1),
+            )));
         }
         j = skip_ws(bytes, j + 1);
         if bytes.get(j) != Some(&b'*') {
@@ -9339,7 +10430,7 @@ fn parse_dynamic_priv_list(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, u
     loop {
         i = skip_ws(bytes, i);
         let (name, next) = read_quoted_or_ident(bytes, i);
-        if name.is_empty() || !is_dynamic_priv(&name) {
+        if name.is_empty() || is_static_or_reserved_priv(bytes, i, &name) {
             break;
         }
         privs.push(name.to_ascii_uppercase());
@@ -9350,7 +10441,7 @@ fn parse_dynamic_priv_list(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, u
         if i < bytes.len() && bytes[i] == b',' {
             let after_comma = skip_ws(bytes, i + 1);
             let (peek, _) = read_quoted_or_ident(bytes, after_comma);
-            if is_dynamic_priv(&peek) {
+            if !peek.is_empty() && !is_static_or_reserved_priv(bytes, after_comma, &peek) {
                 i = after_comma;
                 continue;
             }
@@ -9360,7 +10451,25 @@ fn parse_dynamic_priv_list(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, u
     Ok((privs, i))
 }
 
-fn is_dynamic_priv(name: &str) -> bool {
+/// Names that terminate a dynamic-privilege list: `ALL`, `USAGE`,
+/// `GRANT OPTION`, and every static privilege (`SELECT`, `SHOW VIEW`, …).
+fn is_static_or_reserved_priv(bytes: &[u8], i: usize, name: &str) -> bool {
+    if keyword_at(bytes, i, "ALL") || keyword_at(bytes, i, "USAGE") {
+        return true;
+    }
+    if keyword_at(bytes, i, "GRANT") {
+        let after = skip_ws(bytes, i + "GRANT".len());
+        if keyword_at(bytes, after, "OPTION") || keyword_at(bytes, after, "TO") {
+            return true;
+        }
+    }
+    let _ = name;
+    static_priv_at(bytes, i).is_some()
+}
+
+/// Whether `name` is a dynamic privilege registered with the server. Unknown
+/// names are still parsed (TiDB warns 3929) but never stored.
+pub fn is_dynamic_priv(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
         "BACKUP_ADMIN"
@@ -9544,8 +10653,10 @@ fn read_user_identity(bytes: &[u8], mut i: usize) -> Result<(UserIdentity, usize
         }
         return Ok((UserIdentity::new("", ""), j));
     }
+    let quoted = matches!(bytes.get(i), Some(b'\'') | Some(b'"') | Some(b'`'));
     let (user, after_user) = read_quoted_or_ident(bytes, i);
-    if user.is_empty() {
+    // `''@'localhost'` is MySQL's anonymous account; a missing token is not.
+    if user.is_empty() && !quoted {
         return Err(Error::new(ERR_PARSE_ERROR, "missing user"));
     }
     let mut j = skip_ws(bytes, after_user);
@@ -9988,6 +11099,10 @@ enum AlterPartOp {
         charset: String,
         collate: Option<String>,
     },
+    /// `[WITH|WITHOUT] VALIDATION` (accepted, then warned as 8200).
+    Validation {
+        with: bool,
+    },
 }
 
 /// `ALTER TABLE` table options TiDB accepts in the spec list
@@ -10030,16 +11145,31 @@ fn parse_alter_table_options(body: &str) -> Option<Vec<(String, String)>> {
         if item.is_empty() {
             return None;
         }
+        // `DEFAULT COLLATE x` / `DEFAULT CHARSET x` — the leading DEFAULT is
+        // noise in the option list.
+        let item = if keyword_at(item.as_bytes(), 0, "DEFAULT") {
+            item["DEFAULT".len()..].trim_start()
+        } else {
+            item
+        };
         let item_bytes = item.as_bytes();
         let name_end = skip_ident_or_quoted(item_bytes, skip_ws(item_bytes, 0));
-        let name = item[..name_end].trim().trim_matches('`');
+        let mut name = item[..name_end].trim().trim_matches('`').to_string();
+        let mut j = skip_ws(item_bytes, name_end);
+        // `CHARSET x` is rewritten to `CHARACTER SET x` before this pass.
+        if name.eq_ignore_ascii_case("CHARACTER") {
+            let set_at = skip_ws(item_bytes, j);
+            if set_at < item_bytes.len() && keyword_at(item_bytes, set_at, "SET") {
+                name = "CHARSET".to_string();
+                j = skip_ws(item_bytes, set_at + "SET".len());
+            }
+        }
         if !ALTER_TABLE_OPTION_KEYWORDS
             .iter()
-            .any(|kw| kw.eq_ignore_ascii_case(name))
+            .any(|kw| kw.eq_ignore_ascii_case(&name))
         {
             return None;
         }
-        let mut j = skip_ws(item_bytes, name_end);
         if j < item_bytes.len() && item_bytes[j] == b'=' {
             j = skip_ws(item_bytes, j + 1);
         }
@@ -10081,6 +11211,25 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                     ops.push(Some(AlterPartOp::Options(options)));
                     i = skip_ws(bytes, end);
                     continue;
+                }
+                // `ALTER TABLE t [WITH|WITHOUT] VALIDATION`: sqlparser has no
+                // grammar for the clause, so capture it for the DDL layer.
+                if keyword_at(bytes, after_name, "WITH") || keyword_at(bytes, after_name, "WITHOUT")
+                {
+                    let (kw_len, with) = if keyword_at(bytes, after_name, "WITHOUT") {
+                        ("WITHOUT".len(), false)
+                    } else {
+                        ("WITH".len(), true)
+                    };
+                    let after_kw = skip_ws(bytes, after_name + kw_len);
+                    if keyword_at(bytes, after_kw, "VALIDATION") {
+                        let end = stmt_end(bytes, after_kw + "VALIDATION".len());
+                        out.push_str(&sql[i..after_name]);
+                        out.push_str("ALGORITHM=INPLACE");
+                        ops.push(Some(AlterPartOp::Validation { with }));
+                        i = skip_ws(bytes, end);
+                        continue;
+                    }
                 }
                 if let Some((partition, attributes, end)) =
                     parse_alter_attributes_spec(bytes, after_name)?
@@ -15085,6 +16234,117 @@ fn rewrite_set_assign_operator(sql: &str) -> String {
     out
 }
 
+/// sqlparser has no grammar for `SET CHARACTER SET <charset>`. Rewrite the
+/// statement to a private assignment (`__sealdb_character_set__`) that the
+/// session handles like `SET NAMES` with the connection charset pinned to the
+/// database default.
+fn rewrite_set_character_set(sql: &str) -> String {
+    if !sql.to_ascii_lowercase().contains("character") {
+        return sql.to_string();
+    }
+    let stmts = split_top_level_statements(sql);
+    let mut out = String::with_capacity(sql.len());
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if idx > 0 {
+            out.push(';');
+        }
+        match rewrite_one_set_character_set(stmt) {
+            Some(rewritten) => out.push_str(&rewritten),
+            None => out.push_str(stmt),
+        }
+    }
+    out
+}
+
+fn rewrite_one_set_character_set(stmt: &str) -> Option<String> {
+    if !statement_is_set(stmt) {
+        return None;
+    }
+    let bytes = stmt.as_bytes();
+    let mut i = skip_sql_blanks(bytes, 0);
+    // `SET` keyword.
+    if !bytes
+        .get(i..)
+        .is_some_and(|rest| rest.len() >= 3 && rest[..3].eq_ignore_ascii_case(b"set"))
+    {
+        return None;
+    }
+    let set_start = i;
+    i = skip_sql_blanks(bytes, i + 3);
+    // `CHARACTER` keyword.
+    if !bytes
+        .get(i..)
+        .is_some_and(|rest| rest.len() >= 9 && rest[..9].eq_ignore_ascii_case(b"character"))
+    {
+        return None;
+    }
+    i = skip_sql_blanks(bytes, i + 9);
+    // `SET` keyword of `CHARACTER SET`.
+    if !bytes
+        .get(i..)
+        .is_some_and(|rest| rest.len() >= 3 && rest[..3].eq_ignore_ascii_case(b"set"))
+    {
+        return None;
+    }
+    i = skip_sql_blanks(bytes, i + 3);
+    // Charset operand: quoted literal or bare identifier.
+    let (value, end) = match bytes.get(i) {
+        Some(&quote @ (b'\'' | b'"')) => {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != quote {
+                j += 1;
+            }
+            (
+                String::from_utf8_lossy(&bytes[i + 1..j.min(bytes.len())]).into_owned(),
+                (j + 1).min(bytes.len()),
+            )
+        }
+        Some(_) => {
+            let mut j = i;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+            {
+                j += 1;
+            }
+            if j == i {
+                return None;
+            }
+            (String::from_utf8_lossy(&bytes[i..j]).into_owned(), j)
+        }
+        None => return None,
+    };
+    Some(format!(
+        "{}SET __sealdb_character_set__ = '{}'{}",
+        &stmt[..set_start],
+        value,
+        &stmt[end..]
+    ))
+}
+
+/// Skip whitespace and `--` / `/* */` comments.
+fn skip_sql_blanks(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'-') && bytes.get(i + 1) == Some(&b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        return i;
+    }
+}
+
 /// Whether the statement text (comments / whitespace skipped) starts with SET.
 fn statement_is_set(stmt: &str) -> bool {
     let bytes = stmt.as_bytes();
@@ -15854,7 +17114,8 @@ fn lower_column_comment(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<S
         sqlparser::ast::ColumnOption::Comment(text)
             if !text.starts_with(AUTO_RANDOM_MARKER_PREFIX)
                 && text != CLUSTERED_MARKER
-                && text != NONCLUSTERED_MARKER =>
+                && text != NONCLUSTERED_MARKER
+                && text != GLOBAL_INDEX_MARKER =>
         {
             Some(text.clone())
         }
@@ -16032,6 +17293,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
     let mut col_primary: Option<String> = None;
     let mut col_pk_clustered = false;
     let mut col_pk_nonclustered = false;
+    let mut col_pk_global = false;
     for col in &create.columns {
         cols.push(ColumnDef {
             name: col.name.value.clone(),
@@ -16040,6 +17302,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
             generated: lower_generated_column(&col.options)?,
             auto_increment: lower_auto_increment(&col.options),
             auto_random: lower_auto_random(&col.options),
+            auto_random_range: lower_auto_random_range(&col.options),
             not_null: lower_not_null(&col.options),
             explicit_null: col
                 .options
@@ -16063,6 +17326,20 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                     if comment == NONCLUSTERED_MARKER =>
                 {
                     col_pk_nonclustered = true;
+                }
+                sqlparser::ast::ColumnOption::Comment(comment)
+                    if comment == GLOBAL_INDEX_MARKER =>
+                {
+                    col_pk_global = true;
+                }
+                sqlparser::ast::ColumnOption::PrimaryKey(pk)
+                    if index_def_global(&pk.index_options) =>
+                {
+                    if col_primary.is_some() {
+                        return Err(Error::unsupported("multiple column PRIMARY KEY"));
+                    }
+                    col_primary = Some(col.name.value.clone());
+                    col_pk_global = true;
                 }
                 sqlparser::ast::ColumnOption::PrimaryKey(_) => {
                     if col_primary.is_some() {
@@ -16122,7 +17399,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                 columns: vec![IndexPart::column(name)],
                 unique: true,
                 primary: true,
-                global: false,
+                global: col_pk_global,
                 nonclustered: col_pk_nonclustered,
                 clustered: col_pk_clustered && !col_pk_nonclustered,
                 invisible: false,
@@ -16174,6 +17451,38 @@ fn validate_table_option(name: &str) -> Result<()> {
             ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED,
             "CREATE/ALTER table with insert method option is not supported",
         ));
+    }
+    Ok(())
+}
+
+/// TiDB `ALTER TABLE … [DEFAULT] CHARSET|CHARACTER SET x [COLLATE y]` /
+/// `[DEFAULT] COLLATE y`: the option itself is a table-default change SealDB
+/// does not persist, but TiDB validates the names while building the spec, so
+/// an unusable collation is 1273 (and an unknown charset 1115).
+fn validate_alter_charset_option(name: &str, value: &str) -> Result<()> {
+    let value = value.trim();
+    if name.eq_ignore_ascii_case("COLLATE") {
+        if let Some(err) = crate::charset::collation_validation_error(value) {
+            return Err(err);
+        }
+    } else if name.eq_ignore_ascii_case("CHARSET") {
+        let mut parts = value.split_whitespace();
+        let charset = parts.next().unwrap_or_default().trim_matches(['\'', '"']);
+        if !crate::charset::is_supported_charset(charset) {
+            return Err(Error::new(
+                ERR_UNKNOWN_CHARACTER_SET,
+                format!("Unknown character set: '{charset}'"),
+            ));
+        }
+        if let Some(word) = parts.next()
+            && word.eq_ignore_ascii_case("COLLATE")
+            && let Some(collate) = parts.next()
+        {
+            let collate = collate.trim_matches(['\'', '"']);
+            if let Some(err) = crate::charset::collation_validation_error(collate) {
+                return Err(err);
+            }
+        }
     }
     Ok(())
 }
@@ -16867,6 +18176,28 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 ci: false,
             }))
         }
+        // MySQL `RLIKE` / `REGEXP` (`a RLIKE 'x'`): TiDB builds
+        // `regexp_like(a, 'x')`, negated as `not(regexp_like(...))`.
+        Expr::RLike {
+            negated,
+            expr,
+            pattern,
+            ..
+        } => {
+            let call = ExprNode::Func(FuncCallExpr {
+                name: "regexp_like".to_string(),
+                args: vec![lower_expr(expr)?, lower_expr(pattern)?],
+                distinct: false,
+            });
+            Ok(if *negated {
+                ExprNode::Unary(UnaryOpExpr {
+                    op: Op::Not,
+                    expr: Box::new(call),
+                })
+            } else {
+                call
+            })
+        }
         Expr::ILike {
             negated,
             expr,
@@ -16950,6 +18281,47 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 args,
                 distinct: false,
             }))
+        }
+        // `TRIM([BOTH|LEADING|TRAILING] [what] FROM str)`: the internal AST
+        // keeps only (name, args), so a directional trim becomes a marker call
+        // with the trim string as the second argument (space when omitted).
+        Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            let _ = trim_characters;
+            let value = lower_expr(expr)?;
+            let direction = trim_where.map(|w| match w {
+                sqlparser::ast::TrimWhereField::Both => "both",
+                sqlparser::ast::TrimWhereField::Leading => "leading",
+                sqlparser::ast::TrimWhereField::Trailing => "trailing",
+            });
+            let what = match trim_what {
+                Some(what) => Some(lower_expr(&what)?),
+                None => None,
+            };
+            match (direction, what) {
+                (None, None) => Ok(ExprNode::Func(FuncCallExpr {
+                    name: "trim".to_string(),
+                    args: vec![value],
+                    distinct: false,
+                })),
+                (dir, what) => {
+                    let dir = dir.unwrap_or("both");
+                    Ok(ExprNode::Func(FuncCallExpr {
+                        name: format!("__sealdb_trim_{dir}"),
+                        args: vec![
+                            value,
+                            what.unwrap_or(ExprNode::Value(ValueExpr {
+                                datum: Datum::Bytes(b" ".to_vec()),
+                            })),
+                        ],
+                        distinct: false,
+                    }))
+                }
+            }
         }
         Expr::AnyOp {
             left,
@@ -17098,6 +18470,12 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
             datum: Datum::Bytes(unit.into_bytes()),
         });
     }
+    // `CHARSET(expr)` marker from `rewrite_charset_function`.
+    let name = if name.eq_ignore_ascii_case(SEALDB_CHARSET_FN) {
+        "charset".to_string()
+    } else {
+        name
+    };
     // TiDB opcode.Not2 (`!`): rewritten as `__sealdb_bang(expr)`.
     if name.eq_ignore_ascii_case(SEALDB_BANG_FN) {
         if args.len() != 1 {
@@ -17493,14 +18871,17 @@ fn bit_literal_bytes(bits: &str) -> Result<Vec<u8>> {
 }
 
 /// Decode `X'ABCD'` / `0xABCD` hex digits into raw bytes (TiDB binary literal).
+///
+/// MySQL accepts an odd digit count and reads it as if the value were padded
+/// with a leading zero (`0x2` is `0x02`), so `concat_ws(0x2, …)` works.
 fn decode_hex_literal(hex: &str) -> Result<Vec<u8>> {
-    let h = hex.as_bytes();
-    if !h.len().is_multiple_of(2) {
-        return Err(Error::new(
-            ERR_PARSE_ERROR,
-            format!("Incorrect hex literal: {hex}"),
-        ));
-    }
+    let padded;
+    let h = if hex.len() % 2 == 0 {
+        hex.as_bytes()
+    } else {
+        padded = format!("0{hex}");
+        padded.as_bytes()
+    };
     let mut out = Vec::with_capacity(h.len() / 2);
     let nibble = |c: u8| -> Result<u8> {
         match c {
@@ -17646,6 +19027,7 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<Statement>
         name,
         columns,
         unique: create.unique,
+        global: index_def_global(&create.index_options),
         invisible: index_def_invisible(&create.index_options),
     }))
 }
@@ -17659,6 +19041,7 @@ fn lower_rename_tables(renames: &[SqlRenameTable]) -> Result<Statement> {
         specs: vec![AlterTableSpec::RenameTable {
             new_name: object_table_name(&renames[0].new_name)?,
         }],
+        from_rename_table: true,
     }))
 }
 
@@ -17687,6 +19070,7 @@ fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<Statement> {
     Ok(Statement::AlterTable(AlterTableStmt {
         table: object_table_name(&alter.name)?,
         specs,
+        from_rename_table: false,
     }))
 }
 
@@ -17706,6 +19090,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 generated: lower_generated_column(&column_def.options)?,
                 auto_increment: lower_auto_increment(&column_def.options),
                 auto_random: lower_auto_random(&column_def.options),
+                auto_random_range: lower_auto_random_range(&column_def.options),
                 not_null: lower_not_null(&column_def.options),
                 explicit_null: column_def
                     .options
@@ -17739,6 +19124,17 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             if_exists: false,
             name: name.value.clone(),
         }),
+        AlterTableOperation::DropForeignKey {
+            name,
+            drop_behavior,
+        } => {
+            if drop_behavior.is_some() {
+                return Err(Error::unsupported("DROP FOREIGN KEY drop behavior"));
+            }
+            Ok(AlterTableSpec::DropForeignKey {
+                name: name.value.clone(),
+            })
+        }
         AlterTableOperation::ChangeColumn {
             old_name,
             new_name,
@@ -17765,6 +19161,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 type_name: data_type.to_string(),
                 default: lower_column_option_default(options),
                 generated: lower_column_option_generated(options)?,
+                auto_random: lower_column_option_auto_random(options),
+                auto_random_range: lower_column_option_auto_random_range(options),
                 not_null: lower_not_null_option(options),
                 charset: lower_column_option_charset(options),
                 collate: lower_column_option_collate(options),
@@ -17798,6 +19196,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 type_name: data_type.to_string(),
                 default: lower_column_option_default(options),
                 generated: lower_column_option_generated(options)?,
+                auto_random: lower_column_option_auto_random(options),
+                auto_random_range: lower_column_option_auto_random_range(options),
                 not_null: lower_not_null_option(options),
                 charset: lower_column_option_charset(options),
                 collate: lower_column_option_collate(options),
@@ -17963,7 +19363,7 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                 indices.push(lower_unique_index(idx)?);
             }
             TableConstraint::PrimaryKey(idx) => {
-                auto_names.push(false);
+                auto_names.push(idx.index_name.is_none() && idx.name.is_none());
                 indices.push(lower_primary_key(idx)?);
             }
             // Accept FK syntax as no-op for now (TiDB stores; enforcement is separate).
@@ -18009,25 +19409,36 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
     Ok(rename_duplicate_index_names(indices, &auto_names))
 }
 
-/// TiDB `renameIndexes`: duplicate *generated* non-PRIMARY index names get a
-/// `_2`, `_3`, … suffix (`expression_index`, `expression_index_2`, …). An
-/// explicit duplicate name is left alone so DDL reports 1061 / 1068.
+/// TiDB `setEmptyConstraintName`: an unnamed constraint takes its first
+/// column's name, and a name already taken (by a column-derived constraint
+/// name, including the primary key's) gets a `_2`, `_3`, … suffix. The primary
+/// key itself is stored as `PRIMARY`, but its derived name still occupies the
+/// column name, so `primary key (k), key (k)` names the second index `k_2`.
+/// Explicit duplicate names are left alone so DDL reports 1061 / 1068.
 fn rename_duplicate_index_names(mut indices: Vec<IndexDef>, auto: &[bool]) -> Vec<IndexDef> {
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (pos, idx) in indices.iter().enumerate() {
+        if !auto.get(pos).copied().unwrap_or(false) {
+            used.insert(idx.name.to_ascii_lowercase());
+        }
+    }
     for (pos, idx) in indices.iter_mut().enumerate() {
-        if idx.name.eq_ignore_ascii_case("PRIMARY") {
-            continue;
-        }
-        if used.insert(idx.name.clone()) {
-            continue;
-        }
         if !auto.get(pos).copied().unwrap_or(false) {
             continue;
         }
+        if idx.primary {
+            // The index is `PRIMARY`, but the auto name based on its first
+            // column is what later unnamed constraints have to avoid.
+            used.insert(default_index_name(&idx.columns).to_ascii_lowercase());
+            continue;
+        }
         let base = idx.name.clone();
+        if used.insert(base.to_ascii_lowercase()) {
+            continue;
+        }
         for i in 2.. {
             let candidate = format!("{base}_{i}");
-            if used.insert(candidate.clone()) {
+            if used.insert(candidate.to_ascii_lowercase()) {
                 idx.name = candidate;
                 break;
             }

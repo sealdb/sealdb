@@ -8,8 +8,9 @@ use sealdb_errno::{
 };
 use sealdb_parser::ast::{
     AlterUserStmt, CreateRoleStmt, CreateUserStmt, DropRoleStmt, DropUserStmt, GrantLevel,
-    GrantLevelType, GrantRoleStmt, GrantStmt, PrivilegeType, RenameUserStmt, RevokeRoleStmt,
-    RevokeStmt, SetDefaultRoleStmt, SetPwdStmt, SetRoleKind, UserIdentity,
+    GrantLevelType, GrantRoleStmt, GrantStmt, PasswordExpireOption, PrivilegeType, RenameUserStmt,
+    RequireClause, RevokeRoleStmt, RevokeStmt, SetDefaultRoleStmt, SetPwdStmt, SetRoleKind,
+    UserIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -35,6 +36,26 @@ struct GrantEntry {
 
 /// One materialized `mysql.tables_priv` row (TiDB keeps the same grant
 /// entries in memory and in the system table).
+/// One materialized `mysql.columns_priv` row.
+#[derive(Clone, Debug)]
+pub struct ColumnPrivRow {
+    pub host: String,
+    pub db: String,
+    pub user: String,
+    pub table: String,
+    pub column: String,
+    pub column_priv: String,
+}
+
+/// One materialized `mysql.global_grants` row (dynamic privilege).
+#[derive(Clone, Debug)]
+pub struct GlobalGrantRow {
+    pub user: String,
+    pub host: String,
+    pub privilege: String,
+    pub with_grant: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct TablePrivRow {
     pub host: String,
@@ -44,6 +65,50 @@ pub struct TablePrivRow {
     pub grantor: String,
     pub table_priv: String,
     pub column_priv: String,
+}
+
+/// Global password-reuse policy (TiDB `password_history` /
+/// `password_reuse_interval` sysvars).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PasswordPolicy {
+    pub history: i64,
+    pub reuse_days: i64,
+}
+
+/// One `mysql.password_history` row.
+#[derive(Clone, Debug)]
+pub struct PasswordHistoryRow {
+    pub host: String,
+    pub user: String,
+    /// Unix epoch microseconds.
+    pub timestamp_micros: i64,
+    pub password: String,
+}
+
+/// Per-account password metadata kept in `mysql.user`.
+#[derive(Clone, Debug)]
+pub struct AccountPasswordOptions {
+    /// `mysql.user.plugin` (empty renders as `mysql_native_password`).
+    pub plugin: String,
+    pub expired: bool,
+    /// `mysql.user.Password_lifetime` (NULL = follow the global default).
+    pub lifetime: Option<i64>,
+    /// `mysql.user.Password_reuse_history`.
+    pub reuse_history: Option<i64>,
+    /// `mysql.user.Password_reuse_time` (days).
+    pub reuse_time: Option<i64>,
+}
+
+impl Default for AccountPasswordOptions {
+    fn default() -> Self {
+        Self {
+            plugin: "mysql_native_password".to_string(),
+            expired: false,
+            lifetime: None,
+            reuse_history: None,
+            reuse_time: None,
+        }
+    }
 }
 
 struct Store {
@@ -62,6 +127,12 @@ struct Store {
     default_roles: HashMap<(String, String), HashSet<(String, String)>>,
     /// TiDB `mysql.user.User_attributes` payload (`COMMENT`, `RESOURCE GROUP`).
     attributes: HashMap<(String, String), UserAttributes>,
+    /// `REQUIRE …` TLS requirements (`mysql.global_priv.Priv`).
+    require: HashMap<(String, String), RequireClause>,
+    /// `mysql.user` password lifetime / reuse / plugin metadata.
+    password_options: HashMap<(String, String), AccountPasswordOptions>,
+    /// `mysql.password_history` rows.
+    password_history: Vec<PasswordHistoryRow>,
 }
 
 /// TiDB user attributes kept in `mysql.user.User_attributes` JSON.
@@ -102,6 +173,29 @@ pub struct UserRow {
     pub global_privs: PrivilegeType,
     pub with_grant: bool,
     pub plugin: String,
+    pub require: RequireClause,
+    pub password_expired: bool,
+    pub password_lifetime: Option<i64>,
+    pub password_reuse_history: Option<i64>,
+    pub password_reuse_time: Option<i64>,
+}
+
+/// One materialized `mysql.db` row (database-level grant).
+#[derive(Clone, Debug)]
+pub struct DbPrivRow {
+    pub host: String,
+    pub db: String,
+    pub user: String,
+    pub privs: PrivilegeType,
+    pub with_grant: bool,
+}
+
+/// One materialized `mysql.global_priv` row (account JSON snapshot).
+#[derive(Clone, Debug)]
+pub struct GlobalPrivRow {
+    pub host: String,
+    pub user: String,
+    pub priv_json: String,
 }
 
 /// One `information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES` row.
@@ -131,6 +225,9 @@ impl Manager {
                 users: HashMap::new(),
                 default_roles: HashMap::new(),
                 attributes: HashMap::new(),
+                require: HashMap::new(),
+                password_options: HashMap::new(),
+                password_history: Vec::new(),
             }),
         }
     }
@@ -146,6 +243,9 @@ impl Manager {
                 users: HashMap::new(),
                 default_roles: HashMap::new(),
                 attributes: HashMap::new(),
+                require: HashMap::new(),
+                password_options: HashMap::new(),
+                password_history: Vec::new(),
             }),
         };
         {
@@ -171,26 +271,53 @@ impl Manager {
     }
 
     pub fn grant(&self, stmt: &GrantStmt) -> Result<()> {
-        // TiDB never auto-creates accounts from GRANT; targeting a missing
-        // account fails with ER_CANT_CREATE_USER_WITH_GRANT (1410). Roles are
-        // accounts too (`CREATE ROLE`), so they are valid grantees.
+        check_dynamic_priv_level(&stmt.level, &stmt.dynamic_privs)?;
+        // MySQL without `NO_AUTO_CREATE_USER` creates a missing account from
+        // `GRANT … TO u` (with `IDENTIFIED BY` as its password). With the mode
+        // on — TiDB's default — IMGRANT to a missing account fails with
+        // ER_CANT_CREATE_USER_WITH_GRANT (1410). Roles are accounts too
+        // (`CREATE ROLE`), so they are valid grantees.
         if !self.skip_grant_table {
-            let inner = self.inner.lock().expect("privilege lock");
+            let mut inner = self.inner.lock().expect("privilege lock");
+            let forbid_create = thread_no_auto_create_user();
             for user in &stmt.users {
                 let key = user_key(user);
                 if !inner.users.contains_key(&key) && !inner.roles.contains(&key) {
-                    return Err(Error::new(
-                        sealdb_errno::ERR_CANT_CREATE_USER_WITH_GRANT,
-                        "You are not allowed to create a user with GRANT",
-                    ));
+                    if forbid_create {
+                        return Err(Error::new(
+                            sealdb_errno::ERR_CANT_CREATE_USER_WITH_GRANT,
+                            "You are not allowed to create a user with GRANT",
+                        ));
+                    }
+                    inner.users.insert(key.clone(), None);
+                }
+            }
+            for user in &stmt.users {
+                let key = user_key(user);
+                if let Some(auth) = &stmt.auth
+                    && inner.users.contains_key(&key)
+                {
+                    inner
+                        .users
+                        .insert(key.clone(), Some(encode_native_password(auth)));
+                }
+                if let Some(require) = &stmt.require {
+                    if require.none || require.is_empty() {
+                        inner.require.remove(&key);
+                    } else {
+                        inner.require.insert(key.clone(), require.clone());
+                    }
                 }
             }
         }
         if !stmt.dynamic_privs.is_empty() {
             let mut inner = self.inner.lock().expect("privilege lock");
             for user in &stmt.users {
-                let set = inner.dynamic.entry(user_key(user)).or_default();
                 for name in &stmt.dynamic_privs {
+                    if !sealdb_parser::sqlparser_bridge::is_dynamic_priv(name) {
+                        continue;
+                    }
+                    let set = inner.dynamic.entry(user_key(user)).or_default();
                     let slot = set.entry(name.to_ascii_uppercase()).or_insert(false);
                     *slot |= stmt.with_grant;
                 }
@@ -208,6 +335,20 @@ impl Manager {
     }
 
     pub fn revoke(&self, stmt: &RevokeStmt) -> Result<()> {
+        check_dynamic_priv_level(&stmt.level, &stmt.dynamic_privs)?;
+        if !self.skip_grant_table {
+            // TiDB rejects `REVOKE … FROM missing` before touching any grant.
+            let inner = self.inner.lock().expect("privilege lock");
+            for user in &stmt.users {
+                let key = user_key(user);
+                if !inner.users.contains_key(&key) && !inner.roles.contains(&key) {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_UNKNOWN_ERROR,
+                        format!("Unknown user: {}@{}", user.username, user.hostname),
+                    ));
+                }
+            }
+        }
         let mut inner = self.inner.lock().expect("privilege lock");
         if !stmt.dynamic_privs.is_empty() {
             for user in &stmt.users {
@@ -230,10 +371,6 @@ impl Manager {
             if let Some(entries) = inner.grants.get_mut(&key) {
                 for entry in entries.iter_mut() {
                     if !same_level(entry, &stmt.level) {
-                        continue;
-                    }
-                    if stmt.grant_option {
-                        entry.with_grant = false;
                         continue;
                     }
                     for elem in &stmt.privs {
@@ -261,6 +398,9 @@ impl Manager {
                         if elem.tp.is_all() || entry.privs.is_empty() {
                             entry.with_grant = false;
                         }
+                    }
+                    if stmt.grant_option {
+                        entry.with_grant = false;
                     }
                 }
                 entries.retain(|e| !e.privs.is_empty() || e.with_grant);
@@ -324,15 +464,15 @@ impl Manager {
         UserIdentity::new(username, client_host)
     }
 
-    pub fn create_user(&self, stmt: &CreateUserStmt) -> Result<()> {
+    pub fn create_user(&self, stmt: &CreateUserStmt, global: PasswordPolicy) -> Result<()> {
         let mut inner = self.inner.lock().expect("privilege lock");
+        let decl = PasswordDeclaration::from_specs(&stmt.users);
+        // Validate every spec up front: TiDB runs the whole statement in one txn.
         for spec in &stmt.users {
             validate_account_name(&spec.user)?;
+            validate_auth_plugin(spec)?;
             let key = user_key(&spec.user);
-            if inner.users.contains_key(&key) {
-                if stmt.if_not_exists {
-                    continue;
-                }
+            if inner.users.contains_key(&key) && !stmt.if_not_exists {
                 return Err(Error::new(
                     sealdb_errno::ERR_TABLE_EXISTS,
                     format!(
@@ -341,45 +481,163 @@ impl Manager {
                     ),
                 ));
             }
-            inner.users.insert(
-                key.clone(),
-                spec.auth.as_deref().map(encode_native_password),
-            );
+            if spec.user.username.is_empty() && decl.expire == Some(PasswordExpireOption::Expire) {
+                return Err(anonymous_expire_error());
+            }
+            decl.validate()?;
+        }
+        for spec in &stmt.users {
+            let key = user_key(&spec.user);
+            if inner.users.contains_key(&key) {
+                continue;
+            }
+            let plugin = spec
+                .auth_plugin
+                .clone()
+                .unwrap_or_else(|| "mysql_native_password".to_string());
+            let auth = spec
+                .auth
+                .as_deref()
+                .map(|pwd| encode_password_for_plugin(&plugin, pwd, spec.auth_is_hash));
+            inner.users.insert(key.clone(), auth.clone());
+            if let Some(require) = &spec.require {
+                if require.none || require.is_empty() {
+                    inner.require.remove(&key);
+                } else {
+                    inner.require.insert(key.clone(), require.clone());
+                }
+            }
             let attrs = UserAttributes {
                 comment: spec.comment.clone(),
                 resource_group: spec.resource_group.clone(),
             };
             if !attrs.is_empty() {
-                inner.attributes.insert(key, attrs);
+                inner.attributes.insert(key.clone(), attrs);
+            }
+            let mut opts = AccountPasswordOptions {
+                plugin: plugin.clone(),
+                ..Default::default()
+            };
+            decl.apply_create(&mut opts)?;
+            inner.password_options.insert(key.clone(), opts);
+            if let Some(pwd) = auth
+                && !pwd.is_empty()
+            {
+                let policy = reuse_info(&inner, &key, &decl, global);
+                insert_history_if_enabled(&mut inner, &key, &pwd, &plugin, policy);
             }
         }
         Ok(())
     }
 
-    /// `ALTER USER … IDENTIFIED BY | COMMENT | RESOURCE GROUP`. TiDB updates
-    /// the account in place; a missing account fails with 1396.
-    pub fn alter_user(&self, stmt: &AlterUserStmt) -> Result<()> {
+    /// `ALTER USER … IDENTIFIED … | PASSWORD … | COMMENT | RESOURCE GROUP`.
+    /// TiDB applies every spec in one txn: a missing account fails the whole
+    /// statement with 1396 unless `IF EXISTS` turns it into warning 3162.
+    pub fn alter_user(
+        &self,
+        stmt: &AlterUserStmt,
+        global: PasswordPolicy,
+    ) -> Result<Vec<(u16, String)>> {
         let mut inner = self.inner.lock().expect("privilege lock");
+        let decl = PasswordDeclaration::from_specs(&stmt.users);
+        decl.validate()?;
+        let mut missing = Vec::new();
         for spec in &stmt.users {
             validate_account_name(&spec.user)?;
+            validate_auth_plugin(spec)?;
             let key = user_key(&spec.user);
-            if !inner.users.contains_key(&key) {
-                if self.skip_grant_table {
-                    inner.users.insert(key.clone(), None);
-                } else {
-                    return Err(Error::new(
-                        sealdb_errno::ERR_CANNOT_USER,
-                        format!(
-                            "Operation ALTER USER failed for '{}'@'{}'",
-                            spec.user.username, spec.user.hostname
-                        ),
-                    ));
+            if !inner.users.contains_key(&key)
+                && !inner.roles.contains(&key)
+                && !self.skip_grant_table
+            {
+                missing.push((spec.user.clone(), key));
+            }
+        }
+        let mut warnings = Vec::new();
+        if !missing.is_empty() {
+            if !stmt.if_exists {
+                let user = &missing[0].0;
+                return Err(Error::new(
+                    sealdb_errno::ERR_CANNOT_USER,
+                    format!(
+                        "Operation ALTER USER failed for '{}'@'{}'",
+                        user.username, user.hostname
+                    ),
+                ));
+            }
+            for (user, _) in &missing {
+                warnings.push((
+                    3162,
+                    format!(
+                        "User '{}'@'{}' does not exist.",
+                        user.username, user.hostname
+                    ),
+                ));
+            }
+        }
+        if decl.expire == Some(PasswordExpireOption::Expire) {
+            for spec in &stmt.users {
+                let key = user_key(&spec.user);
+                if spec.user.username.is_empty()
+                    && (inner.users.contains_key(&key) || inner.roles.contains(&key))
+                {
+                    return Err(anonymous_expire_error());
                 }
             }
-            if let Some(auth) = &spec.auth {
-                inner
-                    .users
-                    .insert(key.clone(), Some(encode_native_password(auth)));
+        }
+        for spec in &stmt.users {
+            let key = user_key(&spec.user);
+            if !inner.users.contains_key(&key) {
+                if inner.roles.contains(&key) || self.skip_grant_table {
+                    inner.users.insert(key.clone(), None);
+                } else {
+                    continue;
+                }
+            }
+            let current_plugin = inner
+                .password_options
+                .get(&key)
+                .map(|opts| opts.plugin.clone())
+                .unwrap_or_default();
+            let current_plugin = normalize_plugin(&current_plugin).to_string();
+            if spec.auth.is_some() || spec.auth_plugin.is_some() {
+                let plugin = spec
+                    .auth_plugin
+                    .clone()
+                    .unwrap_or_else(|| current_plugin.clone());
+                // TiDB prunes the history when the auth plugin changes, even
+                // when the statement does not supply a new password.
+                if !plugin.eq_ignore_ascii_case(&current_plugin) {
+                    inner
+                        .password_history
+                        .retain(|row| !(row.user == key.0 && row.host == key.1));
+                }
+                if spec.auth.is_some() {
+                    let pwd = encode_password_for_plugin(
+                        &plugin,
+                        spec.auth.as_deref().unwrap_or(""),
+                        spec.auth_is_hash,
+                    );
+                    if !pwd.is_empty() {
+                        let policy = reuse_info(&inner, &key, &decl, global);
+                        verify_and_record_password(&mut inner, &key, &pwd, &plugin, policy)?;
+                    }
+                    inner.users.insert(key.clone(), Some(pwd));
+                }
+                let opts = inner.password_options.entry(key.clone()).or_default();
+                opts.plugin = plugin;
+            }
+            let opts = inner.password_options.entry(key.clone()).or_default();
+            if spec.auth.is_some() && decl.expire.is_none() {
+                opts.expired = false;
+            }
+            decl.apply_alter(opts);
+            if let Some(require) = &spec.require {
+                if require.none || require.is_empty() {
+                    inner.require.remove(&key);
+                } else {
+                    inner.require.insert(key.clone(), require.clone());
+                }
             }
             if spec.comment.is_some() || spec.resource_group.is_some() {
                 let attrs = inner.attributes.entry(key).or_default();
@@ -391,7 +649,7 @@ impl Manager {
                 }
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 
     pub fn drop_user(&self, stmt: &DropUserStmt) -> Result<()> {
@@ -414,6 +672,11 @@ impl Manager {
             inner.dynamic.remove(&key);
             inner.role_graph.remove(&key);
             inner.attributes.remove(&key);
+            inner.require.remove(&key);
+            inner.password_options.remove(&key);
+            inner
+                .password_history
+                .retain(|row| !(row.user == key.0 && row.host == key.1));
         }
         Ok(())
     }
@@ -444,6 +707,9 @@ impl Manager {
             inner.users.clone(),
             inner.default_roles.clone(),
             inner.attributes.clone(),
+            inner.require.clone(),
+            inner.password_options.clone(),
+            inner.password_history.clone(),
         );
         let result = (|| -> Result<()> {
             for pair in &stmt.user_to_users {
@@ -473,8 +739,20 @@ impl Manager {
                 if let Some(attrs) = inner.attributes.remove(&old_key) {
                     inner.attributes.insert(new_key.clone(), attrs);
                 }
+                if let Some(require) = inner.require.remove(&old_key) {
+                    inner.require.insert(new_key.clone(), require);
+                }
                 if let Some(defaults) = inner.default_roles.remove(&old_key) {
                     inner.default_roles.insert(new_key.clone(), defaults);
+                }
+                if let Some(opts) = inner.password_options.remove(&old_key) {
+                    inner.password_options.insert(new_key.clone(), opts);
+                }
+                for row in inner.password_history.iter_mut() {
+                    if row.user == old_key.0 && row.host == old_key.1 {
+                        row.user = new_key.0.clone();
+                        row.host = new_key.1.clone();
+                    }
                 }
                 for roles in inner.default_roles.values_mut() {
                     if roles.remove(&old_key) {
@@ -501,6 +779,9 @@ impl Manager {
             inner.users = snapshot.4;
             inner.default_roles = snapshot.5;
             inner.attributes = snapshot.6;
+            inner.require = snapshot.7;
+            inner.password_options = snapshot.8;
+            inner.password_history = snapshot.9;
         }
         result
     }
@@ -565,9 +846,14 @@ impl Manager {
             .collect()
     }
 
-    /// `SET PASSWORD` — update auth string (mysql_native_password plugin, ).
-    /// Stores the password the same way as `CREATE USER … IDENTIFIED BY`.
-    pub fn set_password(&self, stmt: &SetPwdStmt, current: &UserIdentity) -> Result<()> {
+    /// `SET PASSWORD` — update auth string, honouring the password-reuse policy
+    /// (`mysql.password_history`) and clearing `password_expired`.
+    pub fn set_password(
+        &self,
+        stmt: &SetPwdStmt,
+        current: &UserIdentity,
+        global: PasswordPolicy,
+    ) -> Result<()> {
         let target = stmt.user.clone().unwrap_or_else(|| current.clone());
         let key = user_key(&target);
         let mut inner = self.inner.lock().expect("privilege lock");
@@ -586,8 +872,20 @@ impl Manager {
                 ));
             }
         }
-        let auth = encode_native_password(&stmt.password);
-        inner.users.insert(key, Some(auth));
+        let plugin = inner
+            .password_options
+            .get(&key)
+            .map(|opts| opts.plugin.clone())
+            .unwrap_or_default();
+        let plugin = normalize_plugin(&plugin).to_string();
+        let auth = encode_password_for_plugin(&plugin, &stmt.password, false);
+        if !auth.is_empty() {
+            let policy = reuse_info(&inner, &key, &PasswordDeclaration::default(), global);
+            verify_and_record_password(&mut inner, &key, &auth, &plugin, policy)?;
+        }
+        inner.users.insert(key.clone(), Some(auth));
+        let opts = inner.password_options.entry(key).or_default();
+        opts.expired = false;
         Ok(())
     }
 
@@ -629,7 +927,14 @@ impl Manager {
                     ),
                 ));
             }
-            inner.roles.insert(key);
+            inner.roles.insert(key.clone());
+            inner.password_options.insert(
+                key,
+                AccountPasswordOptions {
+                    expired: true,
+                    ..Default::default()
+                },
+            );
         }
         Ok(())
     }
@@ -651,6 +956,10 @@ impl Manager {
                 ));
             }
             inner.grants.remove(&key);
+            inner.password_options.remove(&key);
+            inner
+                .password_history
+                .retain(|row| !(row.user == key.0 && row.host == key.1));
             for members in inner.role_graph.values_mut() {
                 members.remove(&key);
             }
@@ -1246,6 +1555,65 @@ impl Manager {
         rows
     }
 
+    /// Materialize `mysql.columns_priv` rows: one row per column grant.
+    pub fn column_priv_rows(&self) -> Vec<ColumnPrivRow> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut rows = Vec::new();
+        for ((user, host), entries) in &inner.grants {
+            for entry in entries {
+                if entry.db.is_empty() || entry.table.is_empty() {
+                    continue;
+                }
+                for (bits, column) in &entry.columns {
+                    let name = bits
+                        .table_priv_set_names()
+                        .into_iter()
+                        .filter(|name| {
+                            matches!(*name, "Select" | "Insert" | "Update" | "References")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    rows.push(ColumnPrivRow {
+                        host: host.clone(),
+                        db: entry.db.clone(),
+                        user: user.clone(),
+                        table: entry.table.clone(),
+                        column: column.clone(),
+                        column_priv: name,
+                    });
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            (&a.host, &a.db, &a.user, &a.table, &a.column)
+                .cmp(&(&b.host, &b.db, &b.user, &b.table, &b.column))
+        });
+        rows
+    }
+
+    /// Materialize `mysql.global_grants` rows: dynamic privileges per account.
+    pub fn global_grant_rows(&self) -> Vec<GlobalGrantRow> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut rows = Vec::new();
+        for ((user, host), set) in &inner.dynamic {
+            for (name, with_grant) in set {
+                rows.push(GlobalGrantRow {
+                    user: user.clone(),
+                    host: host.clone(),
+                    privilege: name.clone(),
+                    with_grant: *with_grant,
+                });
+            }
+        }
+        rows.sort_by(|a, b| {
+            (&a.user, &a.host, &a.privilege).cmp(&(&b.user, &b.host, &b.privilege))
+        });
+        rows
+    }
+
     /// Rows for `information_schema.{SCHEMA,TABLE,COLUMN}_PRIVILEGES`.
     pub fn privilege_rows(&self) -> Vec<PrivRow> {
         let inner = self.inner.lock().expect("privilege lock");
@@ -1383,6 +1751,43 @@ impl Manager {
                     resource_group: attrs.resource_group.clone(),
                 })
                 .collect(),
+            require: inner
+                .require
+                .iter()
+                .map(|((u, h), require)| PersistRequire {
+                    user: u.clone(),
+                    host: h.clone(),
+                    none: require.none,
+                    ssl: require.ssl,
+                    x509: require.x509,
+                    issuer: require.issuer.clone(),
+                    subject: require.subject.clone(),
+                    cipher: require.cipher.clone(),
+                })
+                .collect(),
+            password_options: inner
+                .password_options
+                .iter()
+                .map(|((u, h), opts)| PersistPasswordOptions {
+                    user: u.clone(),
+                    host: h.clone(),
+                    plugin: opts.plugin.clone(),
+                    expired: opts.expired,
+                    lifetime: opts.lifetime,
+                    reuse_history: opts.reuse_history,
+                    reuse_time: opts.reuse_time,
+                })
+                .collect(),
+            password_history: inner
+                .password_history
+                .iter()
+                .map(|row| PersistPasswordHistory {
+                    host: row.host.clone(),
+                    user: row.user.clone(),
+                    timestamp_micros: row.timestamp_micros,
+                    password: row.password.clone(),
+                })
+                .collect(),
         };
         serde_json::to_vec(&snap).map_err(|e| {
             Error::new(
@@ -1486,6 +1891,20 @@ impl Manager {
         for edge in snap.default_roles {
             default_roles.insert((edge.user, edge.host), edge.roles.into_iter().collect());
         }
+        let mut require = HashMap::new();
+        for r in snap.require {
+            require.insert(
+                (r.user, r.host),
+                RequireClause {
+                    none: r.none,
+                    ssl: r.ssl,
+                    x509: r.x509,
+                    issuer: r.issuer,
+                    subject: r.subject,
+                    cipher: r.cipher,
+                },
+            );
+        }
         let mut inner = self.inner.lock().expect("privilege lock");
         inner.grants = grants;
         inner.roles = roles;
@@ -1493,6 +1912,31 @@ impl Manager {
         inner.dynamic = dynamic;
         inner.attributes = attributes;
         inner.default_roles = default_roles;
+        inner.require = require;
+        let mut password_options = HashMap::new();
+        for opts in snap.password_options {
+            password_options.insert(
+                (opts.user, opts.host),
+                AccountPasswordOptions {
+                    plugin: opts.plugin,
+                    expired: opts.expired,
+                    lifetime: opts.lifetime,
+                    reuse_history: opts.reuse_history,
+                    reuse_time: opts.reuse_time,
+                },
+            );
+        }
+        inner.password_options = password_options;
+        inner.password_history = snap
+            .password_history
+            .into_iter()
+            .map(|row| PasswordHistoryRow {
+                host: row.host,
+                user: row.user,
+                timestamp_micros: row.timestamp_micros,
+                password: row.password,
+            })
+            .collect();
         if !users.is_empty() {
             inner.users = users;
         }
@@ -1526,9 +1970,19 @@ impl Manager {
     /// the global static privileges and `User_attributes` JSON.
     pub fn user_rows(&self) -> Vec<UserRow> {
         let inner = self.inner.lock().expect("privilege lock");
-        let mut users: Vec<_> = inner.users.iter().collect();
-        users.sort_by(|((u1, h1), _), ((u2, h2), _)| h1.cmp(h2).then(u1.cmp(u2)));
-        users
+        // TiDB materializes roles in `mysql.user` too (they are accounts).
+        let mut accounts: Vec<((String, String), Option<String>)> = inner
+            .users
+            .iter()
+            .map(|(key, auth)| (key.clone(), auth.clone()))
+            .collect();
+        for role in &inner.roles {
+            if !inner.users.contains_key(role) {
+                accounts.push((role.clone(), None));
+            }
+        }
+        accounts.sort_by(|((u1, h1), _), ((u2, h2), _)| h1.cmp(h2).then(u1.cmp(u2)));
+        accounts
             .into_iter()
             .map(|((user, host), auth)| {
                 let mut privs = PrivilegeType::default();
@@ -1549,6 +2003,11 @@ impl Manager {
                     .get(&(user.clone(), host.clone()))
                     .map(UserAttributes::to_json)
                     .unwrap_or_else(|| "{}".to_string());
+                let opts = inner
+                    .password_options
+                    .get(&(user.clone(), host.clone()))
+                    .cloned()
+                    .unwrap_or_default();
                 UserRow {
                     host: host.clone(),
                     user: user.clone(),
@@ -1556,8 +2015,133 @@ impl Manager {
                     attributes,
                     global_privs: privs,
                     with_grant,
-                    plugin: "mysql_native_password".to_string(),
+                    plugin: normalize_plugin(&opts.plugin).to_string(),
+                    require: inner
+                        .require
+                        .get(&(user.clone(), host.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                    password_expired: opts.expired,
+                    password_lifetime: opts.lifetime,
+                    password_reuse_history: opts.reuse_history,
+                    password_reuse_time: opts.reuse_time,
                 }
+            })
+            .collect()
+    }
+
+    /// `REQUIRE …` TLS requirement for `user` (empty when not set).
+    pub fn require_of(&self, user: &UserIdentity) -> RequireClause {
+        self.inner
+            .lock()
+            .expect("privilege lock")
+            .require
+            .get(&user_key(user))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether the account (user or role) exists.
+    pub fn account_exists(&self, user: &UserIdentity) -> bool {
+        let inner = self.inner.lock().expect("privilege lock");
+        let key = user_key(user);
+        inner.users.contains_key(&key) || inner.roles.contains(&key)
+    }
+
+    /// Rows for the virtual `mysql.password_history` table.
+    pub fn password_history_rows(&self) -> Vec<PasswordHistoryRow> {
+        let mut rows = self
+            .inner
+            .lock()
+            .expect("privilege lock")
+            .password_history
+            .clone();
+        rows.sort_by(|a, b| {
+            (&a.user, &a.host, a.timestamp_micros).cmp(&(&b.user, &b.host, b.timestamp_micros))
+        });
+        rows
+    }
+
+    /// Move one `mysql.password_history` row's timestamp (`UPDATE … SET
+    /// Password_timestamp = …` targets the `mysql.password_history` virtual
+    /// table).
+    pub fn set_password_history_timestamp(
+        &self,
+        user: &str,
+        host: &str,
+        old_micros: i64,
+        new_micros: i64,
+    ) {
+        let mut inner = self.inner.lock().expect("privilege lock");
+        for row in inner.password_history.iter_mut() {
+            if row.user == user
+                && row.host.eq_ignore_ascii_case(host)
+                && row.timestamp_micros == old_micros
+            {
+                row.timestamp_micros = new_micros;
+                break;
+            }
+        }
+    }
+
+    /// `SHOW CREATE USER` DDL for `user` (TiDB `ShowCreateUserExec`).
+    pub fn show_create_user(&self, user: &UserIdentity) -> Option<String> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let key = user_key(user);
+        let auth = inner.users.get(&key)?;
+        let require = inner.require.get(&key).cloned().unwrap_or_default();
+        Some(format!(
+            "CREATE USER '{}'@'{}' IDENTIFIED WITH 'mysql_native_password' AS '{}' {} PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK PASSWORD HISTORY DEFAULT PASSWORD REUSE INTERVAL DEFAULT",
+            user.username,
+            user.hostname,
+            auth.as_deref().unwrap_or(""),
+            require.restore()
+        ))
+    }
+
+    /// Rows for the virtual `mysql.db` table: one per database-level grant.
+    pub fn db_priv_rows(&self) -> Vec<DbPrivRow> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut rows = Vec::new();
+        for ((user, host), entries) in &inner.grants {
+            for entry in entries {
+                if entry.db.is_empty() || !entry.table.is_empty() {
+                    continue;
+                }
+                rows.push(DbPrivRow {
+                    host: host.clone(),
+                    db: entry.db.clone(),
+                    user: user.clone(),
+                    privs: entry.table_privs,
+                    with_grant: entry.with_grant,
+                });
+            }
+        }
+        rows.sort_by(|a, b| (&a.host, &a.db, &a.user).cmp(&(&b.host, &b.db, &b.user)));
+        rows
+    }
+
+    /// Rows for the virtual `mysql.global_priv` table: the account JSON
+    /// snapshot (SSL fields only; empty privileges render as `{}`).
+    pub fn global_priv_rows(&self) -> Vec<GlobalPrivRow> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut accounts: Vec<((String, String), ())> = inner
+            .users
+            .keys()
+            .chain(inner.roles.iter())
+            .map(|key| (key.clone(), ()))
+            .collect();
+        accounts.sort_by(|((u1, h1), _), ((u2, h2), _)| h1.cmp(h2).then(u1.cmp(u2)));
+        accounts
+            .into_iter()
+            .map(|((user, host), _)| GlobalPrivRow {
+                priv_json: inner
+                    .require
+                    .get(&(user.clone(), host.clone()))
+                    .map(RequireClause::priv_json)
+                    .unwrap_or_else(|| "{}".to_string()),
+                host,
+                user,
             })
             .collect()
     }
@@ -1578,6 +2162,57 @@ struct PersistSnapshot {
     /// User_attributes (`COMMENT` / `RESOURCE GROUP`).
     #[serde(default)]
     attributes: Vec<PersistAttributes>,
+    /// `REQUIRE …` TLS requirements (`mysql.global_priv.Priv`).
+    #[serde(default)]
+    require: Vec<PersistRequire>,
+    /// `mysql.user` password metadata.
+    #[serde(default)]
+    password_options: Vec<PersistPasswordOptions>,
+    /// `mysql.password_history` rows.
+    #[serde(default)]
+    password_history: Vec<PersistPasswordHistory>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistPasswordOptions {
+    user: String,
+    host: String,
+    #[serde(default)]
+    plugin: String,
+    #[serde(default)]
+    expired: bool,
+    #[serde(default)]
+    lifetime: Option<i64>,
+    #[serde(default)]
+    reuse_history: Option<i64>,
+    #[serde(default)]
+    reuse_time: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistPasswordHistory {
+    host: String,
+    user: String,
+    timestamp_micros: i64,
+    password: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistRequire {
+    user: String,
+    host: String,
+    #[serde(default)]
+    none: bool,
+    #[serde(default)]
+    ssl: bool,
+    #[serde(default)]
+    x509: bool,
+    #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    cipher: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1645,6 +2280,30 @@ struct PersistRoleEdge {
     roles: Vec<(String, String)>,
 }
 
+/// TiDB `ErrIllegalPrivilegeLevel` (3619): dynamic privileges (`BACKUP_ADMIN`,
+/// `SYSTEM_VARIABLES_ADMIN`, …) only exist at the global level, even when they
+/// appear in a mixed list with table privileges.
+fn check_dynamic_priv_level(level: &GrantLevel, dynamic_privs: &[String]) -> Result<()> {
+    let registered: Vec<&String> = dynamic_privs
+        .iter()
+        .filter(|name| sealdb_parser::sqlparser_bridge::is_dynamic_priv(name))
+        .collect();
+    if registered.is_empty() || level.level == GrantLevelType::Global {
+        return Ok(());
+    }
+    Err(Error::new(
+        sealdb_errno::ERR_ILLEGAL_PRIVILEGE_LEVEL,
+        format!(
+            "Illegal privilege level specified for {}",
+            registered
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    ))
+}
+
 fn has_priv(
     store: &Store,
     user: &UserIdentity,
@@ -1710,10 +2369,9 @@ fn validate_account_name(user: &UserIdentity) -> Result<()> {
 }
 
 fn user_key(user: &UserIdentity) -> (String, String) {
-    (
-        user.username.to_ascii_lowercase(),
-        user.hostname.to_ascii_lowercase(),
-    )
+    // MySQL user names are case-sensitive (they are printed verbatim by
+    // `mysql.user`/`mysql.db`), while hosts are not.
+    (user.username.clone(), user.hostname.to_ascii_lowercase())
 }
 
 /// MySQL host-pattern match (`%` any run, `_` one char).
@@ -1734,6 +2392,295 @@ fn host_pattern_matches(pattern: &str, host: &str) -> bool {
 /// mysql_native_password-style auth string used by handshake.
 /// Already-hashed values (`*…`) are kept; otherwise store the plaintext
 /// (same shape as `CREATE USER … IDENTIFIED BY`, verified by plugin name).
+/// TiDB's default plugin name when the account has no explicit one.
+fn normalize_plugin(plugin: &str) -> &str {
+    if plugin.is_empty() {
+        "mysql_native_password"
+    } else {
+        plugin
+    }
+}
+
+/// Auth plugins TiDB ships (unknown names fail with 1524).
+const KNOWN_AUTH_PLUGINS: &[&str] = &[
+    "mysql_native_password",
+    "caching_sha2_password",
+    "tidb_sm3_password",
+    "auth_socket",
+    "tidb_auth_token",
+    "authentication_ldap_simple",
+    "authentication_ldap_sasl",
+];
+
+fn validate_auth_plugin(spec: &sealdb_parser::ast::UserSpec) -> Result<()> {
+    if let Some(plugin) = &spec.auth_plugin
+        && !KNOWN_AUTH_PLUGINS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(plugin))
+    {
+        return Err(Error::new(1524, format!("Plugin '{plugin}' is not loaded")));
+    }
+    Ok(())
+}
+
+fn anonymous_expire_error() -> Error {
+    Error::new(3016, "The password for anonymous user cannot be expired.")
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02X}"));
+    }
+    out
+}
+
+/// Encode `pwd` the way TiDB stores it for `plugin`. SealDB uses deterministic
+/// hashes for the salted TiDB plugins: only equality (the reuse policy) is
+/// observed by the SQL surface.
+fn encode_password_for_plugin(plugin: &str, pwd: &str, is_hash: bool) -> String {
+    if is_hash {
+        return pwd.to_string();
+    }
+    match plugin.to_ascii_lowercase().as_str() {
+        "auth_socket" => String::new(),
+        "caching_sha2_password" => format!(
+            "$A$005${}",
+            hex_upper(&sha1_digest(format!("caching_sha2:{pwd}").as_bytes()))
+        ),
+        "tidb_sm3_password" => format!(
+            "*{}",
+            hex_upper(&sha1_digest(format!("sm3:{pwd}").as_bytes()))
+        ),
+        _ => encode_native_password(pwd),
+    }
+}
+
+/// Statement-level `PASSWORD …` options of `CREATE USER` / `ALTER USER`
+/// (they trail the user list and apply to every account in the statement).
+#[derive(Clone, Default)]
+struct PasswordDeclaration {
+    expire: Option<PasswordExpireOption>,
+    history: Option<Option<u64>>,
+    reuse: Option<Option<u64>>,
+}
+
+impl PasswordDeclaration {
+    fn from_specs(specs: &[sealdb_parser::ast::UserSpec]) -> Self {
+        let mut decl = Self::default();
+        for spec in specs {
+            if spec.password_expire.is_some() {
+                decl.expire = spec.password_expire.clone();
+            }
+            if spec.password_history.is_some() {
+                decl.history = spec.password_history;
+            }
+            if spec.password_reuse.is_some() {
+                decl.reuse = spec.password_reuse;
+            }
+        }
+        decl
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(PasswordExpireOption::Interval(days)) = &self.expire
+            && (*days == 0 || *days > u16::MAX as u64)
+        {
+            return Err(Error::new(
+                1690,
+                format!("Incorrect value: '{days}' for DAY"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_create(&self, opts: &mut AccountPasswordOptions) -> Result<()> {
+        self.apply_alter(opts);
+        Ok(())
+    }
+
+    fn apply_alter(&self, opts: &mut AccountPasswordOptions) {
+        match &self.expire {
+            Some(PasswordExpireOption::Expire) => opts.expired = true,
+            Some(PasswordExpireOption::Default) => opts.lifetime = None,
+            Some(PasswordExpireOption::Never) => opts.lifetime = Some(0),
+            Some(PasswordExpireOption::Interval(days)) => opts.lifetime = Some(*days as i64),
+            None => {}
+        }
+        if let Some(history) = self.history {
+            opts.reuse_history = history.map(|value| value.min(u16::MAX as u64) as i64);
+        }
+        if let Some(reuse) = self.reuse {
+            opts.reuse_time = reuse.map(|value| value.min(u16::MAX as u64) as i64);
+        }
+    }
+}
+
+/// Effective reuse policy for one password change: account values fall back to
+/// the globals, and a statement-level `PASSWORD …` clause overrides both.
+fn reuse_info(
+    inner: &Store,
+    key: &(String, String),
+    decl: &PasswordDeclaration,
+    global: PasswordPolicy,
+) -> PasswordPolicy {
+    let opts = inner.password_options.get(key);
+    let mut policy = PasswordPolicy {
+        history: opts
+            .and_then(|opts| opts.reuse_history)
+            .unwrap_or(global.history),
+        reuse_days: opts
+            .and_then(|opts| opts.reuse_time)
+            .unwrap_or(global.reuse_days),
+    };
+    if let Some(history) = decl.history {
+        policy.history = history
+            .map(|value| value.min(u16::MAX as u64) as i64)
+            .unwrap_or(global.history);
+    }
+    if let Some(reuse) = decl.reuse {
+        policy.reuse_days = reuse
+            .map(|value| value.min(u16::MAX as u64) as i64)
+            .unwrap_or(global.reuse_days);
+    }
+    policy
+}
+
+/// Whether the account's policy asks TiDB to retain password history.
+fn history_enabled(policy: PasswordPolicy) -> bool {
+    policy.history > 0 || policy.reuse_days > 0
+}
+
+fn push_history(inner: &mut Store, key: &(String, String), pwd: &str) {
+    inner.password_history.push(PasswordHistoryRow {
+        host: key.1.clone(),
+        user: key.0.clone(),
+        timestamp_micros: now_micros(),
+        password: pwd.to_string(),
+    });
+}
+
+/// `CREATE USER` records the initial password when the policy is enabled (no
+/// reuse check: the account has no history yet).
+fn insert_history_if_enabled(
+    inner: &mut Store,
+    key: &(String, String),
+    pwd: &str,
+    plugin: &str,
+    policy: PasswordPolicy,
+) {
+    if pwd.is_empty() || plugin.eq_ignore_ascii_case("tidb_auth_token") {
+        return;
+    }
+    if !history_enabled(policy) {
+        return;
+    }
+    push_history(inner, key, pwd);
+}
+
+/// TiDB `checkPasswordReusePolicy` + `deleteHistoricalData` + `addHistoricalData`:
+/// reject a password that contradicts the policy, prune rows that fell out of
+/// the window, then record the new one.
+fn verify_and_record_password(
+    inner: &mut Store,
+    key: &(String, String),
+    pwd: &str,
+    plugin: &str,
+    policy: PasswordPolicy,
+) -> Result<()> {
+    if pwd.is_empty() || plugin.eq_ignore_ascii_case("tidb_auth_token") {
+        return Ok(());
+    }
+    let rows: Vec<PasswordHistoryRow> = inner
+        .password_history
+        .iter()
+        .filter(|row| row.user == key.0 && row.host == key.1)
+        .cloned()
+        .collect();
+    // A disabled policy (explicit `PASSWORD HISTORY 0` / `PASSWORD REUSE
+    // INTERVAL 0 DAY`, or globals of 0) both skips the reuse check and drops
+    // the retained history: TiDB prunes every row it no longer has to keep.
+    if !history_enabled(policy) {
+        inner
+            .password_history
+            .retain(|row| !(row.user == key.0 && row.host == key.1));
+        return Ok(());
+    }
+    let count = rows.len() as i64;
+    // Maximum number of records the next insert may prune.
+    let mut can_delete = count - policy.history + 1;
+    if can_delete < 0 {
+        can_delete = 0;
+    }
+    let mut allowed = true;
+    if policy.history <= 0 && policy.reuse_days <= 0 {
+        allowed = true;
+    } else if count <= policy.history || policy.reuse_days > i32::MAX as i64 {
+        allowed = !rows.iter().any(|row| row.password == pwd);
+    } else {
+        if policy.history > 0 {
+            let mut newest = rows.clone();
+            newest.sort_by_key(|row| std::cmp::Reverse(row.timestamp_micros));
+            allowed = !newest
+                .iter()
+                .take(policy.history as usize)
+                .any(|row| row.password == pwd);
+        }
+        if allowed && policy.reuse_days > 0 {
+            let now = now_micros();
+            let before = now.saturating_sub(policy.reuse_days.saturating_mul(86_400_000_000));
+            allowed = !rows
+                .iter()
+                .any(|row| row.password == pwd && row.timestamp_micros >= before);
+        }
+    }
+    if !allowed {
+        return Err(Error::new(
+            3638,
+            format!(
+                "Cannot use these credentials for '{}@{}' because they contradict the password history policy.",
+                key.0, key.1
+            ),
+        ));
+    }
+    // Delete rows that both exceed the retention count and left the time window.
+    if policy.reuse_days <= i32::MAX as i64 && can_delete > 0 {
+        let now = now_micros();
+        let before = if policy.reuse_days > 0 {
+            now.saturating_sub(policy.reuse_days.saturating_mul(86_400_000_000))
+        } else {
+            i64::MAX
+        };
+        let mut candidates: Vec<(i64, usize)> = inner
+            .password_history
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.user == key.0 && row.host == key.1 && row.timestamp_micros < before
+            })
+            .map(|(index, row)| (row.timestamp_micros, index))
+            .collect();
+        candidates.sort_unstable();
+        let remove: Vec<usize> = candidates
+            .into_iter()
+            .take(can_delete as usize)
+            .map(|(_, index)| index)
+            .collect();
+        for index in remove.into_iter().rev() {
+            inner.password_history.remove(index);
+        }
+    }
+    push_history(inner, key, pwd);
+    Ok(())
+}
+
 fn encode_native_password(password: &str) -> String {
     if password.is_empty() {
         return String::new();
@@ -1876,10 +2823,21 @@ thread_local! {
     /// mirroring TiDB's `ActiveRoles` (empty for `SHOW GRANTS FOR other`).
     static ACTIVE_ROLES: std::cell::RefCell<Vec<UserIdentity>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Whether the statement runs under `sql_mode=NO_AUTO_CREATE_USER`:
+    /// `GRANT` to a missing account then fails with 1410 instead of creating it.
+    static NO_AUTO_CREATE_USER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn set_thread_user(user: Option<UserIdentity>) {
     CURRENT_USER.with(|cell| *cell.borrow_mut() = user);
+}
+
+pub fn set_thread_no_auto_create_user(value: bool) {
+    NO_AUTO_CREATE_USER.with(|cell| cell.set(value));
+}
+
+pub fn thread_no_auto_create_user() -> bool {
+    NO_AUTO_CREATE_USER.with(|cell| cell.get())
 }
 
 pub fn set_thread_active_roles(roles: Vec<UserIdentity>) {

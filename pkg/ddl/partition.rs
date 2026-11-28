@@ -814,7 +814,13 @@ pub fn truncate_partitions(
         ));
     };
     let mut ids = Vec::new();
+    // `TRUNCATE PARTITION ALL` empties every partition of the table.
+    let all = names.len() == 1 && names[0].eq_ignore_ascii_case("all");
     for pname in names {
+        if all {
+            ids.extend(part.definitions.iter().map(|d| d.id));
+            break;
+        }
         let Some(def) = part
             .definitions
             .iter()
@@ -1731,6 +1737,10 @@ pub fn remove_partitioning(
             "Partition management on a not partitioned table is not possible",
         ));
     };
+    // TiDB `onReorgPartition` (ActionRemovePartitioning): every GLOBAL index is
+    // re-created with a fresh index id and therefore moves to the end of the
+    // index list; the table becomes unpartitioned, so all indexes turn LOCAL.
+    move_recreated_indexes_to_end(&mut info, |_| false);
     let old_ids: Vec<i64> = part.definitions.iter().map(|d| d.id).collect();
     let mut txn = storage.begin()?;
     use std::collections::HashSet;
@@ -2499,20 +2509,51 @@ pub fn repartition(
                 format!("Incorrect index name '{}'", update.name),
             ));
         }
-        let Some(index) = info
+        if !info
             .indices
-            .iter_mut()
-            .find(|idx| idx.name.o().eq_ignore_ascii_case(&update.name))
-        else {
+            .iter()
+            .any(|idx| idx.name.o().eq_ignore_ascii_case(&update.name))
+        {
             return Err(Error::new(
                 ERR_WRONG_NAME_FOR_INDEX,
                 format!("Incorrect index name '{}'", update.name),
             ));
-        };
-        index.global = update.global;
+        }
     }
+    let new_global = |idx: &sealdb_meta::IndexInfo| -> bool {
+        update_indexes
+            .iter()
+            .find(|u| u.name.eq_ignore_ascii_case(idx.name.o()))
+            .map(|u| u.global)
+            .unwrap_or(idx.global)
+    };
+    // TiDB re-creates every index that is (or becomes) GLOBAL with a fresh
+    // index id, which appends it to the end of the index list while applying
+    // the new locality.
+    move_recreated_indexes_to_end(&mut info, new_global);
     attach_partitions(meta, &mut info, spec)?;
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(())
+}
+/// TiDB `onReorgPartition`: while (re)partitioning, each index that is GLOBAL
+/// before or after the statement is rebuilt with a new id, so it moves to the
+/// end of `TableInfo::indices`; its locality becomes `new_global`.
+fn move_recreated_indexes_to_end(
+    info: &mut TableInfo,
+    new_global: impl Fn(&sealdb_meta::IndexInfo) -> bool,
+) {
+    let mut kept = Vec::with_capacity(info.indices.len());
+    let mut moved = Vec::new();
+    for mut idx in std::mem::take(&mut info.indices) {
+        let target = new_global(&idx);
+        if idx.global || target {
+            idx.global = target;
+            moved.push(idx);
+        } else {
+            kept.push(idx);
+        }
+    }
+    kept.extend(moved);
+    info.indices = kept;
 }

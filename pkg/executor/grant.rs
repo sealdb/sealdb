@@ -52,6 +52,128 @@ impl GrantExec {
         }
     }
 
+    /// TiDB warns 3929 for privilege names it does not know and ignores them
+    /// (`REVOKE bogus ON *.* FROM u` succeeds).
+    fn warn_unknown_dynamic_privs(dynamic: &[String]) {
+        for name in dynamic {
+            if !sealdb_parser::sqlparser_bridge::is_dynamic_priv(name) {
+                sealdb_expression::note_warning(
+                    3929,
+                    format!("Dynamic privilege '{name}' is not registered with the server."),
+                );
+            }
+        }
+    }
+
+    /// `GRANT` rejects unknown dynamic privilege names with 3929 (only
+    /// `REVOKE` degrades them to a warning).
+    fn reject_unknown_dynamic_privs(dynamic: &[String]) -> Result<()> {
+        for name in dynamic {
+            if !sealdb_parser::sqlparser_bridge::is_dynamic_priv(name) {
+                return Err(sealdb_errno::Error::new(
+                    3929,
+                    format!("Dynamic privilege '{name}' is not registered with the server."),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `GRANT`-side validation TiDB runs before touching the grant tables:
+    /// 3941 unknown dynamic privileges, 1044 for `performance_schema`, 1221
+    /// for column grants of non-column privileges, 1144 for privileges that
+    /// do not exist below the database level, and 1146 for a missing table
+    /// (only `CREATE` may be granted on one).
+    fn validate_grant(&self, grant: &sealdb_parser::ast::GrantStmt) -> Result<()> {
+        use sealdb_parser::ast::{GrantLevelType, PrivilegeType};
+        Self::reject_unknown_dynamic_privs(&grant.dynamic_privs)?;
+        let column_grantable = PrivilegeType::SELECT
+            .union(PrivilegeType::INSERT)
+            .union(PrivilegeType::UPDATE)
+            .union(PrivilegeType::REFERENCES);
+        // Privileges MySQL/TiDB only records at the database level or above.
+        let db_only = PrivilegeType::CREATE_TEMP_TABLES
+            .union(PrivilegeType::LOCK_TABLES)
+            .union(PrivilegeType::EVENT)
+            .union(PrivilegeType::CREATE_ROUTINE)
+            .union(PrivilegeType::ALTER_ROUTINE)
+            .union(PrivilegeType::CREATE_TABLESPACE)
+            .union(PrivilegeType::CREATE_USER)
+            .union(PrivilegeType::PROCESS)
+            .union(PrivilegeType::SUPER)
+            .union(PrivilegeType::RELOAD)
+            .union(PrivilegeType::SHUTDOWN)
+            .union(PrivilegeType::FILE)
+            .union(PrivilegeType::REPLICATION_SLAVE)
+            .union(PrivilegeType::REPLICATION_CLIENT)
+            .union(PrivilegeType::CONFIG)
+            .union(PrivilegeType::SYSTEM_USER)
+            .union(PrivilegeType::CREATE_ROLE)
+            .union(PrivilegeType::DROP_ROLE);
+        for elem in &grant.privs {
+            if !elem.cols.is_empty() && !column_grantable.contains(elem.tp) {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_INCORRECT_USAGE,
+                    "Incorrect usage of COLUMN GRANT and NON-COLUMN PRIVILEGES",
+                ));
+            }
+            if grant.level.level == GrantLevelType::Table && db_only.contains(elem.tp) {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_ILLEGAL_GRANT_FOR_TABLE,
+                    "Illegal GRANT/REVOKE command; please consult the manual to see which privileges can be used",
+                ));
+            }
+        }
+        if grant.level.level == GrantLevelType::DB
+            && grant
+                .level
+                .db_name
+                .eq_ignore_ascii_case("performance_schema")
+            && !grant.privs.is_empty()
+            && grant
+                .privs
+                .iter()
+                .any(|elem| !elem.tp.is_empty() && elem.tp != PrivilegeType::SELECT)
+        {
+            let caller = sealdb_privilege::thread_user()
+                .unwrap_or_else(sealdb_parser::ast::UserIdentity::root);
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_DBACCESS_DENIED_ERROR,
+                format!(
+                    "Access denied for user '{}'@'{}' to database '{}'",
+                    caller.username, caller.hostname, grant.level.db_name
+                ),
+            ));
+        }
+        if grant.level.level == GrantLevelType::Table && !grant.privs.is_empty() {
+            let db = if grant.level.db_name.is_empty() {
+                self.current_db.clone()
+            } else {
+                grant.level.db_name.clone()
+            };
+            let table = &grant.level.table_name;
+            // `metrics_schema` tables are virtual (`up`, …) and never appear in
+            // the catalog, but TiDB still accepts grants on them.
+            let virtual_schema = db.eq_ignore_ascii_case("metrics_schema");
+            let is = self.domain.infoschema();
+            if !virtual_schema && is.table_by_name(&db, table).is_none() {
+                // `CREATE` does not need the table to exist yet (TiDB
+                // `grant.go`); `ALL` includes it.
+                let creates = grant
+                    .privs
+                    .iter()
+                    .any(|elem| elem.tp.is_all() || elem.tp.contains(PrivilegeType::CREATE));
+                if !creates {
+                    return Err(sealdb_errno::Error::new(
+                        sealdb_errno::ERR_NO_SUCH_TABLE,
+                        format!("Table '{db}.{table}' doesn't exist"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn with_user(domain: Arc<Domain>, stmt: Statement, current_user: UserIdentity) -> Self {
         Self {
             domain,
@@ -71,6 +193,7 @@ impl Executor for GrantExec {
                 let mut grant = grant.clone();
                 self.qualify_level(&mut grant.level);
                 self.resolve_current_user(&mut grant.users);
+                self.validate_grant(&grant)?;
                 self.domain.privilege().grant(&grant)?;
                 persist_priv = true;
             }
@@ -78,6 +201,7 @@ impl Executor for GrantExec {
                 let mut revoke = revoke.clone();
                 self.qualify_level(&mut revoke.level);
                 self.resolve_current_user(&mut revoke.users);
+                Self::warn_unknown_dynamic_privs(&revoke.dynamic_privs);
                 self.domain.privilege().revoke(&revoke)?;
                 persist_priv = true;
             }
@@ -90,11 +214,20 @@ impl Executor for GrantExec {
                 persist_priv = true;
             }
             Statement::CreateUser(create) => {
-                self.domain.privilege().create_user(create)?;
+                self.domain
+                    .privilege()
+                    .create_user(create, self.domain.password_policy())?;
                 persist_priv = true;
             }
             Statement::AlterUser(alter) => {
-                self.domain.privilege().alter_user(alter)?;
+                let warnings = self
+                    .domain
+                    .privilege()
+                    .alter_user(alter, self.domain.password_policy())?;
+                for (code, message) in warnings {
+                    // `ALTER USER IF EXISTS` reports missing accounts as notes.
+                    sealdb_expression::note_message(i32::from(code), message);
+                }
                 persist_priv = true;
             }
             Statement::DropUser(drop) => {
@@ -110,9 +243,11 @@ impl Executor for GrantExec {
                 persist_priv = true;
             }
             Statement::SetPwd(set) => {
-                self.domain
-                    .privilege()
-                    .set_password(set, &self.current_user)?;
+                self.domain.privilege().set_password(
+                    set,
+                    &self.current_user,
+                    self.domain.password_policy(),
+                )?;
                 persist_priv = true;
             }
             Statement::Flush(flush) => match flush.tp {

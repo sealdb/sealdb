@@ -7,7 +7,7 @@ use sealdb_kv::{LockWait, RowLock, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::TableName;
 use sealdb_tablecodec::{
-    decode_handle_from_row_key, decode_row, encode_index_key, encode_row_key_with_handle,
+    decode_handle_from_row_key, decode_row, encode_index_key_collated, encode_row_key_with_handle,
 };
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -122,7 +122,14 @@ impl Executor for BatchPointGetExec {
                 let mut handles = Vec::new();
                 for lookup in &lookups {
                     for physical_id in scan_ids.iter().copied() {
-                        let key = encode_index_key(physical_id, index.id, lookup, 0, true);
+                        let key = encode_index_key_collated(
+                            physical_id,
+                            index.id,
+                            lookup,
+                            0,
+                            true,
+                            &info.index_collations(&index),
+                        );
                         let raw = txn.get_locked(key.as_bytes(), self.lock, self.wait)?;
                         if let Some(raw) = raw {
                             handles.push(decode_handle_from_row_key(&raw)?);

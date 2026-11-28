@@ -32,6 +32,21 @@ pub fn get_weight(r: char) -> (u64, u64) {
     }
 }
 
+/// Per-rune equality used by `LIKE` under `unicode_ci`, mirroring TiDB's
+/// `unicodePattern.DoMatch`: runes outside the BMP only match themselves, and
+/// long-rune weights (e.g. `ß`) never collapse to a plain letter.
+pub fn like_eq(a: char, b: char) -> bool {
+    if a as u32 > 0xFFFF || b as u32 > 0xFFFF {
+        return a == b;
+    }
+    let (wa, _) = get_weight(a);
+    let (wb, _) = get_weight(b);
+    if wa != wb {
+        return false;
+    }
+    wa != LONG_RUNE || a == b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

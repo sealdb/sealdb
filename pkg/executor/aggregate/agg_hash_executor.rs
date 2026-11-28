@@ -14,6 +14,7 @@ use sealdb_parser::ast::expressions::{
 use sealdb_parser::format::RestoreCtx;
 use sealdb_types::Datum;
 use sealdb_util::chunk::{Chunk, DataInDiskByRows, mem_row_limit};
+use sealdb_util::collate::{CollateMode, key_bytes};
 use std::collections::BTreeMap;
 
 // `Const` carries a `Datum`; boxing it would slow the hot per-row path.
@@ -49,6 +50,9 @@ pub struct HashAggExec {
     mem_limit: usize,
     spilled: bool,
     emitted: bool,
+    /// Collation of each `GROUP BY` key, so equal-under-collation values
+    /// (`'a'`/`'A'` in `utf8mb4_general_ci`) land in one group.
+    group_collations: Vec<CollateMode>,
 }
 
 impl HashAggExec {
@@ -178,7 +182,38 @@ impl HashAggExec {
             mem_limit: mem_row_limit(),
             spilled: false,
             emitted: false,
+            group_collations: Vec::new(),
         })
+    }
+
+    /// Expose additional first-row columns that `ORDER BY` needs but the
+    /// SELECT list does not carry. TiDB keeps a `firstrow(col)` item in the
+    /// aggregate's output schema for such keys and trims it in a Projection
+    /// above; the executor mirrors that by appending the column here and
+    /// letting the Sort/TopN builder trim the extra trailing columns.
+    ///
+    /// `columns` are base column names resolved against the child schema.
+    pub(crate) fn with_order_columns(mut self, columns: &[String]) -> Self {
+        for name in columns {
+            if self.schema.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            let idx = self.any_exprs.len();
+            self.any_exprs.push(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: name.clone(),
+            }));
+            self.outputs.push(OutputItem::Any(idx));
+            self.schema.push(name.clone());
+        }
+        self
+    }
+
+    /// `GROUP BY` key collations, in `select.group_by` order.
+    pub(crate) fn with_group_collations(mut self, modes: Vec<CollateMode>) -> Self {
+        self.group_collations = modes;
+        self
     }
 
     pub(crate) fn with_subquery(mut self, subquery: SubqueryEvalCtx) -> Self {
@@ -375,7 +410,7 @@ impl HashAggExec {
                 .iter()
                 .map(|expr| self.eval(expr, input_schema, &row))
                 .collect::<Result<Vec<_>>>()?;
-            let map_key = encode_group_key(&keys);
+            let map_key = encode_group_key(&keys, &self.group_collations);
             if !groups.contains_key(&map_key) {
                 let any_vals = any_exprs
                     .iter()
@@ -685,9 +720,19 @@ fn restore_expr(expr: &ExprNode) -> String {
     ctx.into_string()
 }
 
-fn encode_group_key(keys: &[Datum]) -> String {
+fn encode_group_key(keys: &[Datum], collations: &[CollateMode]) -> String {
     keys.iter()
-        .map(|d| format!("{d:?}"))
+        .enumerate()
+        .map(|(i, d)| match (d, collations.get(i)) {
+            (Datum::Bytes(bytes), Some(mode)) => match key_bytes(*mode, bytes) {
+                Some(key) => format!(
+                    "s:{}",
+                    key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                ),
+                None => format!("{d:?}"),
+            },
+            _ => format!("{d:?}"),
+        })
         .collect::<Vec<_>>()
         .join("\u{1f}")
 }

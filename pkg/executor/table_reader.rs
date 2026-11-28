@@ -220,7 +220,21 @@ pub(crate) fn scan_table_filtered(
     physical_ids: &[i64],
     filter: Option<&ExprNode>,
 ) -> Result<Vec<ScannedRow>> {
-    handle.with_txn(|txn| {
+    handle.with_txn(|txn| scan_table_in_txn(txn, info, lock, wait, physical_ids, filter))
+}
+
+/// [`scan_table_filtered`] against an already-borrowed transaction, so a caller
+/// that holds the txn handle (e.g. an INSERT writing its rows) can read
+/// without re-locking it.
+pub(crate) fn scan_table_in_txn(
+    txn: &mut dyn sealdb_kv::Transaction,
+    info: &TableInfo,
+    lock: RowLock,
+    wait: LockWait,
+    physical_ids: &[i64],
+    filter: Option<&ExprNode>,
+) -> Result<Vec<ScannedRow>> {
+    {
         let mut rows = Vec::new();
         let start_ts = 0;
         for physical_id in physical_ids {
@@ -266,7 +280,7 @@ pub(crate) fn scan_table_filtered(
             });
         }
         Ok(rows)
-    })
+    }
 }
 
 pub(crate) fn decode_scanned_rows(

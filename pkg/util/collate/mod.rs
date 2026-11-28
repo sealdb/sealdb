@@ -9,8 +9,12 @@ pub mod collate;
 pub mod gbk_bin;
 pub mod gbk_chinese_ci;
 pub mod gbk_chinese_ci_data;
+pub mod general_ci;
 pub mod ucadata;
 pub mod unicode_0400_ci_generated;
 pub mod unicode_0400_ci_impl;
+pub mod unicode_0900;
 
-pub use collate::{CollateMode, bytes_eq, compare_bytes};
+pub use collate::{
+    CollateMode, bytes_eq, compare_bytes, key_bytes, key_bytes_no_trim, trim_trailing_space,
+};

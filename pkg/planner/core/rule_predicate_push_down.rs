@@ -1037,6 +1037,8 @@ fn push_into(
                         is_single_table_subtree(&right),
                         &left_preds,
                         &right_preds,
+                        is,
+                        current_db,
                     );
                     left_preds.extend(dl);
                     right_preds.extend(dr);
@@ -2528,6 +2530,8 @@ fn derive_equal_cond_preds(
     right_single: bool,
     left_preds: &[ExprNode],
     right_preds: &[ExprNode],
+    is: Option<&InfoSchema>,
+    current_db: &str,
 ) -> (Vec<ExprNode>, Vec<ExprNode>) {
     use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ExprNode, UnaryOpExpr};
 
@@ -2635,6 +2639,9 @@ fn derive_equal_cond_preds(
             let Some(alias) = alias_for(right_map, &to, right_table, right_single) else {
                 continue;
             };
+            if !equal_mirror_collation_allowed(is, current_db, left_table, &from, &alias, &to) {
+                continue;
+            }
             if let Some(d) = replace(p, &from, &to, &alias) {
                 dr.push(d);
             }
@@ -2655,12 +2662,54 @@ fn derive_equal_cond_preds(
             let Some(alias) = alias_for(left_map, &to, left_table, left_single) else {
                 continue;
             };
+            if !equal_mirror_collation_allowed(is, current_db, right_table, &from, &alias, &to) {
+                continue;
+            }
             if let Some(d) = replace(p, &from, &to, &alias) {
                 dl.push(d);
             }
         }
     }
     (dl, dr)
+}
+
+/// TiDB `tryToReplaceCond` collation guard for a mirrored join predicate: the
+/// derived `to_col = <expr>` compares under the join key's derived collation,
+/// so it may only be pushed when that is `to_col`'s own collation. A
+/// `utf8mb4_general_ci` join key would otherwise filter a `utf8_bin` column
+/// with byte semantics (`t1.a = 'a'` dropping `'A'` from `t2`).
+fn equal_mirror_collation_allowed(
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    from_table: &str,
+    from_col: &str,
+    to_table: &str,
+    to_col: &str,
+) -> bool {
+    use crate::core::planbuilder::{derive_join_collation, is_collated_string};
+    let Some(is) = is else {
+        return true;
+    };
+    let lookup = |table: &str, column: &str| {
+        is.table_by_name(current_db, table)
+            .and_then(|info| {
+                info.columns
+                    .iter()
+                    .find(|c| c.name.o().eq_ignore_ascii_case(column))
+            })
+            .map(|c| &c.field_type)
+    };
+    let (Some(from_ft), Some(to_ft)) = (lookup(from_table, from_col), lookup(to_table, to_col))
+    else {
+        return true;
+    };
+    if !is_collated_string(from_ft) || !is_collated_string(to_ft) {
+        return true;
+    }
+    match derive_join_collation(from_ft, to_ft) {
+        Some(collation) => collation.eq_ignore_ascii_case(&to_ft.collate),
+        None => true,
+    }
 }
 
 #[cfg(test)]

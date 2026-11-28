@@ -5325,3 +5325,303 @@ SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory        
 ### 状态
 - manifest：`globalindex/analyze` → `green`，green 139 / pending 97（counts 同步）
 - 下一步：R7 长尾（planner casetest 规则类）与 R2 剩余 suite。
+
+## 2026-11-26 21:40 — `expression/charset_and_collation` 差异收窄到 4 类计划形态
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 完整 UCA 9.0.0 权重 | `pkg/parser/charset/ucadata_0900.bin`（TiDB `ucadata.DUCET0900Table` 的 `MapTable4` + `LongRuneMap`，1.4MB，`include_bytes!` 读入）替换手写 ASCII 表；`sort_key_0900_ai_ci` 对全部码点给出权重，符号/emoji 排在字母前、假名排在拉丁字母后，`min(id) … group by str order by str` 的 8 组顺序与 TiDB 一致 |
+| 索引区间键编码 | `explain_key_ranges_text` 改为按键部件 collation 走 `sealdb_util::collate::key_bytes`：`utf8mb4_general_ci` 的 `v < 'b'` 打印 `range:[-inf,"\x00B")`、`v > ' '` 打印 `("","\x00B")`（PAD SPACE 去尾空格），0900 仍是权重键；planner 新增 `sealdb-util` 依赖 |
+| `REPLACE`/`INSERT` 结果 collation | 归入「只转换首参、沿用首参 collation」的函数族，`replace('[]', '[]', cast('[]' as json)) between 'W' and 'm'` 在 0900 连接下按权重比较得 0 |
+| `DISTINCT` 列名 | 带括号的列引用按列名输出（`select distinct(v)` 表头 `v`，不再是 `(v)`） |
+| `CAST(compress(..) AS CHAR)` 非严格模式 | 在首个非法 UTF-8 字节处截断（`compress('b')` → `\x01\x00\x00\x00x`），严格模式仍为 NULL |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t expression/charset_and_collation --status pending
+  → 差异 234 行 → 144 行（未转绿）
+回归：common_collation / executor/explain / explain_easy_stats / table/index /
+      agg_predicate_pushdown / executor/index_lookup_pushdown → PASS
+单元：sealdb-parser collate_0900 / sealdb-util collate → PASS
+```
+
+### 剩余差异（均为计划形态，非结果值）
+1. `SELECT DISTINCT` 未按 TiDB 改写为 `HashAgg(group by …, firstrow)`，也无 cop 下推与 `STREAM_AGG()` hint；
+2. `select v, count(*) … group by v` 未做部分聚合下推（TiDB：`Projection` + root `HashAgg(count(Column#5))` + cop `HashAgg(count(1))`）；
+3. 覆盖索引判定：`select v … where v < 'b' order by v` 应为 `IndexReader`（我们选 `IndexLookUp`）；
+4. 非覆盖 `IndexLookUp` 之上应有 `Projection`（`select id … use index(v)`）。
+
+### 状态
+- manifest：`expression/charset_and_collation` 保持 `pending`
+
+## 2026-11-27 20:10 — `expression/charset_and_collation` 转绿（R4 4/13）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 排序键索引不再当覆盖读 | `pkg/meta/model/table.rs` 新增 `TableInfo::index_has_collation_key`：`utf8mb4_general_ci` / `utf8mb4_unicode_ci` / `0900` / `gbk_bin` / `gbk_chinese_ci` 的索引键存的是排序键，无法逆出原始字节。`pkg/executor/distsql.rs` 在 `covering` 判定里叠加该条件（与表达式索引同一条路径），运行时回表取真实 datum，所以 `select hex(a) … use index(a)` 恢复成 `6120` 而不是被 PAD SPACE 裁掉的 `61` |
+| 跨表 `WHERE` 的 collation 隔离 | `pkg/executor/builder.rs` 新增 `foreign_collation_conflict`：建 `IndexAccess` 时剔除非本表来源的等值谓词。`select * from t1, t2 where t1.a=t2.a and t1.a='a'`（`t1.a` 为 `utf8mb4_general_ci`、`t2.a` 为 `utf8mb4_bin`）不再拿 `'a'` 去 seek `t2.a`，从而保住 `t2` 里的 `'A'` |
+| `IndexLookUp` 之上的投影消除 | `pkg/planner/core/planbuilder.rs` 的 `lookup_needs_projection` 改成 TiDB `eliminatePhysicalProjection` 的口径：`IndexLookUpReader` 继承 table plan schema，即语句块读到的全部列（SELECT 列表 + WHERE/区间列）按表列序排列，只有与 SELECT 列表逐位相同才省略。`select col1, col2 … where col1 in (…)` 直接是裸 `IndexLookUp`，`select id … where v < 'b'` 保留 `Projection db.t.id` |
+| 分组两阶段聚合的 partial 列号 | 读列的 cop 聚合并入 `partial_agg_column_id` 的口径（`count(b) … GROUP BY a` → `Column#10`，带 `ORDER BY`/`LIMIT` → `15`/`16`）；只 `count(1)` 的形状沿用 `out + 1`（`count(*) … GROUP BY v` → 输出 `#4`、partial `#5`） |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t expression/charset_and_collation   → PASS
+./tests/integrationtest/run-tests.sh -s memory -t select / executor/point_get /
+  planner/core/{,casetest/}point_get_plan / globalindex/point_get /
+  executor/{explain,index_lookup_pushdown}                                          → PASS
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory --status green
+  → PASS: memory=143 tikv=0 skipped=111
+```
+
+### 状态
+- manifest：`expression/charset_and_collation` → `green`，green 143 / pending 93（counts 同步）
+- 下一步：R4 剩余 9 套（`collation_*`、`new_character_set*`、`planner/core/plan_cache`、`prepare`）与 R3/R6/R7 长尾。
+## 2026-11-27 22:20 — `executor/admin` 转绿（R7 56/110）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| `ADMIN CHECK` 系列不再一律 no-op | `pkg/parser/sqlparser_bridge/lower.rs` 把 `ADMIN CHECK TABLE t[, …]` / `ADMIN CHECK INDEX t idx [(lo, hi), …]` / `ADMIN CHECKSUM TABLE t[, …]` 解析成结构化 `AdminOp::{CheckTable, CheckIndex, ChecksumTable}`（原先统一落到 `AdminOp::Other`） |
+| 临时表 8006 | `pkg/session/session.rs` 的 `admin_table_info` / `admin_temp_table`：先查会话临时表（local 与 global 都登记在 `temp_tables`），命中即按 `ErrOptOnTemporaryTable` 8006 拒绝，文案按语句区分（`admin check table` / `admin check index` / `admin checksum table`） |
+| 缺表 1146 | 非临时表按会话当前库在 infoschema 中解析，找不到报 `Table '<db>.<t>' doesn't exist`（`use mysql; admin check table t` 不再静默通过） |
+| partial index 8273 | `reject_partial_index_check`：表上存在 `where_clause` 索引且 `tidb_enable_fast_table_check=OFF` 时报 8273；该变量按 TiDB 默认 ON 登记进 `SHOW_VARIABLE_DEFAULTS`（此前未登记，`SET` 也不会落进 override 表，导致关闭后仍被当成开启） |
+| 区间检查回吐行 | `pkg/ddl/index.rs` 新增 `check_index_ranges`：按 `[lo, hi)` 行柄区间扫描表记录（复用 `recover_index` 的 key/行解码路径，partial index 只算满足谓词的行），输出「索引列 + `extra_handle`」并按索引键序排序（`(2, 4)` → 行柄 2、3 的两行） |
+| `CRC32()` | `pkg/expression/evaluator.rs` 补 `CRC32(str)`（`key_hash::crc32_ieee`，NULL 进 NULL 出，返回无符号整数） |
+| 奇数位十六进制字面量 | `decode_hex_literal` 按 MySQL 口径左补零：`0x2` = `0x02`（此前报 `Incorrect hex literal: 2`，让 `concat_ws(0x2, …)` 整条语句失败） |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory -t executor/admin --status pending  → PASS
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory --status green
+  → PASS: memory=144 tikv=0 skipped=110
+```
+
+### 状态
+- manifest：`executor/admin` → `green`，green 144 / pending 92（counts 同步）
+- 下一步：R4 剩余 9 套（`collation_*` 需 enabled/disabled 双金样变体，`new_character_set*`、`planner/core/plan_cache`、`prepare`）与 R6/R7 长尾（缓存期最便宜的候选：`ddl/db_table` 19 行、`executor/cluster_table` 55 行、`ddl/serial` 63 行）。
+## 2026-11-27 23:30 — `ddl/serial` 转绿（R6 21/35）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| `TRUNCATE PARTITION ALL` | `pkg/ddl/partition.rs` 的 `truncate_partitions`：当名字列表只有一个 `ALL` 时清空该表所有分区（不再按字面分区名查找） |
+| `AUTO_RANDOM(shard_bits, range_bits)` | 解析桥把 shard/range 两个位数编码进注释标记 `__sealdb_auto_random_<shard>_<range>__`；`pkg/meta/model/column.rs` 的 `ColumnInfo` 与 AST（`ColumnDef`、`CHANGE/MODIFY COLUMN`）新增 `auto_random_range`。`pkg/ddl/create_table.rs` 的 `validate_auto_random_bits` 按 TiDB 8216 校验：range 位必须落在 [32,64]，增量位（`range - shard`，有符号再减 1 位符号位）不得小于 27 |
+| `ALTER` 上的 AUTO_RANDOM 限制 | `pkg/ddl/alter.rs` 的 `change_column` 拒绝修改 range 位（8216 `alter the range bits of auto_random column is not supported`）；临时表上的 `AUTO_RANDOM` 在 `create_table` 阶段按 8006 拒绝 |
+| 会话级临时表 DDL 限制 | `pkg/session/session.rs` 统一拦截 `RENAME TABLE`（`AlterTableStmt::from_rename_table` 区分）、`CREATE INDEX`、`DROP INDEX`、`LOCK TABLES`、`ADMIN CLEANUP TABLE LOCK`，报 8200 `TiDB doesn't support <KIND> for local temporary table` |
+| 排序规则兼容性 | 新增 `compatible_collate(a, b)`（general_ci / bin / unicode 三个等价族 + 精确相等）：索引列改成或转换到不兼容排序规则时按 8200 拒绝（`Unsupported modifying collation of column … when index is defined on it.` / `Unsupported converting collation of column …`）；`ALTER TABLE … [DEFAULT] CHARSET|COLLATE` 与 `MODIFY COLUMN` 对不支持的排序规则（`utf8mb4_roman_ci` 等）报 1273，并把 `utf8mb4_zh_pinyin_tidb_as_cs` 补进 `SUPPORTED_COLLATIONS` |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory --status pending -t ddl/serial  → PASS
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory --status green
+  → PASS: memory=145 tikv=0 skipped=109
+```
+
+### 状态
+- manifest：`ddl/serial` → `green`，green 145 / pending 91（counts 同步）
+- 下一步：`ddl/db_table`（外键列存在性、`WITH/WITHOUT VALIDATION`、`LOCK TABLE … READ`）与 `executor/cluster_table`。
+
+## 2026-11-28 00:50 — `ddl/db_table` 转绿（R6 22/35）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 外键本地列不存在 | `pkg/ddl/create_table.rs` 的 `add_foreign_key`：本地列缺失从 1215 改报 `ErrKeyColumnDoesNotExits` 1072（`Key column 'a' doesn't exist in table`），`CREATE TABLE` 与 `ALTER TABLE … ADD FOREIGN KEY` 同口径；临时表仍在 1215/8200 先拒 |
+| `DROP COLUMN` 的外键依赖 | `pkg/ddl/alter.rs` 的 `drop_column` 先判外键再判索引：本地约束列报 1828（`Cannot drop column 'a': needed in a foreign key constraint 'fk'`），被其它表（含自引用）引用的列报 1829（`… of table 't2'`）；新增 errno 1828/1829 |
+| `DROP FOREIGN KEY` | 解析桥映射 `AlterTableOperation::DropForeignKey`，AST 新增 `AlterTableSpec::DropForeignKey`，`pkg/ddl/alter.rs` 的 `drop_foreign_key` 只改元数据，未知约束名报 1091 |
+| `WITH/WITHOUT VALIDATION` | 解析桥在 sqlparser 之前截获该子句（`AlterPartOp::Validation`），`pkg/session/session.rs` 在语句只有该子句（+`ALGORITHM`/`LOCK` 噪声 spec）时直接返回成功并记 8200 告警（`ALTER TABLE WITH VALIDATION is currently unsupported` / `WITHOUT …`） |
+| `LOCK TABLE … READ` | 既有 `acquire_mdl` 的读锁写入检查已覆盖，DML 维持 1099（`Table 't1' was locked with a READ lock and can't be updated`） |
+| TiDB 语法错误口径 | 解析桥新增 `tidb_parse_error`：按 TiDB `Scanner.Errorf` 的口径输出 `line %d column %d near "%s"`——`near` 从出错 token 起到语句末尾，`column` 取 token 结束位置，且 TiDB 的 reader 在换行后 `Col` 多计一列（`line>1` 时 +1）。当 sqlparser 报的 `found:` token 是「数字开头的标识符」（如 `0when`）的字母尾部时，按 TiDB 词法把它当函数调用，错误位置顺延到该调用之后的 token，生成列里的病态表达式（`THEN 0when (c0 > 0) THEN …`）与 TiDB 逐字节一致 |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory --status pending -t ddl/db_table  → PASS
+./tests/integrationtest/run-tests.sh -s memory -t ddl/db_foreign_key           → PASS
+./tests/integrationtest/run-tests.sh -s memory -t ddl/db_integration           → PASS
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory --status green
+  → PASS: memory=146 tikv=0 skipped=108
+```
+
+### 状态
+- manifest：`ddl/db_table` → `green`，green 146 / pending 90（counts 同步）
+- 下一步：`ddl/foreign_key`（现已推进到 1833 `Cannot change column … used in a foreign key constraint`）、`executor/cluster_table`、R4 剩余 9 套。
+
+## 2026-11-28 01:10 — `ddl/foreign_key` 转绿（R6 23/35）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 外键列变更（1832/1833） | `pkg/ddl/alter.rs` 新增 `check_foreign_key_column_change` 并挂到所有 `MODIFY/CHANGE COLUMN` 路径：按 TiDB `isAcceptableForeignKeyColumnChange` 口径判定（整型显示宽度可随意改；其余类型不得窄于原长、也不得窄于配对列；`DECIMAL` 不得改 precision/scale）。子表侧报 1832 `Cannot change column 'c': used in a foreign key constraint 'fk'`，父表侧报 1833 `… of table 'db.child'`；新增 errno 1832/1833 |
+| `DROP TABLE` / `DROP DATABASE`（3730） | `ForeignKeyInfo` 新增 `ref_schema` 支撑跨库外键（`create_table.rs` 保留、`fk_ref_schema` 取默认库）。`pkg/ddl/table.rs` 的 `drop_table` 改为两阶段：先把待删集合从 info schema 摘掉，再 `check_drop_tables_referenced_by_fk` 扫描剩余表，外部仍引用即 3730（受 `foreign_key_checks` 门控）；`pkg/ddl/schema.rs` 的 `drop_schema` 同口径。`fk_checks` 从 session 的 `foreign_key_checks` 一路下传到 DDL executor |
+| 删索引被新外键依赖（1553） | 多库 `ALTER TABLE` 中 `checkOperateDropIndexUseByForeignKey`：若被删索引正是同语句新增外键所需的列前缀、且无其它索引覆盖该前缀，报 1553 `Cannot drop index 'x': needed in a foreign key constraint` |
+| DML 外键检查与级联 | `InsertExec` 写入前用 `fk_insert_violation` 校验本地外键（非 NULL 且无父行 → 1452 `Cannot add or update a child row`）；`UpdateExec`/`DeleteExec` 对父行改动执行 `ON UPDATE CASCADE` / `ON DELETE CASCADE`（`executor/table_reader.rs` 新增 `scan_table_in_txn`，避免在已持有事务锁时重入死锁）；`fk_failure_body` 的 `FKInfo` 文本补齐 `ON DELETE/UPDATE CASCADE` 渲染 |
+| 语法错误口径 | `tidb_parse_error` 识别 `DROP FOREIGN KEY IF EXISTS` 被 sqlparser 在 `if` 处报错的情形，按 TiDB 1064 `line 1 column N near "if exists fk1;"` 输出 |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory --status pending -t ddl/foreign_key  → PASS
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory --status green
+  → PASS: memory=154 tikv=0 skipped=100
+```
+
+### 状态
+- manifest：`ddl/foreign_key` → `green`，green 147 / pending 89（counts 同步）
+- 下一步：`executor/cluster_table`，以及 R4 剩余 9 套（`collation_*` 双金样、`new_character_set*`、`planner/core/plan_cache`、`prepare`）。
+
+## 2026-11-28 02:40 — `executor/cluster_table` 转绿（R7 57/110）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| SQL 摘要归一化 | 新增 `pkg/expression/sql_digest.rs`：按 TiDB `parser.Normalize` 口径把语句归一成「关键字小写、标识符反引号、字符串/数字字面量替换为 `?`、token 间单空格」的文本（`begin` → `begin`，`select id, v from t where id = 1 for update` → ```select `id` , `v` from `t` where `id` = ? for update```），再取 SHA-256 小写十六进制；`begin` / `select @@tidb_current_ts` / for-update 查询三条与金样摘要逐字节一致 |
+| `tidb_encode_sql_digest()` | 求值器新增分支：参数个数不为 1 报 1582（原生函数参数计数口径），NULL 入 NULL 出，其余返回摘要；`funcs.rs` 同步登记元数据 |
+| `tidb_decode_sql_digests()` | 会话执行每条语句时把 `digest → 归一化文本` 记入全局语句摘要表（`record_sql_digest`，上限 5 万条后清空）。解码按 JSON 数组逐项回查：非字符串/未知摘要 → `null`；无法解析成数组（`{"a":1}`、`aabbccdd`）→ 1210 告警并返回 NULL；`max_len` 超长按「前 N 字符 + `...`」截断（24 → 27 字符）；参数个数不在 1..2 报 1582 |
+| PROCESS 权限 | `tidb_decode_sql_digests` 要求全局 PROCESS：`check_privilege` 用 `request_verification_with_roles(&user, &roles, "", "", PROCESS)` 判定后写入线程局部量，求值器对无权限用户报 1227 `Access denied; you need (at least one of) the PROCESS privilege(s) for this operation` |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory --status pending -t executor/cluster_table  → PASS
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory --status green
+  → PASS: memory=148 tikv=0 skipped=106
+```
+
+### 状态
+- manifest：`executor/cluster_table` → `green`，green 148 / pending 88（counts 同步）
+- 下一步：R4 剩余 9 套（`collation_*` 双金样、`new_character_set*`、`planner/core/plan_cache`、`prepare`）与 R6/R7 长尾。
+
+## 2026-11-28 04:10 — `executor/revoke` 转绿（R7 58/110）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| `mysql.columns_priv` 虚拟化 | `Manager::column_priv_rows`：把每个 `GrantEntry.columns` 逐列物化（`Host/DB/User/Table_name/Column_name/Timestamp/Column_priv`，SET 名按 `Select/Insert/Update/References` 过滤），`pkg/executor/builder.rs` 的 InfoSchema 分支与 `pkg/infoschema/tables.rs` 列布局同步；`REVOKE SELECT(Host)` 只删该列，`SELECT(DB)` 保留 |
+| `mysql.global_grants` 虚拟化 | `Manager::global_grant_rows`：按 `(User, Host, Priv)` 物化动态权限与 `WITH_GRANT_OPTION`，`ORDER BY user,host,priv` 与 TiDB 一致；`GRANT BACKUP_Admin` 后立即可查 |
+| 动态权限级别校验（3619） | `Manager::grant/revoke` 先跑 `check_dynamic_priv_level`：只对已注册动态权限（`sealdb_parser::sqlparser_bridge::is_dynamic_priv`）在非 `Global` 级报 `Illegal privilege level specified for BACKUP_ADMIN,SYSTEM_VARIABLES_ADMIN`；新增 errno 3619 |
+| 未注册权限（3929） | 解析桥把未知 privilge 名也收进 `dynamic_privs`（静态权限/`ALL`/`USAGE`/`GRANT OPTION` 仍按原路），`GrantExec` 对未注册名记告警 `Dynamic privilege 'BOGUS' is not registered with the server.` 并跳过存储 |
+| 解析补齐 | `REVOKE BACKUP_ADMIN, SELECT, GRANT OPTION ON *.*`：`parse_table_priv_list` 在 `GRANT OPTION` 处收尾、revoke 侧置 `grant_option=true`；`GRANT USAGE ON *`（无 `.`）按全局级解析；`Manager::revoke` 在组合语句里既删权限也清 grant option |
+
+### 验证
+```text
+./tests/integrationtest/run-tests.sh -s memory --status pending -t executor/revoke  → PASS
+SEALDB_ITEST_KEEP_GOING=1 ./tests/integrationtest/run-tests.sh -s memory --status green
+  → PASS: memory=149 tikv=0 skipped=105
+```
+
+### 状态
+- manifest：`executor/revoke` → `green`，green 149 / pending 87（counts 同步）
+- 下一步：`executor/grant`（已定位两条缺口：`GRANT … IDENTIFIED BY` 的 1410/自动建号，以及 `NO_AUTO_CREATE_USER` 关闭时按密码建号）、R4 剩余 9 套。
+
+## 2026-11-28 05:10 — `executor/grant` 转绿（R7 59/110）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| `GRANT … IDENTIFIED BY` / `REQUIRE` | 解析桥新增 `extract_grant_auth_suffix`：在 sqlparser 切分前剥离 `GRANT … TO u [IDENTIFIED BY 'pwd'] [REQUIRE …] [WITH GRANT OPTION]` 后缀，`GrantStmt` 增加 `auth` / `require` 字段；`CREATE USER` / `ALTER USER` 的 `REQUIRE {NONE|SSL|X509|ISSUER|SUBJECT|CIPHER}` 逐子句解析，重复子句在解析期报 `Duplicate require ISSUER clause`（重复 `SSL`/`X509` 仍按 1064 语法错误），X509 名须以 `/` 开头且为合法 DN（否则 `invalid X509_NAME input: …`），cipher 对照 TiDB 支持列表（`Unsupported cipher suit: …`），引号内 `\x` 按 MySQL 转义解码 |
+| `NO_AUTO_CREATE_USER` | `Manager::grant` 读会话线程局部的 sql_mode：开启（TiDB 默认）时对不存在的账号报 1410 `You are not allowed to create a user with GRANT`；`SET SQL_MODE=''` 后 `GRANT … TO u` 自动建号，`IDENTIFIED BY` 写入 `*HEX(SHA1(SHA1(pwd)))`，`REQUIRE` 落库并在 `mysql.user` 的 `ssl_type`/`ssl_cipher`/`x509_issuer`/`x509_subject` 回显 |
+| `GRANT` 前置校验 | 未注册动态权限报 3929；列级权限与非列级权限混用报 1221；仅库级以上可用的权限（`CREATE TEMPORARY TABLES` / `LOCK TABLES` 等）落到表级报 1144；无 `CREATE` 时对不存在的表授权报 1146（`metrics_schema` 虚拟表豁免）；`performance_schema` 上非 SELECT 授权报 1044 |
+| `mysql.db` / `mysql.global_priv` | 权限管理器 `db_priv_rows()` / `global_priv_rows()` 物化数据库级授权与账号 JSON（`Priv` 仅按 SSL 字段渲染，空权限输出 `{}`）；执行期由 `mysql_priv_mem_exec` 在 `TableReader` / `IndexLookUp` / `PointGet` / `BatchPointGet` 上拦截，**计划层不再当作 MemTableScan**（`is_mysql_mem_table` 只保留 `tables_priv`），`EXPLAIN` 维持 TiDB 的 `IndexLookUp … i_user` 形状 |
+| 账号大小写 | `user_key` 只对 host 做小写归一，用户名大小写敏感：`CREATE USER 'testWithGrant'@'localhost'` 后 `WHERE User="testWithGrant"` 能命中，`mysql.user` / `mysql.db` 行按原样回显 |
+| `SHOW CREATE USER` | 新增 `ShowStmtKind::CreateUser`，按 TiDB DDL 逐项渲染 `IDENTIFIED WITH … AS …`、`REQUIRE`、`ACCOUNT LOCK/UNLOCK`、`PASSWORD EXPIRE`、`COMMENT`、`ATTRIBUTE` |
+
+### 验证
+```text
+SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t executor/grant  → PASS
+./tests/integrationtest/run-tests.sh -s memory    → PASS: memory=157 tikv=0 skipped=97
+```
+
+### 状态
+- manifest：`executor/grant` → `green`，green 150 / pending 86（counts 同步；顺带修正 R6/R7 表头与 §2 计数）
+- 下一刀：`executor/password_management` / `executor/show` / `executor/set` 等 R7 账号与系统表长尾。
+
+## 2026-11-28 06:55 — `executor/password_management` 转绿（R7 60/110）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 密码过期 | `UserSpec` 新增 `password_expire`（`PasswordExpireOption::{Expire,Default,Never,Interval}`）：`PASSWORD EXPIRE` 置 `mysql.user.Password_expired='Y'`，`DEFAULT` 把 `Password_lifetime` 复位 NULL，`NEVER` 置 0，`INTERVAL n DAY` 校验 1..65535（0 / 超范围报 1690）后写入；匿名账号（`''@'localhost'`）过期报 3016；`SET PASSWORD` / `ALTER USER … IDENTIFIED BY` 在未显式 `PASSWORD EXPIRE` 时把 `Password_expired` 复位为 `'N'` |
+| 全局复用策略变量 | `password_history` / `password_reuse_interval` 按 TiDB `TypeUnsigned`（MaxValue `math.MaxUint32`）截断：`-1`→0、`4294967296`→`4294967295`；`SET SESSION` 报 1229（`sysvar_scope` 归为 Global），`SET GLOBAL … = DEFAULT` 清掉 override |
+| 账号级选项 | `PASSWORD HISTORY {DEFAULT|n}` / `PASSWORD REUSE INTERVAL {DEFAULT|n DAY}` 存 `mysql.user.Password_reuse_history/Password_reuse_time`（`n` 按 0..65535 截断，`DEFAULT` 存 NULL）；账号值优先于全局，仅 `DEFAULT`/NULL 回落；`PASSWORD HISTORY 0` 表示彻底关闭留存 |
+| `mysql.password_history` | bootstrap 新增该表（`PRIMARY KEY (Host,User,Password_timestamp)`、`KEY i_user (User)`），执行期由权限管理器物化行：`TableReader` / `IndexLookUp` / **`IndexReader`（covering `count(*)`，本轮补齐拦截）** / `PointGet` 分支经 `mysql_priv_mem_exec` 回吐 `(Host,User,Password_timestamp,Password)`；计划层不再当 MemTableScan，`EXPLAIN` 与 `mysql.user` 同形 |
+| 复用判重与留存 | `verify_and_record_password`：策略关闭（条数=0 且时间窗=0）时清空该账号历史并直接通过；否则按「最新 n 条 + 时间窗内」判重（冲突报 3638 `Cannot use these credentials for 'u@h' because they contradict the password history policy.`），随后剪除超出 `count-1` 且已出时间窗的行并记录新口令；`CREATE USER … IDENTIFIED BY` 只记录不判重；空密码与 `tidb_auth_token` 不入历史；切换认证插件（`caching_sha2_password` / `tidb_sm3_password`，即使语句不带新密码）清空该账号历史 |
+| `UPDATE mysql.password_history` | `UpdateExec` 拦截该虚拟表的 `SET Password_timestamp = …`（含 `date_sub(...)`、`ORDER BY … LIMIT`），按 `(user,host,旧时间戳)` 改写权限管理器内存时间戳，支撑 `PASSWORD REUSE INTERVAL n DAY` 的窗口老化用例 |
+| `ALTER USER IF EXISTS` | 解析侧支持 `IF EXISTS`，执行侧对不存在账号按 Note 3162 回吐（`note_message` → `SHOW WARNINGS` 显示 `Note`），其余 spec 照常生效，整条语句成功 |
+
+### 验证
+```text
+SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t executor/password_management  → PASS
+./tests/integrationtest/run-tests.sh -s memory  → PASS: memory=159 tikv=0 skipped=95
+```
+
+### 状态
+- manifest：`executor/password_management` → `green`，green 151 / pending 85（counts 同步）
+- 下一刀：`executor/show` / `executor/set` / `executor/simple` 等 R7 账号与系统表长尾。
+
+## 2026-11-28 08:55 — `executor/set` 转绿（R7 61/110）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 数值型 sysvar 截断 | `tidb_max_delta_schema_count`（[1,16384]，`<=0` 回落默认 100）、`tidb_session_plan_cache_size`（min 1）、`tidb_prepared_plan_cache_memory_guard_ratio`（[0,1] float）、`tiflash_fine_grained_shuffle_stream_count`（[-1,1024]）、`…_batch_size`（[1,u64::MAX]）按 TiDB `TypeInt/TypeFloat` 上下界截断并回吐 1292，非数值操作数报 1232；session/global 两条路径共用 `clamp_sysvar_int/float` |
+| noop 变量 | `tidb_enable_noop_variables` 纳入 sysvar 表（默认 ON）；`query_cache_type` 按 0/OFF→OFF、1/ON→ON、2/DEMAND→DEMAND 归一；变量关闭时赋值告警 8144、读取告警 8145（`system_var_result` 直接回吐），`SHOW VARIABLES LIKE` 不再列出该变量 |
+| 只读开关联动 | `tidb_restricted_read_only=ON` 强制 `tidb_super_read_only=ON`；后者在 restricted 打开时不可关（1105 原文），restricted 关掉后仍保持 super=1；两者 `DEFAULT` 复位 |
+| 其余 sysvar | `tidb_gc_max_wait_time` / `tidb_gc_life_time`、`tiflash_fastscan`、`tidb_enable_prepared_plan_cache_memory_monitor`、`tidb_enable_reuse_chunk`、`tidb_enable_tiflash_pipeline_model`（1681）、`mpp_version`（非法值 1105 + 选项文案）、`mpp_exchange_compression_mode`（按写入原文回显、非法值 1105）纳入注册表与 SET 分支 |
+| 字符集语义 | 新增解析重写 `rewrite_set_character_set`（sqlparser 无 `SET CHARACTER SET`）→ 私有赋值 `__sealdb_character_set__`：client/results 随操作数、connection 保持库默认（utf8mb4）；`SET NAMES` 只改 client/connection/results，`character_set_database` 固定 utf8mb4；`character_set_client/results` 改由 session override 承载；`character_set_filesystem/system`、`character_sets_dir` 进 `SHOW VARIABLES` |
+| 其它 SET 口径 | `default_storage_engine` 入表，session `DEFAULT` 复制当时全局值；`SET GLOBAL sql_mode='DEFAULT'`（带引号字面量）报 1105 包裹 1231 原文；`tidb_slow_log_masking` / `tidb_enable_global_temporary_table` 作为 removedSysVars：SET 静默成功、读取报 8136 + 迁移提示；未知 `@@var` 统一报 1193；`errname` 把 1231 归入 SQLSTATE 42000 |
+
+### 验证
+```text
+SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t executor/set  → PASS
+./tests/integrationtest/run-tests.sh -s memory  → PASS: memory=159 tikv=0 skipped=95
+```
+
+### 状态
+- manifest：`executor/set` → `green`，green 152 / pending 84（counts 同步）
+- 下一刀：`executor/show` / `executor/simple` 等 R7 账号与系统表长尾。
+
+## 2026-11-28 09:20 — `globalindex/ddl` 转绿（R7 62/110）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| GLOBAL 索引合法性 | `Table::create_table` 在分区信息挂载后按 TiDB `checkGlobalIndexes` 拒绝「非分区表上的 GLOBAL 索引」（8200 `Unsupported Global Index on non-partitioned table`），失败的 `CREATE TABLE` 不再把表留在元数据里；`ddl::index::add_index` 同一检查覆盖 `ALTER TABLE ADD [UNIQUE] INDEX/PRIMARY KEY` 与 `CREATE [UNIQUE] INDEX` |
+| 列级 `KEY GLOBAL` | 解析桥在列选项后（`out` 以 `key` 结尾）也把 `GLOBAL` 改写为 `COMMENT 'sealdb_global_index'` 标记，lower 侧识别该列选项并给合成的 PRIMARY 约束置 `global`，从而命中「既 GLOBAL 又 CLUSTERED」的 8200；标记不再泄漏成列注释 |
+| `CREATE INDEX … GLOBAL` | `CreateIndexStmt` 新增 `global`，从 `index_options` 解析、`restore` 回写 `/*T![global_index] GLOBAL */`，`create_index` 透传给 `IndexDef`（此前硬编码 `false`，GLOBAL 被静默丢弃） |
+| SHOW CREATE TABLE | 非聚簇主键行在 `/*T![clustered_index] NONCLUSTERED */` 后补 `/*T![global_index] GLOBAL */`，与 TiDB 的索引注释顺序一致 |
+| REMOVE PARTITIONING | 全部索引降为 LOCAL（`GlobalIndexVersion` 语义），GLOBAL 索引因重建而挪到索引列表末尾 |
+| UPDATE INDEXES 顺序 | `repartition` 先按 `UPDATE INDEXES (idx GLOBAL|LOCAL)` 落 locality，再 `attach_partitions`（含 8264 覆盖校验）；随后按 TiDB `onReorgPartition` 的「变更前或变更后为 GLOBAL 的索引重建」规则把这些索引移到列表尾部，`SHOW CREATE TABLE` 的 KEY 顺序随之与金样一致 |
+
+### 验证
+```text
+SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t globalindex/ddl  → PASS
+./tests/integrationtest/run-tests.sh -s memory  → PASS: memory=160 tikv=0 skipped=94
+```
+
+### 状态
+- manifest：`globalindex/ddl` → `green`，green 153 / pending 83（counts 同步）
+- 下一刀：`executor/show` / `executor/simple` 等 R7 账号与系统表长尾。
+
+## 2026-11-28 10:31 — `executor/statement_context` 转绿（R7 63/110）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| `UNHEX(str)` 内置函数 | 求值器新增 `UNHEX`：按两个十六进制位一声明一个字节解码（奇数位补前导 `0`，`'1'` → `0x01`），任一位置非十六进制或入参 NULL 返回 NULL，结果为二进制串；`unhex('4040ffff')` 得 `@@\xFF\xFF` |
+| 字符集校验开关 | `CHARSET_CHECKS` 线程局部量承载 `(skip_utf8_check, skip_ascii_check, check_mb4_value_in_utf8)`，经 `with_charset_checks` 由 session 在语句构建期与执行期各包一层；`tidb_skip_utf8_check` / `tidb_skip_ascii_check` / `tidb_check_mb4_value_in_utf8` 写入 `SHOW_VARIABLE_DEFAULTS`、`SET [GLOBAL]`、`@@` 读取与 `DEFAULT` 复位 |
+| 列值转换口径 | `charset_convert` 读开关：跳过 UTF-8 有效性时 utf8/utf8mb4 列原样落库，跳过 ASCII 校验时 ascii 列接受 `>= 0x80` 字节；`check_mb4` 关闭时 utf8（utf8mb3）列接受 4 字节字符；二进制来源（`UNHEX`、`0x…`）写入 utf8mb3 列时在首个 4 字节字符处**截断**（`@@\xF0\x9F\x8C\x80` → `@@`），字符来源仍替换为 `?` |
+| 二进制来源标记 | 求值器 `note_binary_value` / `take_binary_value` 标记 `UNHEX` 结果；`eval_insert_row` 逐值记录 `binary` 并贯穿 `map_insert_row` → `cast_for_column_impl`，`Datum::Bit`（`0x…` 字面量）同口径 |
+| 非严格比较截断 | `UPDATE`/`DELETE` 的 `enforce_truncating_comparisons` 仅在 `STRICT_{TRANS,ALL}_TABLES` 下报 1292；非严格会话里 `where a > '1x'` 按 1.0 静默比较（`update sc set a = 4 where a > '1x'` 成功） |
+| `SET GLOBAL` mb4 开关 | `tidb_check_mb4_value_in_utf8` 归入 GLOBAL 作用域变量（`SET SESSION` 不认），当前会话立即生效并同步写入 domain override 供新会话继承 |
+
+### 验证
+```text
+SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t executor/statement_context  → PASS
+./tests/integrationtest/run-tests.sh -s memory                          → PASS: memory=162 tikv=0 skipped=92
+./tests/integrationtest/run-tests.sh -s tikv -k -t executor/statement_context → PASS: memory=0 tikv=1
+./tests/integrationtest/run-tests.sh -s tikv -k -t {executor/insert,executor/update,executor/delete,new_character_set_invalid,executor/charset} → 全 PASS
+```
+
+### 状态
+- manifest：`executor/statement_context` → `green`，green 154 / pending 82（counts 同步）
+- 下一刀：`expression/builtin`（`UNHEX` 已补，可接着补 `AES_DECRYPT` / `UNCOMPRESS` / `INET6_NTOA` 等二进制函数链）与 `executor/show` / `executor/simple` 等 R7 长尾。

@@ -120,9 +120,11 @@ pub fn coerce_key_datum(
     coerce_bound(&part.field_type, Some((datum.clone(), true))).map(|(value, _)| value)
 }
 
-/// `utf8mb4_0900_ai_ci` index keys are stored as the collation sort key, and
-/// `ranger` builds the seek bounds on those keys, so EXPLAIN prints the encoded
-/// weights (`range:["\x1c@\x1c>…"]`) rather than the literal string.
+/// A collated index key is stored as the collation sort key, and `ranger`
+/// builds the seek bounds on those keys, so EXPLAIN prints the encoded weights
+/// (`range:["\x00B")` for `'b'` under `utf8mb4_general_ci`,
+/// `range:["\x1c@\x1c>…"]` under `utf8mb4_0900_ai_ci`) rather than the
+/// literal string.
 ///
 /// Only the `range:…` text is encoded: the plan's `ranges`/`seek` bounds keep
 /// the literal datum the executor compares against the stored key.
@@ -134,18 +136,11 @@ fn explain_key_ranges_text(
     let parts = index_key_parts(info, index);
     let encode = |pos: usize, datum: &Datum| -> Option<Datum> {
         let part = parts.as_ref()?.get(pos)?;
-        if !part
-            .field_type
-            .collate
-            .eq_ignore_ascii_case("utf8mb4_0900_ai_ci")
-        {
-            return None;
-        }
         let Datum::Bytes(bytes) = datum else {
             return None;
         };
-        let text = std::str::from_utf8(bytes).ok()?;
-        let key = sealdb_parser::charset::collate_0900::sort_key_0900_ai_ci(text)?;
+        let mode = sealdb_util::collate::CollateMode::from_name(&part.field_type.collate);
+        let key = sealdb_util::collate::key_bytes(mode, bytes)?;
         Some(Datum::Bytes(key))
     };
     let display = |bound: &[(Datum, bool)]| -> Vec<(Datum, bool)> {

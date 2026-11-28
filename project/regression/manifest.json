@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 139,
+      "green": 154,
       "in_progress": 8,
       "local": 8,
-      "pending": 97
+      "pending": 82
     },
     "by_wave": {
       "D": 2,
@@ -146,7 +146,7 @@
     {
       "name": "common_collation",
       "wave": "R4",
-      "status": "pending",
+      "status": "green",
       "test": "t/common_collation.test",
       "result": "r/common_collation.result",
       "has_result": true,
@@ -326,7 +326,7 @@
     {
       "name": "ddl/db_table",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/db_table.test",
       "result": "r/ddl/db_table.result",
       "has_result": true,
@@ -386,7 +386,7 @@
     {
       "name": "ddl/foreign_key",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/foreign_key.test",
       "result": "r/ddl/foreign_key.result",
       "has_result": true,
@@ -486,7 +486,7 @@
     {
       "name": "ddl/serial",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/serial.test",
       "result": "r/ddl/serial.result",
       "has_result": true,
@@ -516,7 +516,7 @@
     {
       "name": "executor/admin",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/admin.test",
       "result": "r/executor/admin.result",
       "has_result": true,
@@ -586,7 +586,7 @@
     {
       "name": "executor/cluster_table",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/cluster_table.test",
       "result": "r/executor/cluster_table.result",
       "has_result": true,
@@ -706,7 +706,7 @@
     {
       "name": "executor/grant",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/grant.test",
       "result": "r/executor/grant.result",
       "has_result": true,
@@ -926,7 +926,7 @@
     {
       "name": "executor/password_management",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/password_management.test",
       "result": "r/executor/password_management.result",
       "has_result": true,
@@ -956,7 +956,7 @@
     {
       "name": "executor/revoke",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/revoke.test",
       "result": "r/executor/revoke.result",
       "has_result": true,
@@ -986,7 +986,7 @@
     {
       "name": "executor/set",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/set.test",
       "result": "r/executor/set.result",
       "has_result": true,
@@ -1036,7 +1036,7 @@
     {
       "name": "executor/statement_context",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/statement_context.test",
       "result": "r/executor/statement_context.result",
       "has_result": true,
@@ -1252,7 +1252,7 @@
     {
       "name": "expression/charset_and_collation",
       "wave": "R4",
-      "status": "pending",
+      "status": "green",
       "test": "t/expression/charset_and_collation.test",
       "result": "r/expression/charset_and_collation.result",
       "has_result": true,
@@ -1352,7 +1352,7 @@
     {
       "name": "expression/plan_cache",
       "wave": "R4",
-      "status": "pending",
+      "status": "green",
       "test": "t/expression/plan_cache.test",
       "result": "r/expression/plan_cache.result",
       "has_result": true,
@@ -1412,7 +1412,7 @@
     {
       "name": "globalindex/ddl",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/globalindex/ddl.test",
       "result": "r/globalindex/ddl.result",
       "has_result": true,
@@ -1732,7 +1732,7 @@
     {
       "name": "new_character_set_invalid",
       "wave": "R4",
-      "status": "pending",
+      "status": "green",
       "test": "t/new_character_set_invalid.test",
       "result": "r/new_character_set_invalid.result",
       "has_result": true,

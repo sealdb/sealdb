@@ -23,11 +23,14 @@ use crate::window::WindowExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_kv::{LockWait, RowLock, Storage, TxnHandle};
-use sealdb_parser::ast::expressions::ExprNode;
+use sealdb_parser::ast::expressions::{
+    BetweenExpr, BinaryOpExpr, ExprNode, FuncCallExpr, PatternLikeExpr, ValueExpr,
+};
 use sealdb_parser::ast::{
     ByItem, ResultSetNode, SelectLock, SelectLockWait, SelectStmt, SetOprStmt, Statement, TableName,
 };
 use sealdb_planner::{JoinType, PhysicalPlan, PlanBuilder};
+use sealdb_util::collate::CollateMode;
 use std::sync::Arc;
 
 pub struct ExecutorBuilder;
@@ -46,9 +49,13 @@ impl ExecutorBuilder {
                 stmt.clone(),
                 current_db.to_string(),
                 true,
+                true,
             ))),
             PhysicalPlan::Projection { exprs, child, .. }
             | PhysicalPlan::StarOrderProjection { exprs, child } => {
+                // A Projection re-emits only the SELECT list, so ORDER BY-only
+                // aggregate outputs could not survive it: cancel the request.
+                ORDER_COLUMNS_WANTED.set(false);
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("projection without select"))?;
@@ -157,11 +164,9 @@ impl ExecutorBuilder {
                     .or_else(|| order_by_from_plan_info(by_info))
                     .ok_or_else(|| Error::unsupported("sort without ORDER BY"))?;
                 let collations = order_by_collations(&domain, stmt, current_db, &by);
-                Ok(Box::new(SortExec::with_collations(
-                    by,
-                    collations,
-                    Self::build(child, stmt, domain, current_db, txn)?,
-                )))
+                let built = build_with_order_columns(child, stmt, domain, current_db, txn)?;
+                let sort = SortExec::with_collations(by, collations, built);
+                Ok(trim_order_columns(Box::new(sort)))
             }
             PhysicalPlan::TopN { child, by_info, .. } => {
                 // ResultReorder injects keys into the planner's local SELECT
@@ -174,13 +179,9 @@ impl ExecutorBuilder {
                 let (limit, offset) =
                     stmt_limit(stmt).ok_or_else(|| Error::unsupported("topn without LIMIT"))?;
                 let limit = limit.ok_or_else(|| Error::unsupported("topn without LIMIT"))?;
-                Ok(Box::new(TopNExec::with_collations(
-                    by,
-                    collations,
-                    limit,
-                    offset,
-                    Self::build(child, stmt, domain, current_db, txn)?,
-                )))
+                let built = build_with_order_columns(child, stmt, domain, current_db, txn)?;
+                let topn = TopNExec::with_collations(by, collations, limit, offset, built);
+                Ok(trim_order_columns(Box::new(topn)))
             }
             PhysicalPlan::Limit { child, .. } => {
                 let (limit, offset) =
@@ -206,6 +207,16 @@ impl ExecutorBuilder {
                         | PhysicalPlan::IndexLookUpReader { .. }
                         | PhysicalPlan::IndexMerge { .. }
                 );
+                // Rewrite the surviving filter with the collation derived from
+                // its operands (index ranges may have consumed the comparator
+                // for indexed columns, but residual filters still need it).
+                let filter = match stmt.as_select() {
+                    Some(select) => {
+                        let scope = CollationScope::for_select(&domain, select, current_db);
+                        &fold_collation(filter.clone(), &scope)?
+                    }
+                    None => filter,
+                };
                 Ok(Box::new(
                     SelectionExec::new(
                         filter.clone(),
@@ -219,12 +230,20 @@ impl ExecutorBuilder {
                 fields,
                 names,
                 child,
-            } => Ok(Box::new(DistinctExec::new(
-                keys.clone(),
-                fields.clone(),
-                names.clone(),
-                Self::build(child, stmt, domain, current_db, txn)?,
-            ))),
+            } => {
+                let mut exec = DistinctExec::new(
+                    keys.clone(),
+                    fields.clone(),
+                    names.clone(),
+                    Self::build(child, stmt, Arc::clone(&domain), current_db, txn)?,
+                );
+                if let Some(select) = stmt.as_select() {
+                    exec = exec.with_collations(expr_list_collations(
+                        fields, select, &domain, current_db,
+                    )?);
+                }
+                Ok(Box::new(exec))
+            }
             PhysicalPlan::Simple { kind } if kind == "Analyze" => Ok(Box::new(AnalyzeExec::new(
                 domain,
                 stmt.clone(),
@@ -299,6 +318,14 @@ impl ExecutorBuilder {
                     domain.bind_info_rows()
                 } else if table.eq_ignore_ascii_case("tables_priv") {
                     tables_priv_rows(&domain)
+                } else if table.eq_ignore_ascii_case("columns_priv") {
+                    columns_priv_rows(&domain)
+                } else if table.eq_ignore_ascii_case("global_grants") {
+                    global_grants_rows(&domain)
+                } else if table.eq_ignore_ascii_case("db") {
+                    db_priv_rows(&domain)
+                } else if table.eq_ignore_ascii_case("global_priv") {
+                    global_priv_rows(&domain)
                 } else if matches!(
                     table.to_ascii_lowercase().as_str(),
                     "schema_privileges" | "table_privileges" | "column_privileges"
@@ -365,7 +392,7 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("index lookup without select"))?;
                 let from = index_reader_table(select, table)
                     .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
-                if let Some(exec) = mysql_user_exec(&from, current_db, stmt, &domain) {
+                if let Some(exec) = mysql_priv_mem_exec(&from, current_db, stmt, &domain) {
                     return Ok(exec);
                 }
                 // TiDB's probe-side `TableRowIDScan` batches the build handles
@@ -439,6 +466,9 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("index lookup without select"))?;
                 let from = index_reader_table(select, table)
                     .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
+                if let Some(exec) = mysql_priv_mem_exec(&from, current_db, stmt, &domain) {
+                    return Ok(exec);
+                }
                 let access =
                     index_access(&domain, current_db, &from, index, select.selection.as_ref())
                         .ok_or_else(|| Error::unsupported("index lookup without access path"))?;
@@ -520,6 +550,9 @@ impl ExecutorBuilder {
                         })
                     })
                 });
+                if let Some(exec) = mysql_priv_mem_exec(&from, current_db, stmt, &domain) {
+                    return Ok(exec);
+                }
                 let lookup = index.as_ref().and_then(|index_name| {
                     index_lookup_values(&domain, current_db, &from, index_name, select)
                 });
@@ -551,6 +584,9 @@ impl ExecutorBuilder {
                     .as_select()
                     .ok_or_else(|| Error::unsupported("batch point get without FROM"))?;
                 let from = resolve_reader_table(stmt, table)?;
+                if let Some(exec) = mysql_priv_mem_exec(&from, current_db, stmt, &domain) {
+                    return Ok(exec);
+                }
                 let selection = select.selection.as_ref();
                 // Key values come from the table metadata, so an expression
                 // part folds from the plain parts (`uk_expr((tidb_shard(a)), a)`
@@ -641,7 +677,7 @@ impl ExecutorBuilder {
                 ..
             } => {
                 let from = resolve_reader_table(stmt, table)?;
-                if let Some(exec) = mysql_user_exec(&from, current_db, stmt, &domain) {
+                if let Some(exec) = mysql_priv_mem_exec(&from, current_db, stmt, &domain) {
                     return Ok(exec);
                 }
                 let with_rowid = stmt
@@ -708,6 +744,14 @@ impl ExecutorBuilder {
                     current_db,
                     Arc::clone(&txn),
                 )?;
+                // `SELECT DISTINCT` plans as an aggregate grouped on the
+                // projected columns; execution de-duplicates them (TiDB's
+                // dedup HashAgg) instead of folding them into one row. A select
+                // list holding aggregate functions is the scalar aggregate
+                // itself (the single row is already distinct).
+                if distinct_is_dedup(select) {
+                    return distinct_exec_for_select(select, built, &domain, current_db);
+                }
                 // `RewriteINToJoinAndAgg` puts a `HashAgg(firstrow)` over the
                 // subquery as the build side of an inner join. That aggregate
                 // belongs to the *subquery*, so the outer statement carries no
@@ -716,12 +760,15 @@ impl ExecutorBuilder {
                 if let Some(dedup) = dedup_from_agg_info(info)
                     && !stmt_owns_agg_info(select, &dedup)
                 {
-                    return Ok(Box::new(DistinctExec::new(
-                        dedup.keys,
-                        dedup.fields,
-                        dedup.names,
-                        built,
-                    )));
+                    let mut exec =
+                        DistinctExec::new(dedup.keys, dedup.fields.clone(), dedup.names, built);
+                    exec = exec.with_collations(expr_list_collations(
+                        &dedup.fields,
+                        select,
+                        &domain,
+                        current_db,
+                    )?);
+                    return Ok(Box::new(exec));
                 }
                 // Outer DISTINCT HashAgg over StreamAgg: dedup projected columns.
                 if matches!(
@@ -771,9 +818,18 @@ impl ExecutorBuilder {
                             })
                             .collect()
                     };
-                    return Ok(Box::new(DistinctExec::new(keys, fields, names, built)));
+                    let modes = expr_list_collations(&fields, select, &domain, current_db)?;
+                    return Ok(Box::new(
+                        DistinctExec::new(keys, fields, names, built).with_collations(modes),
+                    ));
                 }
-                let mut exec = HashAggExec::new(select, built)?;
+                let from_columns = select_from_column_names(select, &domain, current_db);
+                let order_columns = take_order_columns(select, &from_columns);
+                let mut exec = HashAggExec::new(select, built)?
+                    .with_group_collations(group_by_collations(select, &domain, current_db)?);
+                if !order_columns.is_empty() {
+                    exec = exec.with_order_columns(&order_columns);
+                }
                 if let Some(ctx) = agg_subquery_ctx(select, domain, current_db, txn) {
                     exec = exec.with_subquery(ctx);
                 }
@@ -785,8 +841,18 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("stream agg without select"))?;
                 let ctx =
                     agg_subquery_ctx(select, Arc::clone(&domain), current_db, Arc::clone(&txn));
-                let mut exec =
-                    StreamAggExec::new(select, Self::build(child, stmt, domain, current_db, txn)?)?;
+                let built = Self::build(child, stmt, Arc::clone(&domain), current_db, txn)?;
+                // `SELECT DISTINCT` under `STREAM_AGG()` is the same dedup.
+                if distinct_is_dedup(select) {
+                    return distinct_exec_for_select(select, built, &domain, current_db);
+                }
+                let from_columns = select_from_column_names(select, &domain, current_db);
+                let order_columns = take_order_columns(select, &from_columns);
+                let mut exec = StreamAggExec::new(select, built)?
+                    .with_group_collations(group_by_collations(select, &domain, current_db)?);
+                if !order_columns.is_empty() {
+                    exec = exec.with_order_columns(&order_columns);
+                }
                 if let Some(ctx) = ctx {
                     exec = exec.with_subquery(ctx);
                 }
@@ -1156,11 +1222,21 @@ impl ExecutorBuilder {
                 PhysicalPlan::HashAgg { info, .. } if dedup_from_agg_info(info).is_some()
             );
         let exec_tp = if in_rewrite { JoinType::Semi } else { tp };
+        // Hash/semi/anti joins probe by raw key equality. Wrap string equality
+        // operands in their collation sort key so `'a'`/`'A'`/`'À'` hash
+        // together under `utf8mb4_general_ci` (TiDB hashes `collator.Key`).
+        let join_on = match stmt.as_select() {
+            Some(select) => {
+                let scope = CollationScope::for_select(&domain, select, current_db);
+                wrap_join_keys(on.clone(), &scope)?
+            }
+            None => on.clone(),
+        };
         let join = sealdb_parser::ast::Join {
             left: sealdb_parser::ast::TableName::new(None, left_table.to_string()),
             right: sealdb_parser::ast::TableName::new(None, right_table.to_string()),
             tp: ast_join_type(exec_tp),
-            on: on.clone(),
+            on: join_on,
             using_cols: using_cols.clone(),
             natural: false,
             straight,
@@ -1440,6 +1516,69 @@ fn is_hidden_generated_column(schema_name: &str) -> bool {
         .is_some_and(|name| name.starts_with("_V$"))
 }
 
+thread_local! {
+    /// Sort/TopN asks a directly nested aggregate to expose the ORDER BY
+    /// columns that the SELECT list does not carry.
+    static ORDER_COLUMNS_WANTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Trailing aggregate output columns added for ORDER BY (trimmed above).
+    static ORDER_COLUMNS_ADDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Build the Sort/TopN input, letting an aggregate directly below expose the
+/// ORDER BY-only columns.
+fn build_with_order_columns(
+    child: &PhysicalPlan,
+    stmt: &Statement,
+    domain: Arc<Domain>,
+    current_db: &str,
+    txn: Arc<TxnHandle>,
+) -> Result<Box<dyn Executor>> {
+    ORDER_COLUMNS_ADDED.set(0);
+    ORDER_COLUMNS_WANTED.set(true);
+    let built = ExecutorBuilder::build(child, stmt, domain, current_db, txn)?;
+    ORDER_COLUMNS_WANTED.set(false);
+    Ok(built)
+}
+
+/// Consume a pending Sort/TopN request: the base columns ORDER BY references
+/// that the aggregate's input carries. The aggregate appends them as
+/// first-row outputs so the Sort can evaluate its keys.
+fn take_order_columns(
+    select: &sealdb_parser::ast::SelectStmt,
+    child_schema: &[String],
+) -> Vec<String> {
+    if !ORDER_COLUMNS_WANTED.replace(false) {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for item in &select.order_by {
+        for (_, name) in item.expr.referenced_columns() {
+            if child_schema.iter().any(|c| {
+                c.rsplit('.')
+                    .next()
+                    .unwrap_or(c)
+                    .eq_ignore_ascii_case(&name)
+            }) && !out.iter().any(|n| n.eq_ignore_ascii_case(&name))
+            {
+                out.push(name);
+            }
+        }
+    }
+    ORDER_COLUMNS_ADDED.set(out.len());
+    out
+}
+
+/// Trim the trailing ORDER BY-only columns an aggregate appended.
+fn trim_order_columns(exec: Box<dyn Executor>) -> Box<dyn Executor> {
+    let added = ORDER_COLUMNS_ADDED.replace(0);
+    if added == 0 {
+        return exec;
+    }
+    let schema = exec.schema().to_vec();
+    let keep = schema.len().saturating_sub(added);
+    Box::new(ProjectionExec::trim_trailing(schema[..keep].to_vec(), exec))
+}
+
 fn stmt_order_by(stmt: &Statement) -> Option<Vec<ByItem>> {
     match stmt {
         Statement::Select(select) if !select.order_by.is_empty() => Some(select.order_by.clone()),
@@ -1472,6 +1611,22 @@ fn order_by_collations(
                             .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
                     })
                     .map(|c| sealdb_util::collate::CollateMode::from_name(&c.field_type.collate)),
+                // `expr COLLATE name` overrides the session collation for the
+                // sort key (`ORDER BY a COLLATE utf8mb4_general_ci` when the
+                // connection is utf8mb4_bin).
+                ExprNode::Func(func) if func.name.eq_ignore_ascii_case("__collate") => {
+                    func.args.get(1).and_then(|arg| match arg {
+                        ExprNode::Value(v) => match &v.datum {
+                            sealdb_types::Datum::Bytes(bytes) => {
+                                Some(sealdb_util::collate::CollateMode::from_name(
+                                    &String::from_utf8_lossy(bytes),
+                                ))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                }
                 _ => None,
             };
             mode.unwrap_or_else(sealdb_expression::collation_mode)
@@ -1673,6 +1828,8 @@ fn index_lookup_values(
             &join.left,
             &join.right,
             &join.on,
+            Some(&is),
+            current_db,
         );
         for pred in left.into_iter().chain(right) {
             if !expr_owned_by(&pred, table) {
@@ -1921,9 +2078,19 @@ fn index_access(
     let substituted = selection
         .and_then(|sel| sealdb_planner::core::expr_index::substitute_generated_expr(info, sel));
     let selection = substituted.as_ref().or(selection);
-    let conjuncts = selection
+    let conjuncts: Vec<ExprNode> = selection
         .map(|selection| selection.split_cnf())
         .unwrap_or_default();
+    // The statement's WHERE clause also carries predicates of the other join
+    // inputs, and `index_key_ranges` matches a conjunct to an index column by
+    // name alone. That is what lets a correlated inner scan seek on the outer
+    // value, but it must not bound this index with a constant that another
+    // table compares under a different collation (`t1.a = 'a'` next to
+    // `t1.a = t2.a` would seek `'a'` in a `utf8_bin` index and miss `'A'`).
+    let conjuncts: Vec<ExprNode> = conjuncts
+        .into_iter()
+        .filter(|conjunct| !foreign_collation_conflict(&is, current_db, table, info, conjunct))
+        .collect();
     // Ranger shares the planner's key ranges, so the executor seeks exactly the
     // range EXPLAIN prints: an equality prefix pins every key part it covers
     // (`c2 = 1 and c1 > 1` → `(1 1,1 +inf]` on `index c2(c2)`).
@@ -1952,6 +2119,57 @@ fn index_access(
         high: Vec::new(),
         high_inclusive: true,
     }])
+}
+
+/// Whether `conjunct` compares a column of another table under a collation
+/// this table's same-named column does not use.
+///
+/// The executor derives index ranges from the whole statement `WHERE` clause
+/// (key ranges match a conjunct to the index column by name), which is how a
+/// correlated inner scan seeks on the outer value. The shortcut is only sound
+/// while both columns compare under the same collation: `t1.a = 'a'` with
+/// `t1.a = t2.a` must not seek `'a'` in a `utf8_bin` index (`'A'` collates
+/// equal to `'a'` under `utf8mb4_general_ci` only).
+fn foreign_collation_conflict(
+    is: &sealdb_infoschema::InfoSchema,
+    current_db: &str,
+    table: &sealdb_parser::ast::TableName,
+    info: &sealdb_meta::TableInfo,
+    conjunct: &ExprNode,
+) -> bool {
+    conjunct
+        .referenced_columns()
+        .iter()
+        .any(|(qualifier, name)| {
+            let Some(qualifier) = qualifier else {
+                return false;
+            };
+            if qualifier.eq_ignore_ascii_case(&table.name)
+                || qualifier.eq_ignore_ascii_case(table.resolve_name())
+            {
+                return false;
+            }
+            let Some(foreign) = is.table_by_name(current_db, qualifier) else {
+                return false;
+            };
+            let local_ft = info
+                .columns
+                .iter()
+                .find(|c| c.name.o().eq_ignore_ascii_case(name))
+                .map(|c| &c.field_type);
+            let foreign_ft = foreign
+                .columns
+                .iter()
+                .find(|c| c.name.o().eq_ignore_ascii_case(name))
+                .map(|c| &c.field_type);
+            let (Some(local_ft), Some(foreign_ft)) = (local_ft, foreign_ft) else {
+                return false;
+            };
+            local_ft.eval_type() == sealdb_types::field_type::EvalType::String
+                && foreign_ft.eval_type() == sealdb_types::field_type::EvalType::String
+                && (!local_ft.collate.eq_ignore_ascii_case(&foreign_ft.collate)
+                    || !local_ft.charset.eq_ignore_ascii_case(&foreign_ft.charset))
+        })
 }
 
 fn select_row_lock(select: &SelectStmt) -> RowLock {
@@ -2006,6 +2224,55 @@ pub(crate) fn field_output_name(field: &sealdb_parser::ast::SelectField) -> Stri
         tidb_projection_field_name(&field.expr, field.orig_text.as_deref())
     };
     truncate_alias_identifier(raw)
+}
+
+/// `SELECT DISTINCT` without `GROUP BY` is planned as a dedup aggregate, so the
+/// executor de-duplicates its input. A select list with aggregate functions is
+/// the scalar aggregate itself: its single row is already distinct.
+fn distinct_is_dedup(select: &SelectStmt) -> bool {
+    select.distinct
+        && select.group_by.is_empty()
+        && !select.fields.iter().any(|field| match &field.expr {
+            ExprNode::Func(func) => crate::aggfuncs::is_agg_name(&func.name),
+            _ => false,
+        })
+}
+
+/// `SELECT DISTINCT` executor: keep the first row of every distinct projection
+/// (TiDB's de-duplicating `HashAgg group by … firstrow(…)`).
+fn distinct_exec_for_select(
+    select: &SelectStmt,
+    child: Box<dyn Executor>,
+    domain: &Domain,
+    current_db: &str,
+) -> Result<Box<dyn Executor>> {
+    // `SELECT DISTINCT *` keeps the full child row.
+    let star = select.fields.iter().all(|field| {
+        matches!(
+            &field.expr,
+            ExprNode::Value(ValueExpr {
+                datum: sealdb_types::Datum::Bytes(bytes),
+            }) if bytes == b"*"
+        )
+    });
+    let fields: Vec<ExprNode> = if star {
+        Vec::new()
+    } else {
+        select
+            .fields
+            .iter()
+            .map(|field| field.expr.clone())
+            .collect()
+    };
+    let names: Vec<String> = if star {
+        Vec::new()
+    } else {
+        select.fields.iter().map(field_output_name).collect()
+    };
+    let modes = expr_list_collations(&fields, select, domain, current_db)?;
+    Ok(Box::new(
+        DistinctExec::new(names.clone(), fields, names, child).with_collations(modes),
+    ))
 }
 
 fn truncate_alias_identifier(name: String) -> String {
@@ -2376,53 +2643,570 @@ fn resolve_collation_exprs(
     if !exprs.iter().any(contains_collation) {
         return Ok(exprs);
     }
-    let is = domain.infoschema();
-    let info = select
-        .from
-        .as_ref()
-        .filter(|_| select.from_item.is_none() && select.joins.is_empty())
-        .and_then(|from| {
-            let (db, table) = from.qualified(current_db);
-            is.table_by_name(&db, &table)
-        });
+    let scope = CollationScope::for_select(domain, select, current_db);
     exprs
         .into_iter()
-        .map(|expr| fold_collation(expr, info))
+        .map(|expr| fold_collation(expr, &scope))
         .collect()
+}
+
+/// User variable marker (`__SEALDB_VARCOLL(value, collation, charset)`): the
+/// value keeps the collation of the expression it was assigned from.
+const SEALDB_VARCOLL_FN: &str = "__SEALDB_VARCOLL";
+
+/// Collation of a standalone expression (no table scope), used to remember
+/// the collation a user variable was assigned with.
+pub fn derive_expr_collation(expr: &ExprNode) -> Option<(String, String)> {
+    let scope = CollationScope::empty();
+    expr_collation(expr, &scope)
+        .ok()
+        .filter(|info| !info.is_neutral())
+        .map(|info| (info.collation, info.charset))
+}
+
+/// TiDB derives the collation of every string comparison / string function
+/// while building the expression tree, so an illegal mix is reported before
+/// execution (1267 two-collation mix, 1271 for `FIELD`).
+pub fn validate_statement_collations(
+    domain: &Domain,
+    stmt: &Statement,
+    current_db: &str,
+) -> Result<()> {
+    if let Some(select) = stmt.as_select() {
+        validate_select_collations(domain, select, current_db)?;
+    }
+    Ok(())
+}
+
+fn validate_select_collations(
+    domain: &Domain,
+    select: &SelectStmt,
+    current_db: &str,
+) -> Result<()> {
+    let scope = CollationScope::for_select(domain, select, current_db);
+    for field in &select.fields {
+        validate_expr_collation(&field.expr, &scope, domain, current_db)?;
+    }
+    if let Some(selection) = &select.selection {
+        validate_expr_collation(selection, &scope, domain, current_db)?;
+    }
+    if let Some(having) = &select.having {
+        validate_expr_collation(having, &scope, domain, current_db)?;
+    }
+    for expr in &select.group_by {
+        validate_expr_collation(expr, &scope, domain, current_db)?;
+    }
+    for item in &select.order_by {
+        validate_expr_collation(&item.expr, &scope, domain, current_db)?;
+    }
+    for join in &select.joins {
+        validate_expr_collation(&join.on, &scope, domain, current_db)?;
+    }
+    Ok(())
+}
+
+fn validate_expr_collation(
+    expr: &ExprNode,
+    scope: &CollationScope,
+    domain: &Domain,
+    current_db: &str,
+) -> Result<()> {
+    let walk = |child: &ExprNode| validate_expr_collation(child, scope, domain, current_db);
+    match expr {
+        ExprNode::Binary(binary) => {
+            if matches!(
+                binary.op,
+                sealdb_parser::opcode::Op::Eq
+                    | sealdb_parser::opcode::Op::NullSafeEq
+                    | sealdb_parser::opcode::Op::Ne
+                    | sealdb_parser::opcode::Op::Lt
+                    | sealdb_parser::opcode::Op::Le
+                    | sealdb_parser::opcode::Op::Gt
+                    | sealdb_parser::opcode::Op::Ge
+            ) {
+                validate_comparison(&binary.left, &binary.right, binary.op.restore(), scope)?;
+            }
+            walk(&binary.left)?;
+            walk(&binary.right)
+        }
+        ExprNode::Like(like) => {
+            validate_comparison(&like.expr, &like.pattern, "like", scope)?;
+            walk(&like.expr)?;
+            walk(&like.pattern)
+        }
+        ExprNode::Func(func) => {
+            let name = func.name.to_ascii_lowercase();
+            if name == "field" {
+                validate_field_collation(func, scope)?;
+            } else if is_collation_derived_func(&name) {
+                // A conflicting explicit collation is an error for every
+                // aggregating string function.
+                expr_collation(expr, scope)?;
+            }
+            for arg in &func.args {
+                walk(arg)?;
+            }
+            Ok(())
+        }
+        ExprNode::Unary(unary) => walk(&unary.expr),
+        ExprNode::Cast(cast) => walk(&cast.expr),
+        ExprNode::InList(in_list) => {
+            walk(&in_list.expr)?;
+            for item in &in_list.list {
+                walk(item)?;
+            }
+            Ok(())
+        }
+        ExprNode::InSubquery(in_subquery) => {
+            walk(&in_subquery.expr)?;
+            validate_result_set_collations(&in_subquery.query, scope, domain, current_db)
+        }
+        ExprNode::Exists(exists) => {
+            validate_result_set_collations(&exists.query, scope, domain, current_db)
+        }
+        ExprNode::ScalarSubquery(subquery) => {
+            validate_result_set_collations(&subquery.query, scope, domain, current_db)
+        }
+        ExprNode::QuantifiedCmp(cmp) => {
+            walk(&cmp.expr)?;
+            validate_result_set_collations(&cmp.query, scope, domain, current_db)
+        }
+        ExprNode::Between(between) => {
+            walk(&between.expr)?;
+            walk(&between.low)?;
+            walk(&between.high)
+        }
+        ExprNode::IsNull(is_null) => walk(&is_null.expr),
+        ExprNode::Case(case) => {
+            if let Some(operand) = &case.operand {
+                walk(operand)?;
+            }
+            for (when, then) in &case.when_then {
+                walk(when)?;
+                walk(then)?;
+            }
+            if let Some(else_expr) = &case.else_expr {
+                walk(else_expr)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_result_set_collations(
+    query: &ResultSetNode,
+    outer: &CollationScope,
+    domain: &Domain,
+    current_db: &str,
+) -> Result<()> {
+    for select in query.selects() {
+        // A correlated subquery can name a column of the outer query block, so
+        // fall back to the outer scope when the inner block has no table.
+        let scope = CollationScope::for_select(domain, select, current_db);
+        let scope = if scope.tables.is_empty() {
+            outer.clone()
+        } else {
+            scope
+        };
+        for field in &select.fields {
+            validate_expr_collation(&field.expr, &scope, domain, current_db)?;
+        }
+        if let Some(selection) = &select.selection {
+            validate_expr_collation(selection, &scope, domain, current_db)?;
+        }
+        if let Some(having) = &select.having {
+            validate_expr_collation(having, &scope, domain, current_db)?;
+        }
+        for join in &select.joins {
+            validate_expr_collation(&join.on, &scope, domain, current_db)?;
+        }
+    }
+    Ok(())
+}
+
+/// TiDB `inferCollation` + `CheckAndDeriveCollationFromExprs` for a comparison:
+/// a comparison yields an integer, so a `CoercibilityNone` result (no bin side
+/// to break the tie) is an illegal mix.
+fn validate_comparison(
+    left: &ExprNode,
+    right: &ExprNode,
+    op: &str,
+    scope: &CollationScope,
+) -> Result<()> {
+    let a = expr_collation(left, scope)?;
+    let b = expr_collation(right, scope)?;
+    // A non-string comparison (`i = 1`) never derives a collation.
+    if a.charset == "binary" && b.charset == "binary" {
+        return Ok(());
+    }
+    let dst = if a.charset == b.charset {
+        comparison_same_charset(&a, &b, op)?
+    } else {
+        aggregate_collation_pair(a.clone(), b.clone(), op)?
+    };
+    if dst.coercibility == COERCIBILITY_NONE {
+        return Err(illegal_mix_of_collations(&a, &b, op));
+    }
+    Ok(())
+}
+
+fn comparison_same_charset(
+    a: &CollationInfo,
+    b: &CollationInfo,
+    op: &str,
+) -> Result<CollationInfo> {
+    if a.collation == b.collation {
+        return Ok(a.clone());
+    }
+    if a.coercibility != b.coercibility {
+        return Ok(if a.coercibility < b.coercibility {
+            a.clone()
+        } else {
+            b.clone()
+        });
+    }
+    if a.coercibility == COERCIBILITY_EXPLICIT {
+        return Err(illegal_mix_of_collations(a, b, op));
+    }
+    if is_bin_collation(&a.collation) {
+        return Ok(a.clone());
+    }
+    if is_bin_collation(&b.collation) {
+        return Ok(b.clone());
+    }
+    Ok(CollationInfo {
+        collation: bin_collation_for_charset(&a.charset),
+        charset: a.charset.clone(),
+        coercibility: COERCIBILITY_NONE,
+        text: None,
+    })
+}
+
+/// `FIELD` resolves its collation like a multi-argument comparison; a mix with
+/// no bin tie-breaker reports the N-collation error (1271).
+fn validate_field_collation(
+    func: &sealdb_parser::ast::FuncCallExpr,
+    scope: &CollationScope,
+) -> Result<()> {
+    let mut out: Option<CollationInfo> = None;
+    for arg in func.args.iter().skip(1) {
+        let coll = expr_collation_aggregated(arg, scope)?;
+        if coll.is_neutral() {
+            continue;
+        }
+        out = Some(match out {
+            None => coll,
+            Some(current) => {
+                if current.charset == coll.charset {
+                    comparison_same_charset(&current, &coll, "field")?
+                } else {
+                    aggregate_collation_pair(current, coll, "field")?
+                }
+            }
+        });
+    }
+    if out.is_some_and(|coll| coll.coercibility == COERCIBILITY_NONE) {
+        return Err(Error::new(
+            1271,
+            "Illegal mix of collations for operation 'field'",
+        ));
+    }
+    Ok(())
+}
+
+fn is_collation_derived_func(name: &str) -> bool {
+    matches!(
+        name,
+        "concat"
+            | "concat_ws"
+            | "upper"
+            | "ucase"
+            | "lower"
+            | "lcase"
+            | "reverse"
+            | "quote"
+            | "left"
+            | "right"
+            | "repeat"
+            | "trim"
+            | "ltrim"
+            | "rtrim"
+            | "substr"
+            | "substring"
+            | "mid"
+            | "translate"
+            | "substring_index"
+            | "lpad"
+            | "rpad"
+            | "elt"
+            | "export_set"
+            | "make_set"
+            | "ifnull"
+            | "coalesce"
+            | "if"
+            | "nullif"
+            | "greatest"
+            | "least"
+    )
 }
 
 fn contains_collation(expr: &ExprNode) -> bool {
     match expr {
+        ExprNode::Like(_) | ExprNode::Between(_) => true,
         ExprNode::Func(func) => {
             func.name.eq_ignore_ascii_case("collation")
+                || func.name.eq_ignore_ascii_case("charset")
+                || func.name.eq_ignore_ascii_case("coercibility")
                 || func.name.eq_ignore_ascii_case("weight_string")
+                || func.name.eq_ignore_ascii_case("field")
+                || func.name.eq_ignore_ascii_case("find_in_set")
+                || func.name.eq_ignore_ascii_case("instr")
+                || func.name.eq_ignore_ascii_case("locate")
+                // `REGEXP`'s case sensitivity comes from the collation
+                // aggregated across its value and pattern operands.
+                || func.name.eq_ignore_ascii_case("regexp_like")
+                || func.name.eq_ignore_ascii_case("regexp_instr")
+                || func.name.eq_ignore_ascii_case("regexp_substr")
+                || func.name.eq_ignore_ascii_case("regexp_replace")
+                // TiDB compares GREATEST/LEAST with the collation derived from
+                // their arguments, not the session collation.
+                || func.name.eq_ignore_ascii_case("greatest")
+                || func.name.eq_ignore_ascii_case("least")
                 || func.args.iter().any(contains_collation)
         }
         ExprNode::Cast(cast) => contains_collation(&cast.expr),
         ExprNode::Binary(binary) => {
-            contains_collation(&binary.left) || contains_collation(&binary.right)
+            is_comparison_op(binary.op)
+                || contains_collation(&binary.left)
+                || contains_collation(&binary.right)
         }
         ExprNode::Unary(unary) => contains_collation(&unary.expr),
         _ => false,
     }
 }
 
-fn fold_collation(expr: ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Result<ExprNode> {
+/// Collation mode per `GROUP BY` key (used by HashAgg/StreamAgg group keys).
+fn group_by_collations(
+    select: &SelectStmt,
+    domain: &Domain,
+    current_db: &str,
+) -> Result<Vec<CollateMode>> {
+    if select.group_by.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scope = CollationScope::for_select(domain, select, current_db);
+    select
+        .group_by
+        .iter()
+        .map(|expr| {
+            let info = expr_collation(expr, &scope)?;
+            Ok(if info.is_neutral() || info.charset == "binary" {
+                CollateMode::Bin
+            } else {
+                CollateMode::from_name(&info.collation)
+            })
+        })
+        .collect()
+}
+
+/// Collation mode per projected expression (used by DISTINCT dedup keys).
+fn expr_list_collations(
+    exprs: &[ExprNode],
+    select: &SelectStmt,
+    domain: &Domain,
+    current_db: &str,
+) -> Result<Vec<CollateMode>> {
+    if exprs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scope = CollationScope::for_select(domain, select, current_db);
+    exprs
+        .iter()
+        .map(|expr| {
+            let info = expr_collation(expr, &scope)?;
+            Ok(if info.is_neutral() || info.charset == "binary" {
+                CollateMode::Bin
+            } else {
+                CollateMode::from_name(&info.collation)
+            })
+        })
+        .collect()
+}
+
+/// Wrap the string operands of a join equality in `__COLL_KEY(expr, coll)`, so
+/// hash-join key bytes follow the collation (`'a'`/`'A'` join under
+/// `utf8mb4_general_ci`). Only the cross-side equality keys are wrapped; every
+/// other conjunct is left untouched for residual evaluation.
+fn wrap_join_keys(expr: ExprNode, scope: &CollationScope) -> Result<ExprNode> {
+    match expr {
+        ExprNode::Binary(mut binary) => {
+            binary.left = Box::new(wrap_join_keys(*binary.left, scope)?);
+            binary.right = Box::new(wrap_join_keys(*binary.right, scope)?);
+            if matches!(
+                binary.op,
+                sealdb_parser::opcode::Op::Eq | sealdb_parser::opcode::Op::NullSafeEq
+            ) {
+                if let Some(info) = derive_comparison_collation(
+                    &binary.left,
+                    &binary.right,
+                    binary.op.restore(),
+                    scope,
+                )? && !info.is_neutral()
+                    && info.charset != "binary"
+                {
+                    let collation = collation_literal(&info.collation);
+                    let wrap = |expr: ExprNode| -> ExprNode {
+                        ExprNode::Func(sealdb_parser::ast::expressions::FuncCallExpr {
+                            name: "__COLL_KEY".to_string(),
+                            args: vec![expr, collation.clone()],
+                            distinct: false,
+                        })
+                    };
+                    binary.left = Box::new(wrap(*binary.left));
+                    binary.right = Box::new(wrap(*binary.right));
+                }
+            }
+            Ok(ExprNode::Binary(binary))
+        }
+        ExprNode::Func(mut func) => {
+            func.args = func
+                .args
+                .into_iter()
+                .map(|arg| wrap_join_keys(arg, scope))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ExprNode::Func(func))
+        }
+        other => Ok(other),
+    }
+}
+
+fn fold_collation(expr: ExprNode, scope: &CollationScope) -> Result<ExprNode> {
     match expr {
         ExprNode::Func(mut func) => {
+            if func.name.eq_ignore_ascii_case("coercibility") && func.args.len() == 1 {
+                let coercibility = expr_collation(&func.args[0], scope)?.coercibility;
+                return Ok(ExprNode::Value(
+                    sealdb_parser::ast::expressions::ValueExpr {
+                        datum: sealdb_types::Datum::I64(i64::from(coercibility)),
+                    },
+                ));
+            }
             if func.name.eq_ignore_ascii_case("collation") && func.args.len() == 1 {
-                let collation = expr_collation(&func.args[0], info)?.collation;
+                let info = expr_collation(&func.args[0], scope)?;
+                // `COLLATION(NULL)` reports `binary` (TiDB `GetCollation`).
+                let collation = if info.is_neutral() {
+                    "binary".to_string()
+                } else {
+                    info.collation
+                };
                 return Ok(ExprNode::Value(
                     sealdb_parser::ast::expressions::ValueExpr {
                         datum: sealdb_types::Datum::Bytes(collation.into_bytes()),
                     },
                 ));
             }
+            if func.name.eq_ignore_ascii_case("charset") && func.args.len() == 1 {
+                let info = expr_collation(&func.args[0], scope)?;
+                let charset = if info.is_neutral() {
+                    "binary".to_string()
+                } else {
+                    info.charset
+                };
+                return Ok(ExprNode::Value(
+                    sealdb_parser::ast::expressions::ValueExpr {
+                        datum: sealdb_types::Datum::Bytes(charset.into_bytes()),
+                    },
+                ));
+            }
             func.args = func
                 .args
                 .into_iter()
-                .map(|arg| fold_collation(arg, info))
+                .map(|arg| fold_collation(arg, scope))
                 .collect::<Result<Vec<_>>>()?;
+            if (func.name.eq_ignore_ascii_case("greatest")
+                || func.name.eq_ignore_ascii_case("least"))
+                && func.args.len() >= 2
+            {
+                let want_greatest = func.name.eq_ignore_ascii_case("greatest");
+                let collation = expr_collation(&ExprNode::Func(func.clone()), scope)?.collation;
+                func.name = if want_greatest {
+                    "__greatest_coll".to_string()
+                } else {
+                    "__least_coll".to_string()
+                };
+                func.args.insert(
+                    0,
+                    ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
+                        datum: sealdb_types::Datum::Bytes(collation.into_bytes()),
+                    }),
+                );
+            }
+            let lower_name = func.name.to_ascii_lowercase();
+            // `REGEXP`/`RLIKE` lowers to `regexp_like(expr, pat)`. TiDB adds
+            // the `i` flag only for a case-insensitive collation derived from
+            // both operands; a binary or `*_bin` pair stays case-sensitive.
+            if lower_name == "regexp_like" && func.args.len() == 2 {
+                let case_sensitive = match derive_comparison_collation(
+                    &func.args[0],
+                    &func.args[1],
+                    "regexp",
+                    scope,
+                )? {
+                    None => true,
+                    Some(info) if info.is_neutral() => true,
+                    Some(info) => !CollateMode::from_name(&info.collation).is_ci(),
+                };
+                if case_sensitive {
+                    func.args.push(ExprNode::Value(ValueExpr {
+                        datum: sealdb_types::Datum::Bytes(b"c".to_vec()),
+                    }));
+                }
+            }
+            // `FIELD`/`FIND_IN_SET` compare under the collation aggregated from
+            // their operands (a column collation wins over the session one).
+            if (lower_name == "field" || lower_name == "find_in_set") && func.args.len() >= 2 {
+                let compared: &[ExprNode] = if lower_name == "field" {
+                    &func.args[1..]
+                } else {
+                    &func.args
+                };
+                let info = aggregate_collations(
+                    &lower_name,
+                    compared
+                        .iter()
+                        .map(|arg| expr_collation_aggregated(arg, scope)),
+                )?;
+                if !info.is_neutral() {
+                    func.name = if lower_name == "field" {
+                        "__FIELD_COLL".to_string()
+                    } else {
+                        "__FIND_IN_SET_COLL".to_string()
+                    };
+                    func.args.insert(0, collation_literal(&info.collation));
+                }
+            }
+            // `INSTR`/`LOCATE` compare under the collation aggregated from their
+            // operands (a column collation wins over the session one).
+            if (lower_name == "instr" && func.args.len() == 2)
+                || (lower_name == "locate" && (2..=3).contains(&func.args.len()))
+            {
+                let compared: &[ExprNode] = &func.args[..2];
+                let info = aggregate_collations(
+                    &lower_name,
+                    compared
+                        .iter()
+                        .map(|arg| expr_collation_aggregated(arg, scope)),
+                )?;
+                if !info.is_neutral() {
+                    func.name = if lower_name == "instr" {
+                        "__INSTR_COLL".to_string()
+                    } else {
+                        "__LOCATE_COLL".to_string()
+                    };
+                    func.args.insert(0, collation_literal(&info.collation));
+                }
+            }
             // `WEIGHT_STRING(expr[, 'CHAR'|'BINARY', n])` needs the argument's
             // static collation, which is only known here: pass it as a trailing
             // literal so the evaluator can build the key.
@@ -2430,7 +3214,7 @@ fn fold_collation(expr: ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Resu
                 && !func.args.is_empty()
                 && matches!(func.args.len(), 1 | 3)
             {
-                let collation = expr_collation(&func.args[0], info)?.collation;
+                let collation = expr_collation(&func.args[0], scope)?.collation;
                 func.args.push(ExprNode::Value(
                     sealdb_parser::ast::expressions::ValueExpr {
                         datum: sealdb_types::Datum::Bytes(collation.into_bytes()),
@@ -2440,16 +3224,81 @@ fn fold_collation(expr: ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Resu
             Ok(ExprNode::Func(func))
         }
         ExprNode::Cast(mut cast) => {
-            cast.expr = Box::new(fold_collation(*cast.expr, info)?);
+            cast.expr = Box::new(fold_collation(*cast.expr, scope)?);
             Ok(ExprNode::Cast(cast))
         }
         ExprNode::Binary(mut binary) => {
-            binary.left = Box::new(fold_collation(*binary.left, info)?);
-            binary.right = Box::new(fold_collation(*binary.right, info)?);
+            binary.left = Box::new(fold_collation(*binary.left, scope)?);
+            binary.right = Box::new(fold_collation(*binary.right, scope)?);
+            if is_comparison_op(binary.op) {
+                return wrap_collation_comparison(
+                    *binary.left,
+                    *binary.right,
+                    binary.op,
+                    binary.single_cnf_item,
+                    scope,
+                );
+            }
             Ok(ExprNode::Binary(binary))
         }
+        ExprNode::Between(between) => {
+            let value = fold_collation(*between.expr, scope)?;
+            let low = fold_collation(*between.low, scope)?;
+            let high = fold_collation(*between.high, scope)?;
+            if !between.not {
+                let low_dst = derive_comparison_collation(&value, &low, ">=", scope)?;
+                let high_dst = derive_comparison_collation(&value, &high, "<=", scope)?;
+                if let (Some(a), Some(b)) = (&low_dst, &high_dst)
+                    && !a.is_neutral()
+                    && a.collation == b.collation
+                {
+                    return Ok(ExprNode::Func(
+                        sealdb_parser::ast::expressions::FuncCallExpr {
+                            name: "__STR_BETWEEN".to_string(),
+                            args: vec![collation_literal(&a.collation), value, low, high],
+                            distinct: false,
+                        },
+                    ));
+                }
+            }
+            Ok(ExprNode::Between(BetweenExpr {
+                expr: Box::new(value),
+                low: Box::new(low),
+                high: Box::new(high),
+                not: between.not,
+            }))
+        }
+        ExprNode::Like(like) => {
+            let value = fold_collation(*like.expr, scope)?;
+            let pattern = fold_collation(*like.pattern, scope)?;
+            let derived = derive_comparison_collation(&value, &pattern, "like", scope)?;
+            if let Some(info) = derived
+                && !info.is_neutral()
+            {
+                return Ok(ExprNode::Func(
+                    sealdb_parser::ast::expressions::FuncCallExpr {
+                        name: "__STR_LIKE".to_string(),
+                        args: vec![
+                            collation_literal(&info.collation),
+                            value,
+                            pattern,
+                            ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
+                                datum: sealdb_types::Datum::I64(i64::from(like.not)),
+                            }),
+                        ],
+                        distinct: false,
+                    },
+                ));
+            }
+            Ok(ExprNode::Like(PatternLikeExpr {
+                expr: Box::new(value),
+                pattern: Box::new(pattern),
+                not: like.not,
+                ci: like.ci,
+            }))
+        }
         ExprNode::Unary(mut unary) => {
-            unary.expr = Box::new(fold_collation(*unary.expr, info)?);
+            unary.expr = Box::new(fold_collation(*unary.expr, scope)?);
             Ok(ExprNode::Unary(unary))
         }
         other => Ok(other),
@@ -2460,8 +3309,14 @@ fn fold_collation(expr: ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Resu
 /// strength order (`EXPLICIT` beats `IMPLICIT` beats `COERCIBLE`). `IGNORABLE`
 /// (NULL) and `NUMERIC` operands do not participate.
 const COERCIBILITY_EXPLICIT: u8 = 0;
+/// Different collations met at the same strength (`CONCAT` of two implicit
+/// collations): MySQL reports no collation instead of picking one.
+const COERCIBILITY_NONE: u8 = 1;
+/// Function results like `USER()` / `VERSION()` / `DATABASE()`.
+const COERCIBILITY_SYSTEM_CONSTANT: u8 = 3;
 const COERCIBILITY_IMPLICIT: u8 = 2;
 const COERCIBILITY_COERCIBLE: u8 = 4;
+const COERCIBILITY_NUMERIC: u8 = 5;
 const COERCIBILITY_IGNORABLE: u8 = 6;
 
 /// Collation metadata of one string operand (TiDB `types.FieldType` collation
@@ -2487,16 +3342,163 @@ impl CollationInfo {
     }
 
     fn is_neutral(&self) -> bool {
+        // NULL (no charset) and numeric operands do not take part in collation
+        // aggregation (`CONCAT(i, 1)` reports the fallback collation).
         self.charset.is_empty()
+            || (self.charset == "binary" && self.coercibility == COERCIBILITY_NUMERIC)
     }
 
     fn coercibility_name(&self) -> &'static str {
         match self.coercibility {
             COERCIBILITY_EXPLICIT => "EXPLICIT",
+            COERCIBILITY_NONE => "NONE",
+            COERCIBILITY_SYSTEM_CONSTANT => "SYSTEM",
             COERCIBILITY_IMPLICIT => "IMPLICIT",
             COERCIBILITY_COERCIBLE => "COERCIBLE",
+            COERCIBILITY_NUMERIC => "NUMERIC",
             _ => "IGNORABLE",
         }
+    }
+}
+
+/// Column collation lookup scope: every table in the statement's FROM / JOIN
+/// chain, keyed by the name the query uses (alias when present).
+#[derive(Clone)]
+struct CollationScope {
+    tables: Vec<(String, sealdb_meta::TableInfo)>,
+}
+
+impl CollationScope {
+    fn empty() -> Self {
+        Self { tables: Vec::new() }
+    }
+
+    fn single(info: &sealdb_meta::TableInfo) -> Self {
+        Self {
+            tables: vec![(info.name.o().to_ascii_lowercase(), info.clone())],
+        }
+    }
+
+    /// Resolve every table named by the query block (aliases included).
+    fn for_select(domain: &Domain, select: &SelectStmt, current_db: &str) -> Self {
+        let is = domain.infoschema();
+        let mut tables = Vec::new();
+        for table in select.join_tables() {
+            let (db, name) = table.qualified(current_db);
+            let resolved = match is.table_by_name(&db, &name) {
+                Some(info) => Some(info.clone()),
+                // A derived table (`FROM (SELECT …) x`) is a synthetic CTE
+                // rather than an infoschema entry; its column types still
+                // drive `collation()` on the outer reference.
+                None => derived_table_info(select, table.resolve_name(), &is, current_db),
+            };
+            let Some(info) = resolved else {
+                continue;
+            };
+            tables.push((table.name.to_ascii_lowercase(), info.clone()));
+            if let Some(physical) = &table.physical {
+                tables.push((physical.to_ascii_lowercase(), info));
+            }
+        }
+        Self { tables }
+    }
+
+    fn lookup(
+        &self,
+        column: &sealdb_parser::ast::expressions::ColumnNameExpr,
+    ) -> Option<&sealdb_meta::ColumnInfo> {
+        fn find<'i>(
+            info: &'i sealdb_meta::TableInfo,
+            name: &str,
+        ) -> Option<&'i sealdb_meta::ColumnInfo> {
+            info.columns
+                .iter()
+                .find(|col| col.name.o().eq_ignore_ascii_case(name))
+        }
+        match &column.table {
+            Some(table) => self
+                .tables
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(table))
+                .find_map(|(_, info)| find(info, &column.name)),
+            None => self
+                .tables
+                .iter()
+                .find_map(|(_, info)| find(info, &column.name)),
+        }
+    }
+}
+
+/// Column types of a derived table (`FROM (SELECT …) x`), read from the
+/// synthetic CTE the parser lowering stores on the statement. Only columns
+/// whose type is statically known (`NULL` literal, or a base-table column) are
+/// reported; the others fall back to the session collation as before.
+fn derived_table_info(
+    select: &SelectStmt,
+    name: &str,
+    is: &sealdb_infoschema::InfoSchema,
+    current_db: &str,
+) -> Option<sealdb_meta::TableInfo> {
+    let with = select.with.as_ref()?;
+    let cte = with.find(name)?;
+    if !cte.derived {
+        return None;
+    }
+    let seed = cte.query.as_ref();
+    let mut columns = Vec::new();
+    for (offset, field) in seed.fields.iter().enumerate() {
+        let Some(column_name) = cte
+            .col_name_list
+            .get(offset)
+            .cloned()
+            .or_else(|| field.as_name.clone().filter(|name| !name.is_empty()))
+            .or_else(|| match &field.expr {
+                ExprNode::Column(column) => Some(column.name.clone()),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let Some(field_type) = derived_field_type(&field.expr, seed, is, current_db) else {
+            continue;
+        };
+        columns.push(sealdb_meta::ColumnInfo::new(
+            0,
+            offset as i32,
+            column_name,
+            field_type,
+        ));
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    Some(sealdb_meta::TableInfo::new(0, name, columns))
+}
+
+/// Static type of a derived table's output expression.
+fn derived_field_type(
+    expr: &ExprNode,
+    seed: &SelectStmt,
+    is: &sealdb_infoschema::InfoSchema,
+    current_db: &str,
+) -> Option<sealdb_types::FieldType> {
+    match expr {
+        // `SELECT NULL AS a`: TiDB types the column as NULL (collation
+        // `binary`), which is what `COLLATION(a)` reports.
+        ExprNode::Value(value) if value.datum.is_null() => Some(sealdb_types::FieldType {
+            tp: sealdb_types::field_type::TYPE_NULL,
+            ..Default::default()
+        }),
+        ExprNode::Column(column) => {
+            let from = seed.from.as_ref()?;
+            let (db, table) = from.qualified(current_db);
+            let info = is.table_by_name(&db, &table)?;
+            info.columns
+                .iter()
+                .find(|col| col.name.o().eq_ignore_ascii_case(&column.name))
+                .map(|col| col.field_type.clone())
+        }
+        _ => None,
     }
 }
 
@@ -2504,35 +3506,40 @@ impl CollationInfo {
 /// type, together with the charset and coercibility used by the aggregation
 /// rules. A binary string (VARBINARY/BLOB/JSON) or a non-string operand
 /// reports `binary`; string literals report the utf8mb4 default collation.
-fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Result<CollationInfo> {
-    // String literals take the charset's default collation (`utf8mb4_bin`).
-    const DEFAULT: &str = "utf8mb4_bin";
+fn expr_collation(expr: &ExprNode, scope: &CollationScope) -> Result<CollationInfo> {
+    // String literals take `collation_connection` (TiDB `ctx.GetCharsetInfo()`).
+    let (session_charset, session_collation) = sealdb_expression::session_collation();
     match expr {
         ExprNode::Value(value) => Ok(match &value.datum {
             sealdb_types::Datum::Bytes(bytes) => CollationInfo {
-                collation: DEFAULT.to_string(),
-                charset: "utf8mb4".to_string(),
+                collation: session_collation.clone(),
+                charset: session_charset.clone(),
                 coercibility: COERCIBILITY_COERCIBLE,
                 text: Some(String::from_utf8_lossy(bytes).into_owned()),
             },
             sealdb_types::Datum::Null => CollationInfo::ignorable(),
+            // A binary literal is a string constant (`CoercibilityCoercible`
+            // with the binary collation).
+            sealdb_types::Datum::Bit(_) => CollationInfo {
+                collation: "binary".to_string(),
+                charset: "binary".to_string(),
+                coercibility: COERCIBILITY_COERCIBLE,
+                text: None,
+            },
+            // Numeric / temporal constants are `CoercibilityNumeric`.
             _ => CollationInfo {
                 collation: "binary".to_string(),
                 charset: "binary".to_string(),
-                coercibility: COERCIBILITY_IGNORABLE,
+                coercibility: COERCIBILITY_NUMERIC,
                 text: None,
             },
         }),
-        ExprNode::Column(column) => Ok(info
-            .and_then(|info| {
-                info.columns
-                    .iter()
-                    .find(|col| col.name.o().eq_ignore_ascii_case(&column.name))
-            })
+        ExprNode::Column(column) => Ok(scope
+            .lookup(column)
             .map(column_collation_info)
             .unwrap_or_else(|| CollationInfo {
-                collation: DEFAULT.to_string(),
-                charset: "utf8mb4".to_string(),
+                collation: session_collation.clone(),
+                charset: session_charset.clone(),
                 coercibility: COERCIBILITY_IMPLICIT,
                 text: None,
             })),
@@ -2555,7 +3562,7 @@ fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Res
             let mut out = func
                 .args
                 .first()
-                .map(|arg| expr_collation(arg, info))
+                .map(|arg| expr_collation(arg, scope))
                 .transpose()?
                 .unwrap_or_else(CollationInfo::ignorable);
             let target = charset_of_collation(&collation);
@@ -2598,7 +3605,7 @@ fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Res
             let mut out = func
                 .args
                 .first()
-                .map(|arg| expr_collation(arg, info))
+                .map(|arg| expr_collation(arg, scope))
                 .transpose()?
                 .unwrap_or_else(CollationInfo::ignorable);
             out.collation = default_collation_for_charset(&charset);
@@ -2606,10 +3613,100 @@ fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Res
             out.coercibility = COERCIBILITY_IMPLICIT;
             Ok(out)
         }
-        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("concat") => aggregate_collations(
-            "concat",
-            func.args.iter().map(|arg| expr_collation(arg, info)),
-        ),
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case(SEALDB_VARCOLL_FN) => {
+            let literal = |arg: Option<&ExprNode>| match arg {
+                Some(ExprNode::Value(v)) => match &v.datum {
+                    sealdb_types::Datum::Bytes(bytes) => {
+                        Some(String::from_utf8_lossy(bytes).into_owned())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let collation = literal(func.args.get(1)).unwrap_or_default();
+            let charset = literal(func.args.get(2)).unwrap_or_default();
+            let mut info = CollationInfo {
+                collation,
+                charset,
+                // A user variable behaves like a column of its value type.
+                coercibility: COERCIBILITY_IMPLICIT,
+                text: None,
+            };
+            if let Some(ExprNode::Value(v)) = func.args.first() {
+                if let sealdb_types::Datum::Bytes(bytes) = &v.datum {
+                    info.text = Some(String::from_utf8_lossy(bytes).into_owned());
+                }
+            }
+            Ok(info)
+        }
+        ExprNode::Func(func)
+            if matches!(
+                func.name.to_ascii_lowercase().as_str(),
+                "concat" | "concat_ws"
+            ) =>
+        {
+            let op = func.name.to_ascii_lowercase();
+            aggregate_collations(
+                &op,
+                func.args
+                    .iter()
+                    .map(|arg| expr_collation_aggregated(arg, scope)),
+            )
+        }
+        // String functions that only transform their first argument keep its
+        // collation (TiDB `deriveCollation`).
+        ExprNode::Func(func)
+            if matches!(
+                func.name.to_ascii_lowercase().as_str(),
+                "upper"
+                    | "ucase"
+                    | "lower"
+                    | "lcase"
+                    | "reverse"
+                    | "quote"
+                    | "left"
+                    | "right"
+                    | "repeat"
+                    | "trim"
+                    | "ltrim"
+                    | "rtrim"
+                    | "substr"
+                    | "substring"
+                    | "mid"
+                    | "translate"
+                    | "substring_index"
+                    | "lpad"
+                    | "rpad"
+                    | "replace"
+                    | "insert"
+            ) =>
+        {
+            let op = func.name.to_ascii_lowercase();
+            aggregate_collations(
+                &op,
+                func.args
+                    .first()
+                    .map(|arg| expr_collation_aggregated(arg, scope))
+                    .into_iter(),
+            )
+        }
+        // `ELT`/`MAKE_SET`/`EXPORT_SET` derive from their string arguments
+        // (`args[1:]`).
+        ExprNode::Func(func)
+            if matches!(
+                func.name.to_ascii_lowercase().as_str(),
+                "elt" | "export_set" | "make_set"
+            ) =>
+        {
+            let op = func.name.to_ascii_lowercase();
+            aggregate_collations(
+                &op,
+                func.args
+                    .iter()
+                    .skip(1)
+                    .map(|arg| expr_collation_aggregated(arg, scope)),
+            )
+        }
         ExprNode::Func(func)
             if matches!(
                 func.name.to_ascii_lowercase().as_str(),
@@ -2617,35 +3714,270 @@ fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Res
             ) =>
         {
             let op = func.name.to_ascii_lowercase();
-            aggregate_collations(&op, func.args.iter().map(|arg| expr_collation(arg, info)))
+            aggregate_collations(
+                &op,
+                func.args
+                    .iter()
+                    .map(|arg| expr_collation_aggregated(arg, scope)),
+            )
         }
         ExprNode::Cast(cast)
             if cast.target.to_ascii_uppercase().starts_with("CHAR")
                 || cast.target.to_ascii_uppercase().starts_with("VARCHAR")
                 || cast.target.to_ascii_uppercase().starts_with("TEXT") =>
         {
-            expr_collation(&cast.expr, info)
+            // `CAST(expr AS CHAR)`: TiDB types the result with the connection
+            // charset/collation, not the argument's (`CAST('a' COLLATE
+            // utf8mb4_bin AS CHAR)` reports `utf8mb4_general_ci` under a
+            // general_ci connection). The cast is implicitly coercible.
+            let (session_charset, session_collation) = sealdb_expression::session_collation();
+            Ok(CollationInfo {
+                collation: session_collation,
+                charset: session_charset,
+                // An implicit `CAST` always reports `CoercibilityImplicit`
+                // (`COERCIBILITY(CAST('a' AS CHAR(10)))` = 2).
+                coercibility: COERCIBILITY_IMPLICIT,
+                text: None,
+            })
         }
         ExprNode::Case(case) => aggregate_collations(
             "case",
             case.when_then
                 .iter()
-                .map(|(_, then)| expr_collation(then, info))
-                .chain(case.else_expr.as_deref().map(|e| expr_collation(e, info))),
+                .map(|(_, then)| expr_collation_aggregated(then, scope))
+                .chain(
+                    case.else_expr
+                        .as_deref()
+                        .map(|e| expr_collation_aggregated(e, scope)),
+                ),
         ),
-        _ => Ok(CollationInfo {
-            collation: "binary".to_string(),
-            charset: "binary".to_string(),
-            coercibility: COERCIBILITY_IMPLICIT,
-            text: None,
-        }),
+        _ => {
+            if let ExprNode::Func(func) = expr {
+                let name = func.name.to_ascii_lowercase();
+                if is_system_const_func(&name) {
+                    return Ok(CollationInfo {
+                        // TiDB declares these results as utf8mb4 / utf8mb4_bin.
+                        collation: "utf8mb4_bin".to_string(),
+                        charset: "utf8mb4".to_string(),
+                        coercibility: COERCIBILITY_SYSTEM_CONSTANT,
+                        text: None,
+                    });
+                }
+                if is_numeric_result_func(&name) {
+                    return Ok(CollationInfo {
+                        collation: "binary".to_string(),
+                        charset: "binary".to_string(),
+                        coercibility: COERCIBILITY_NUMERIC,
+                        text: None,
+                    });
+                }
+            }
+            if let ExprNode::Binary(binary) = expr
+                && matches!(
+                    binary.op,
+                    sealdb_parser::opcode::Op::Plus
+                        | sealdb_parser::opcode::Op::Minus
+                        | sealdb_parser::opcode::Op::Mul
+                        | sealdb_parser::opcode::Op::Div
+                        | sealdb_parser::opcode::Op::IntDiv
+                        | sealdb_parser::opcode::Op::Mod
+                        | sealdb_parser::opcode::Op::LeftShift
+                        | sealdb_parser::opcode::Op::RightShift
+                        | sealdb_parser::opcode::Op::BitAnd
+                        | sealdb_parser::opcode::Op::BitOr
+                        | sealdb_parser::opcode::Op::BitXor
+                )
+            {
+                return Ok(CollationInfo {
+                    collation: "binary".to_string(),
+                    charset: "binary".to_string(),
+                    coercibility: COERCIBILITY_NUMERIC,
+                    text: None,
+                });
+            }
+            Ok(CollationInfo {
+                collation: "binary".to_string(),
+                charset: "binary".to_string(),
+                coercibility: COERCIBILITY_IMPLICIT,
+                text: None,
+            })
+        }
     }
 }
 
-/// Column field type → collation metadata (implicit coercibility).
+/// String functions whose result is a system constant (`CoercibilitySystem`).
+fn is_system_const_func(name: &str) -> bool {
+    matches!(
+        name,
+        "version"
+            | "tidb_version"
+            | "user"
+            | "current_user"
+            | "session_user"
+            | "system_user"
+            | "database"
+            | "schema"
+            | "current_role"
+            | "current_role_json"
+    )
+}
+
+/// Functions whose result is a number/temporal (`CoercibilityNumeric`).
+fn is_numeric_result_func(name: &str) -> bool {
+    if matches!(
+        name,
+        "now"
+            | "sysdate"
+            | "current_timestamp"
+            | "current_date"
+            | "curdate"
+            | "current_time"
+            | "curtime"
+            | "localtime"
+            | "localtimestamp"
+            | "utc_timestamp"
+            | "utc_date"
+            | "utc_time"
+            | "unix_timestamp"
+            | "from_unixtime"
+            | "rand"
+            | "random"
+            | "sleep"
+            | "last_insert_id"
+            | "row_count"
+            | "found_rows"
+            | "connection_id"
+            | "length"
+            | "char_length"
+            | "character_length"
+            | "octet_length"
+            | "bit_length"
+            | "instr"
+            | "locate"
+            | "field"
+            | "find_in_set"
+            | "strcmp"
+            | "timestampdiff"
+    ) {
+        return true;
+    }
+    sealdb_expression::lookup(name).is_some_and(|meta| {
+        matches!(
+            meta.category,
+            sealdb_expression::FuncCategory::Math | sealdb_expression::FuncCategory::Time
+        )
+    })
+}
+
+/// A JSON expression behaves as utf8mb4 with `utf8mb4_bin` while aggregating
+/// string-function arguments (TiDB issue #31320).
+fn is_json_expr(expr: &ExprNode, scope: &CollationScope) -> bool {
+    match expr {
+        ExprNode::Column(column) => scope
+            .lookup(column)
+            .is_some_and(|col| col.field_type.tp == sealdb_types::field_type::TYPE_JSON),
+        _ => false,
+    }
+}
+
+/// `expr_collation` as an operand of a string function: JSON arguments take
+/// the utf8mb4 binary collation.
+fn is_comparison_op(op: sealdb_parser::opcode::Op) -> bool {
+    use sealdb_parser::opcode::Op;
+    matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge)
+}
+
+fn collation_literal(name: &str) -> ExprNode {
+    ExprNode::Value(ValueExpr {
+        datum: sealdb_types::Datum::Bytes(name.as_bytes().to_vec()),
+    })
+}
+
+/// Collation a comparison would run with (TiDB `CheckAndDeriveCollationFromExprs`),
+/// or `None` for a purely numeric/binary comparison.
+fn derive_comparison_collation(
+    left: &ExprNode,
+    right: &ExprNode,
+    op: &str,
+    scope: &CollationScope,
+) -> Result<Option<CollationInfo>> {
+    let a = expr_collation(left, scope)?;
+    let b = expr_collation(right, scope)?;
+    // TiDB derives a comparison collation only when the comparison type is a
+    // string (`argTps[0] == ETString`). A numeric/temporal operand makes the
+    // comparison numeric or temporal — `ts_col = '2001-01-01 00:00:00'` parses
+    // the string as a TIMESTAMP in the session time zone — so no collation
+    // decides the result and wrapping the keys would compare their text.
+    if a.coercibility == COERCIBILITY_NUMERIC || b.coercibility == COERCIBILITY_NUMERIC {
+        return Ok(None);
+    }
+    if a.charset == "binary" && b.charset == "binary" {
+        return Ok(None);
+    }
+    let dst = if a.charset == b.charset {
+        comparison_same_charset(&a, &b, op)?
+    } else {
+        aggregate_collation_pair(a.clone(), b.clone(), op)?
+    };
+    if dst.coercibility == COERCIBILITY_NONE {
+        return Err(illegal_mix_of_collations(&a, &b, op));
+    }
+    Ok(Some(dst))
+}
+
+/// Rewrite a string comparison with the collation derived from its operands so
+/// execution does not fall back to `collation_connection`.
+fn wrap_collation_comparison(
+    left: ExprNode,
+    right: ExprNode,
+    op: sealdb_parser::opcode::Op,
+    single_cnf_item: bool,
+    scope: &CollationScope,
+) -> Result<ExprNode> {
+    let text = op.restore();
+    if let Some(info) = derive_comparison_collation(&left, &right, text, scope)?
+        && !info.is_neutral()
+    {
+        return Ok(ExprNode::Func(FuncCallExpr {
+            name: "__STR_CMP".to_string(),
+            args: vec![
+                collation_literal(&info.collation),
+                ExprNode::Value(ValueExpr {
+                    datum: sealdb_types::Datum::Bytes(text.as_bytes().to_vec()),
+                }),
+                left,
+                right,
+            ],
+            distinct: false,
+        }));
+    }
+    Ok(ExprNode::Binary(BinaryOpExpr {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+        single_cnf_item,
+    }))
+}
+
+fn expr_collation_aggregated(expr: &ExprNode, scope: &CollationScope) -> Result<CollationInfo> {
+    let mut collation = expr_collation(expr, scope)?;
+    if is_json_expr(expr, scope) {
+        collation.charset = "utf8mb4".to_string();
+        collation.collation = "utf8mb4_bin".to_string();
+    }
+    Ok(collation)
+}
+
+/// Column field type → collation metadata (TiDB
+/// `deriveCoercibilityForColumn`: `implicit` for string/JSON/bit columns,
+/// `numeric` for the rest). A JSON column's own collation is `binary`; the
+/// aggregation rules coerce JSON arguments to `utf8mb4_bin`
+/// (`expr_collation_aggregated`).
 fn column_collation_info(col: &sealdb_meta::ColumnInfo) -> CollationInfo {
     let ft = &col.field_type;
-    if ft.charset == "binary" || ft.collate == "binary" {
+    // A JSON column reports `binary` on its own (`Collation(d)`), even though
+    // it participates in string-function aggregation as `utf8mb4_bin`.
+    if ft.tp == sealdb_types::field_type::TYPE_JSON {
         return CollationInfo {
             collation: "binary".to_string(),
             charset: "binary".to_string(),
@@ -2653,7 +3985,25 @@ fn column_collation_info(col: &sealdb_meta::ColumnInfo) -> CollationInfo {
             text: None,
         };
     }
+    // A `NULL`-typed derived column (`FROM (SELECT NULL AS a) x`) reports
+    // `binary` collation like a NULL literal.
+    if ft.tp == sealdb_types::field_type::TYPE_NULL {
+        return CollationInfo {
+            collation: "binary".to_string(),
+            charset: "binary".to_string(),
+            coercibility: COERCIBILITY_NUMERIC,
+            text: None,
+        };
+    }
     if ft.eval_type() != sealdb_types::field_type::EvalType::String {
+        return CollationInfo {
+            collation: "binary".to_string(),
+            charset: "binary".to_string(),
+            coercibility: COERCIBILITY_NUMERIC,
+            text: None,
+        };
+    }
+    if ft.charset == "binary" || ft.collate == "binary" {
         return CollationInfo {
             collation: "binary".to_string(),
             charset: "binary".to_string(),
@@ -2703,6 +4053,28 @@ fn charset_of_collation(collation: &str) -> String {
             .filter(|prefix| !prefix.is_empty())
             .unwrap_or("utf8mb4")
             .to_string(),
+    }
+}
+
+/// TiDB `isBinCollation`: collations whose names end in `_bin` for the
+/// aggregation rules (`binary` belongs to charset `bin` and takes another
+/// path).
+fn is_bin_collation(collation: &str) -> bool {
+    matches!(
+        collation.to_ascii_lowercase().as_str(),
+        "utf8_bin" | "utf8mb4_bin" | "ascii_bin" | "latin1_bin" | "gbk_bin" | "utf8mb4_0900_bin"
+    )
+}
+
+/// TiDB `getBinCollation`: the `_bin` collation of a charset.
+fn bin_collation_for_charset(charset: &str) -> String {
+    match charset.to_ascii_lowercase().as_str() {
+        "utf8" => "utf8_bin".to_string(),
+        "utf8mb4" | "utf8mb3" => "utf8mb4_bin".to_string(),
+        "gbk" => "gbk_bin".to_string(),
+        "ascii" => "ascii_bin".to_string(),
+        "latin1" => "latin1_bin".to_string(),
+        other => format!("{other}_bin"),
     }
 }
 
@@ -2774,7 +4146,27 @@ fn aggregate_collation_pair(a: CollationInfo, b: CollationInfo, op: &str) -> Res
     // Equal coercibility: resolve by charset (`ascii` coerces to any other
     // charset, and a Unicode charset wins over a non-Unicode one).
     if a.charset == b.charset {
-        return Ok(a);
+        // Same charset, conflicting collations: a `_bin` collation yields to a
+        // non-`_bin` one, otherwise the aggregation has no collation
+        // (`CoercibilityNone`, `_bin` collation).
+        if a.collation == b.collation {
+            return Ok(a);
+        }
+        if a.coercibility == COERCIBILITY_EXPLICIT {
+            return Err(illegal_mix_of_collations(&a, &b, op));
+        }
+        if is_bin_collation(&a.collation) {
+            return Ok(a);
+        }
+        if is_bin_collation(&b.collation) {
+            return Ok(b);
+        }
+        return Ok(CollationInfo {
+            collation: bin_collation_for_charset(&a.charset),
+            charset: a.charset.clone(),
+            coercibility: COERCIBILITY_NONE,
+            text: None,
+        });
     }
     if a.charset == "ascii" {
         return Ok(b);
@@ -2787,6 +4179,13 @@ fn aggregate_collation_pair(a: CollationInfo, b: CollationInfo, op: &str) -> Res
         return Ok(a);
     }
     if unicode(&b.charset) && !unicode(&a.charset) {
+        return Ok(b);
+    }
+    // utf8mb4 wins over utf8 (`utf8` can convert to `utf8mb4` without loss).
+    if a.charset == "utf8mb4" && b.charset == "utf8" {
+        return Ok(a);
+    }
+    if b.charset == "utf8mb4" && a.charset == "utf8" {
         return Ok(b);
     }
     Err(illegal_mix_of_collations(&a, &b, op))
@@ -3437,40 +4836,82 @@ fn agg_subquery_ctx(
     ))
 }
 
-/// `mysql.user` is backed by the privilege manager rather than stored rows:
-/// the executor substitutes an in-memory row source while EXPLAIN keeps the
-/// regular table-scan shape.
-fn mysql_user_table(from: &TableName, current_db: &str) -> bool {
-    let schema = from
-        .schema
-        .as_deref()
-        .filter(|schema| !schema.is_empty())
-        .unwrap_or(current_db);
-    schema.eq_ignore_ascii_case("mysql") && from.resolve_name().eq_ignore_ascii_case("user")
-}
-
-fn mysql_user_exec(
+/// `mysql.{user,db,global_priv}` are backed by the privilege manager rather
+/// than stored rows: the executor substitutes an in-memory row source while
+/// EXPLAIN keeps the regular table-scan shape (`mysql.user` is an
+/// `IndexLookUp` on `i_user`, a PK equality is a `PointGet`).
+fn mysql_priv_mem_exec(
     from: &TableName,
     current_db: &str,
     stmt: &Statement,
     domain: &Arc<Domain>,
 ) -> Option<Box<dyn Executor>> {
-    if !mysql_user_table(from, current_db) {
+    let schema = from
+        .schema
+        .as_deref()
+        .filter(|schema| !schema.is_empty())
+        .unwrap_or(current_db);
+    if !schema.eq_ignore_ascii_case("mysql") {
+        return None;
+    }
+    let table = from.resolve_name().to_ascii_lowercase();
+    if !matches!(
+        table.as_str(),
+        "user"
+            | "db"
+            | "global_priv"
+            | "tables_priv"
+            | "columns_priv"
+            | "global_grants"
+            | "password_history"
+    ) {
         return None;
     }
     let is = domain.infoschema();
-    let info = is.table_by_name("mysql", "user")?;
+    let info = is.table_by_name("mysql", &table)?;
     let columns: Vec<String> = info
         .columns
         .iter()
         .map(|column| column.name.o().to_string())
         .collect();
-    let rows = mysql_user_rows(domain, &columns);
+    let rows = match table.as_str() {
+        "user" => mysql_user_rows(domain, &columns),
+        "db" => db_priv_rows(domain).1,
+        "global_priv" => global_priv_rows(domain).1,
+        "tables_priv" => tables_priv_rows(domain).1,
+        "columns_priv" => columns_priv_rows(domain).1,
+        "password_history" => password_history_rows(domain),
+        _ => global_grants_rows(domain).1,
+    };
     let mut exec: Box<dyn Executor> = Box::new(MemTableExec::new(columns, rows));
     if let Some(selection) = stmt.as_select().and_then(|select| select.selection.clone()) {
         exec = Box::new(SelectionExec::new(selection, exec));
     }
     Some(exec)
+}
+
+/// `mysql.password_history` rows from the privilege manager.
+fn password_history_rows(domain: &Domain) -> Vec<Vec<sealdb_types::Datum>> {
+    use sealdb_types::{Datum, Time, TimeType};
+    domain
+        .privilege()
+        .password_history_rows()
+        .into_iter()
+        .map(|row| {
+            let mut ts = Time::from_unix_secs(
+                row.timestamp_micros.div_euclid(1_000_000),
+                TimeType::Timestamp,
+            );
+            ts.micro = row.timestamp_micros.rem_euclid(1_000_000) as u32;
+            ts.fsp = 6;
+            vec![
+                Datum::Bytes(row.host.into_bytes()),
+                Datum::Bytes(row.user.into_bytes()),
+                Datum::Time(ts),
+                Datum::Bytes(row.password.into_bytes()),
+            ]
+        })
+        .collect()
 }
 
 fn mysql_user_rows(domain: &Domain, columns: &[String]) -> Vec<Vec<sealdb_types::Datum>> {
@@ -3528,23 +4969,134 @@ fn mysql_user_rows(domain: &Domain, columns: &[String]) -> Vec<Vec<sealdb_types:
                     }
                     "create_role_priv" => yn(row.global_privs.contains(PrivilegeType::CREATE_ROLE)),
                     "drop_role_priv" => yn(row.global_privs.contains(PrivilegeType::DROP_ROLE)),
-                    "ssl_type" | "ssl_cipher" | "x509_issuer" | "x509_subject" => bytes(""),
+                    "ssl_type" => bytes(match row.require.ssl_type() {
+                        1 => "ANY",
+                        2 => "X509",
+                        3 => "SPECIFIED",
+                        _ => "",
+                    }),
+                    "ssl_cipher" => bytes(row.require.cipher.clone().unwrap_or_default()),
+                    "x509_issuer" => bytes(row.require.issuer.clone().unwrap_or_default()),
+                    "x509_subject" => bytes(row.require.subject.clone().unwrap_or_default()),
                     "max_questions"
                     | "max_updates"
                     | "max_connections"
                     | "max_user_connections" => Datum::I64(0),
-                    "password_expired" | "account_locked" => bytes("N"),
+                    "password_expired" => yn(row.password_expired),
+                    "account_locked" => yn(false),
                     "password_last_changed" => bytes("2020-01-01 00:00:00"),
-                    "password_lifetime"
-                    | "password_reuse_history"
-                    | "password_reuse_time"
-                    | "password_require_current" => Datum::Null,
+                    "password_lifetime" => {
+                        row.password_lifetime.map(Datum::I64).unwrap_or(Datum::Null)
+                    }
+                    "password_reuse_history" => row
+                        .password_reuse_history
+                        .map(Datum::I64)
+                        .unwrap_or(Datum::Null),
+                    "password_reuse_time" => row
+                        .password_reuse_time
+                        .map(Datum::I64)
+                        .unwrap_or(Datum::Null),
+                    "password_require_current" => Datum::Null,
                     "user_attributes" => bytes(row.attributes.clone()),
                     _ => Datum::Null,
                 })
                 .collect()
         })
         .collect()
+}
+
+/// `mysql.db` rows from the privilege manager (one row per database grant).
+fn db_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {
+    use sealdb_parser::ast::PrivilegeType;
+    use sealdb_types::Datum;
+    fn yn(value: bool) -> Datum {
+        Datum::Bytes(if value { b"Y".to_vec() } else { b"N".to_vec() })
+    }
+    fn has(privs: PrivilegeType, wanted: PrivilegeType) -> bool {
+        privs.contains(wanted)
+    }
+    let columns: Vec<String> = [
+        "Host",
+        "DB",
+        "User",
+        "Select_priv",
+        "Insert_priv",
+        "Update_priv",
+        "Delete_priv",
+        "Create_priv",
+        "Drop_priv",
+        "Grant_priv",
+        "References_priv",
+        "Index_priv",
+        "Alter_priv",
+        "Create_tmp_table_priv",
+        "Lock_tables_priv",
+        "Create_view_priv",
+        "Show_view_priv",
+        "Create_routine_priv",
+        "Alter_routine_priv",
+        "Execute_priv",
+        "Event_priv",
+        "Trigger_priv",
+    ]
+    .iter()
+    .map(|column| column.to_string())
+    .collect();
+    let rows = domain
+        .privilege()
+        .db_priv_rows()
+        .into_iter()
+        .map(|row| {
+            vec![
+                Datum::Bytes(row.host.into_bytes()),
+                Datum::Bytes(row.db.into_bytes()),
+                Datum::Bytes(row.user.into_bytes()),
+                yn(has(row.privs, PrivilegeType::SELECT)),
+                yn(has(row.privs, PrivilegeType::INSERT)),
+                yn(has(row.privs, PrivilegeType::UPDATE)),
+                yn(has(row.privs, PrivilegeType::DELETE)),
+                yn(has(row.privs, PrivilegeType::CREATE)),
+                yn(has(row.privs, PrivilegeType::DROP)),
+                yn(row.with_grant),
+                yn(has(row.privs, PrivilegeType::REFERENCES)),
+                yn(has(row.privs, PrivilegeType::INDEX)),
+                yn(has(row.privs, PrivilegeType::ALTER)),
+                yn(has(row.privs, PrivilegeType::CREATE_TEMP_TABLES)),
+                yn(has(row.privs, PrivilegeType::LOCK_TABLES)),
+                yn(has(row.privs, PrivilegeType::CREATE_VIEW)),
+                yn(has(row.privs, PrivilegeType::SHOW_VIEW)),
+                yn(has(row.privs, PrivilegeType::CREATE_ROUTINE)),
+                yn(has(row.privs, PrivilegeType::ALTER_ROUTINE)),
+                yn(has(row.privs, PrivilegeType::EXECUTE)),
+                yn(has(row.privs, PrivilegeType::EVENT)),
+                yn(has(row.privs, PrivilegeType::TRIGGER)),
+            ]
+        })
+        .collect();
+    (columns, rows)
+}
+
+/// `mysql.global_priv` rows from the privilege manager: the account's JSON
+/// snapshot (`Priv` column).
+fn global_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {
+    use sealdb_types::Datum;
+    let columns: Vec<String> = ["Host", "User", "Priv"]
+        .iter()
+        .map(|column| column.to_string())
+        .collect();
+    let rows = domain
+        .privilege()
+        .global_priv_rows()
+        .into_iter()
+        .map(|row| {
+            vec![
+                Datum::Bytes(row.host.into_bytes()),
+                Datum::Bytes(row.user.into_bytes()),
+                Datum::Bytes(row.priv_json.into_bytes()),
+            ]
+        })
+        .collect();
+    (columns, rows)
 }
 
 /// `mysql.tables_priv` rows from the privilege manager (TiDB persists one row
@@ -3578,6 +5130,68 @@ fn tables_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datu
                 Datum::Bytes(b"1970-01-01 00:00:00".to_vec()),
                 Datum::Bytes(row.table_priv.into_bytes()),
                 Datum::Bytes(row.column_priv.into_bytes()),
+            ]
+        })
+        .collect();
+    (columns, rows)
+}
+
+/// `mysql.columns_priv` rows from the privilege manager (one row per column
+/// grant, `Column_priv` as the SET name list).
+fn columns_priv_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {
+    use sealdb_types::Datum;
+    let columns: Vec<String> = [
+        "Host",
+        "DB",
+        "User",
+        "Table_name",
+        "Column_name",
+        "Timestamp",
+        "Column_priv",
+    ]
+    .iter()
+    .map(|column| column.to_string())
+    .collect();
+    let rows = domain
+        .privilege()
+        .column_priv_rows()
+        .into_iter()
+        .map(|row| {
+            vec![
+                Datum::Bytes(row.host.into_bytes()),
+                Datum::Bytes(row.db.into_bytes()),
+                Datum::Bytes(row.user.into_bytes()),
+                Datum::Bytes(row.table.into_bytes()),
+                Datum::Bytes(row.column.into_bytes()),
+                Datum::Bytes(b"1970-01-01 00:00:00".to_vec()),
+                Datum::Bytes(row.column_priv.into_bytes()),
+            ]
+        })
+        .collect();
+    (columns, rows)
+}
+
+/// `mysql.global_grants` rows from the privilege manager (dynamic privileges).
+fn global_grants_rows(domain: &Domain) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {
+    use sealdb_types::Datum;
+    let columns: Vec<String> = ["USER", "HOST", "PRIV", "WITH_GRANT_OPTION"]
+        .iter()
+        .map(|column| column.to_string())
+        .collect();
+    let rows = domain
+        .privilege()
+        .global_grant_rows()
+        .into_iter()
+        .map(|row| {
+            vec![
+                Datum::Bytes(row.user.into_bytes()),
+                Datum::Bytes(row.host.into_bytes()),
+                Datum::Bytes(row.privilege.into_bytes()),
+                Datum::Bytes(if row.with_grant {
+                    b"Y".to_vec()
+                } else {
+                    b"N".to_vec()
+                }),
             ]
         })
         .collect();

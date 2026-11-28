@@ -28,6 +28,6 @@ pub mod unionexec;
 pub mod update;
 pub mod window;
 
-pub use builder::ExecutorBuilder;
+pub use builder::{ExecutorBuilder, derive_expr_collation, validate_statement_collations};
 pub use ddl::DDLExec;
 pub use internal::QueryResult;

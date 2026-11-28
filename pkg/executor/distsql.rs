@@ -12,7 +12,8 @@ use sealdb_meta::{IndexInfo, TableInfo};
 use sealdb_parser::ast::{ExprNode, TableName};
 use sealdb_tablecodec::{
     decode_handle_from_index_key, decode_handle_from_row_key, decode_index_key_values, decode_row,
-    encode_index_seek_key, encode_index_seek_prefix, encode_row_key_with_handle, next_prefix,
+    encode_index_seek_key, encode_index_seek_prefix_collated, encode_row_key_with_handle,
+    next_prefix,
 };
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -149,11 +150,18 @@ impl Executor for IndexLookUpExecutor {
         // the table rows to evaluate the expression (the EXPLAIN shape remains
         // a covering `IndexReader`).
         let expression_index = sealdb_planner::core::expr_index::has_expression_part(&info, &index);
+        // A collation-keyed string index stores sort-key bytes, which cannot be
+        // turned back into the original text (`'a '` and `'a'` share one key
+        // under a PAD SPACE collation). TiDB keeps a copy of the original values
+        // in the index value ("restored data") and still reads the index alone;
+        // SealDB does not store that copy yet, so the rows are fetched from the
+        // table. The index-only plan shape is kept.
+        let lossy_index_key = info.index_has_collation_key(&index);
         // `IndexReader` (index-only plan) keeps the index key order even when
         // an expression part forces a table fetch to evaluate the expression;
         // `IndexLookUp` batches its probe and answers in handle order.
         let index_only = self.covering;
-        if expression_index {
+        if expression_index || lossy_index_key {
             self.covering = false;
         }
         self.schema = info
@@ -237,7 +245,12 @@ impl Executor for IndexLookUpExecutor {
                 'scan: for physical_id in physical {
                     let mut part_fetched = 0u64;
                     for access in &self.access {
-                        let (start, end) = scan_bounds(physical_id, index.id, access);
+                        let (start, end) = scan_bounds(
+                            physical_id,
+                            index.id,
+                            access,
+                            &info.index_collations(&index),
+                        );
                         if start.as_bytes() >= end.as_slice() {
                             continue;
                         }
@@ -535,6 +548,7 @@ impl Executor for IndexMergeExecutor {
                 for (index, access) in &arms {
                     collect_bounds(
                         txn,
+                        &info,
                         (*index).clone(),
                         std::slice::from_ref(access),
                         &physical,
@@ -593,6 +607,7 @@ impl Executor for IndexMergeExecutor {
                     let mut arm_seen = HashSet::new();
                     collect_bounds(
                         txn,
+                        &info,
                         index.clone(),
                         &bounds,
                         &physical,
@@ -773,10 +788,15 @@ fn merge_access_arms(
     Ok(arms)
 }
 
-fn scan_bounds(physical_id: i64, index_id: i64, access: &IndexAccess) -> (Key, Vec<u8>) {
+fn scan_bounds(
+    physical_id: i64,
+    index_id: i64,
+    access: &IndexAccess,
+    modes: &[Option<sealdb_util::collate::CollateMode>],
+) -> (Key, Vec<u8>) {
     match access {
         IndexAccess::Equal(values) => {
-            let start = encode_index_seek_prefix(physical_id, index_id, values);
+            let start = encode_index_seek_prefix_collated(physical_id, index_id, values, modes);
             let end = next_prefix(start.as_bytes());
             (start, end)
         }
@@ -789,7 +809,7 @@ fn scan_bounds(physical_id: i64, index_id: i64, access: &IndexAccess) -> (Key, V
             let start = if low.is_empty() {
                 encode_index_seek_key(physical_id, index_id, &[])
             } else {
-                let prefix = encode_index_seek_prefix(physical_id, index_id, low);
+                let prefix = encode_index_seek_prefix_collated(physical_id, index_id, low, modes);
                 if *low_inclusive {
                     prefix
                 } else {
@@ -799,7 +819,7 @@ fn scan_bounds(physical_id: i64, index_id: i64, access: &IndexAccess) -> (Key, V
             let end = if high.is_empty() {
                 next_prefix(encode_index_seek_key(physical_id, index_id, &[]).as_bytes())
             } else {
-                let prefix = encode_index_seek_prefix(physical_id, index_id, high);
+                let prefix = encode_index_seek_prefix_collated(physical_id, index_id, high, modes);
                 if *high_inclusive {
                     next_prefix(prefix.as_bytes())
                 } else {
@@ -815,6 +835,7 @@ fn scan_bounds(physical_id: i64, index_id: i64, access: &IndexAccess) -> (Key, V
 #[allow(clippy::too_many_arguments)]
 fn collect_bounds(
     txn: &mut dyn sealdb_kv::Transaction,
+    info: &TableInfo,
     index: IndexInfo,
     bounds: &[IndexAccess],
     physical: &[i64],
@@ -823,9 +844,10 @@ fn collect_bounds(
     seen: &mut HashSet<(i64, i64)>,
     handles: &mut Vec<(i64, i64)>,
 ) -> Result<()> {
+    let modes = info.index_collations(&index);
     for access in bounds {
         for physical_id in physical {
-            let (start, end) = scan_bounds(*physical_id, index.id, access);
+            let (start, end) = scan_bounds(*physical_id, index.id, access, &modes);
             if start.as_bytes() >= end.as_slice() {
                 continue;
             }

@@ -167,6 +167,13 @@ impl Executor for DeleteExec {
         self.txn.with_txn(|txn| {
             for scanned in matched {
                 apply_row_delete(txn, &info, &scanned)?;
+                crate::update::apply_delete_cascades(
+                    txn,
+                    &self.domain,
+                    &self.current_db,
+                    &info,
+                    &scanned.values,
+                )?;
                 affected += 1;
             }
             Ok(())
@@ -538,15 +545,16 @@ impl DeleteExec {
                             })
                         });
                         if referenced {
-                            let columns = fk.cols.join("`, `");
-                            let refs = ref_cols.join("`, `");
                             conflicts.push((
                                 (row.physical_id, row.handle),
                                 format!(
-                                    "Cannot delete or update a parent row: a foreign key constraint fails (`{db}`.`{}`, CONSTRAINT `{}` FOREIGN KEY (`{columns}`) REFERENCES `{}` (`{refs}`))",
-                                    child.name.o(),
-                                    fk.name,
-                                    parent.name.o()
+                                    "Cannot delete or update a parent row: a foreign key constraint fails {}",
+                                    crate::update::fk_failure_body(
+                                        &db,
+                                        &child,
+                                        fk,
+                                        parent.name.o()
+                                    )
                                 ),
                             ));
                             break;

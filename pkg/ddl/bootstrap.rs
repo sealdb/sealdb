@@ -74,6 +74,16 @@ const SYSTEM_TABLES: &[&str] = &[
         PRIMARY KEY (Host, User),\n\
         KEY i_user (User)\n\
     )",
+    // TiDB `mysql.password_history`: one row per retained account password.
+    // SealDB materializes the rows from the privilege manager (virtual).
+    "CREATE TABLE password_history (\n\
+        Host CHAR(255) NOT NULL DEFAULT '',\n\
+        User CHAR(32) NOT NULL DEFAULT '',\n\
+        Password_timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\
+        Password TEXT,\n\
+        PRIMARY KEY (Host, User, Password_timestamp),\n\
+        KEY i_user (User)\n\
+    )",
     // TiDB `mysql.global_priv`: the JSON grant snapshot for each account.
     "CREATE TABLE global_priv (\n\
         Host CHAR(255) NOT NULL DEFAULT '',\n\

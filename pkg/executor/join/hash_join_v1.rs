@@ -1197,12 +1197,19 @@ fn concat_row(left: &[Datum], right: &[Datum]) -> Vec<Datum> {
 /// `DATETIME`, and bytes that parse as a timestamp literal share that form.
 fn key_text(value: &Datum) -> String {
     match value {
+        // A TIME column compares with a `'HH:MM:SS'` string as a time of day.
+        Datum::Time(t) if matches!(t.tp, sealdb_types::time::TimeType::Time) => {
+            time_of_day_key_text(*t)
+        }
         Datum::Time(t) => time_key_text(*t),
         Datum::Bytes(b) => {
-            if let Ok(s) = std::str::from_utf8(b)
-                && let Ok(t) = sealdb_types::time::parse_timestamp_literal(s)
-            {
-                return time_key_text(t);
+            if let Ok(s) = std::str::from_utf8(b) {
+                if let Ok(t) = sealdb_types::time::parse_timestamp_literal(s) {
+                    return time_key_text(t);
+                }
+                if let Ok(t) = sealdb_types::time::parse_time_literal(s) {
+                    return time_of_day_key_text(t);
+                }
             }
             format!("{value:?}")
         }
@@ -1285,6 +1292,14 @@ fn matched_ids(
         }
     }
     Ok(out)
+}
+
+/// Canonical time-of-day key (a TIME value, or a `'HH:MM:SS'` literal).
+fn time_of_day_key_text(t: sealdb_types::time::Time) -> String {
+    format!(
+        "tod:{:02}:{:02}:{:02}.{:06}",
+        t.hour, t.minute, t.second, t.micro
+    )
 }
 
 fn time_key_text(mut t: sealdb_types::time::Time) -> String {

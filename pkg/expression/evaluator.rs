@@ -14,7 +14,7 @@ use sealdb_types::Datum;
 use sealdb_types::MyDecimal;
 use sealdb_types::field_type::FieldType;
 use sealdb_types::time::{Time, TimeType, parse_timestamp_literal};
-use sealdb_util::collate::{CollateMode, compare_bytes};
+use sealdb_util::collate::{CollateMode, compare_bytes, key_bytes, key_bytes_no_trim};
 use std::cell::{Cell, RefCell};
 // `TzOffset::fix()` comes from the `Offset` trait (chrono-tz offsets).
 use chrono::Offset as _;
@@ -31,6 +31,10 @@ thread_local! {
     static BINARY_COLUMN_NAMES: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
     static COLLATION_MODE: RefCell<CollateMode> = const { RefCell::new(CollateMode::Bin) };
+    /// Session `character_set_connection` / `collation_connection`: string
+    /// literals take this collation (TiDB `ctx.GetCharsetInfo()`).
+    static SESSION_COLLATION: RefCell<(String, String)> =
+        const { RefCell::new((String::new(), String::new())) };
     static SQL_MODE: RefCell<String> = const { RefCell::new(String::new()) };
     static TIME_ZONE: RefCell<String> = const { RefCell::new(String::new()) };
     /// Session `@@block_encryption_mode` (`aes-128-ecb` when unset).
@@ -53,6 +57,12 @@ thread_local! {
     static ALLOW_AUTO_INCREMENT_IN_GENERATED: Cell<bool> = const { Cell::new(false) };
     /// Session `@@tidb_enable_strict_not_null_check` (default ON).
     static STRICT_NOT_NULL_CHECK: Cell<bool> = const { Cell::new(true) };
+    /// Charset validity knobs: `(skip_utf8_check, skip_ascii_check,
+    /// check_mb4_value_in_utf8)`. TiDB `@@tidb_skip_utf8_check` /
+    /// `@@tidb_skip_ascii_check` (default OFF) skip the 1366 validation, and
+    /// `@@GLOBAL.tidb_check_mb4_value_in_utf8` (default ON) makes a `utf8`
+    /// (3-byte) column reject 4-byte characters.
+    static CHARSET_CHECKS: Cell<(bool, bool, bool)> = const { Cell::new((false, false, true)) };
     /// Session `@@tidb_enable_strict_double_type_check` (default ON).
     static STRICT_DOUBLE_TYPE_CHECK: Cell<bool> = const { Cell::new(true) };
     /// Session `@@default_week_format` (default 0).
@@ -205,6 +215,31 @@ pub fn note_message(code: i32, message: impl Into<String>) {
     push_warning(NOTE_WARNING_BASE + code, message);
 }
 
+/// Publish the session's connection charset/collation for string literal
+/// collation derivation.
+pub fn set_session_collation(charset: &str, collation: &str) {
+    SESSION_COLLATION.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        slot.0.clear();
+        slot.0.push_str(charset);
+        slot.1.clear();
+        slot.1.push_str(collation);
+    });
+}
+
+/// Session connection charset/collation, defaulting to `utf8mb4` /
+/// `utf8mb4_bin`.
+pub fn session_collation() -> (String, String) {
+    SESSION_COLLATION.with(|cell| {
+        let slot = cell.borrow();
+        if slot.0.is_empty() {
+            ("utf8mb4".to_string(), "utf8mb4_bin".to_string())
+        } else {
+            (slot.0.clone(), slot.1.clone())
+        }
+    })
+}
+
 pub fn with_collation<T>(mode: CollateMode, f: impl FnOnce() -> T) -> T {
     COLLATION_MODE.with(|cell| {
         let prev = *cell.borrow();
@@ -232,6 +267,12 @@ pub fn sql_mode_flag(flag: &str) -> bool {
             .split(',')
             .any(|m| m.trim().eq_ignore_ascii_case(flag))
     })
+}
+
+/// `STRICT_TRANS_TABLES` / `STRICT_ALL_TABLES`: invalid conversions become NULL
+/// (with a warning) instead of keeping the raw bytes.
+fn strict_sql_mode() -> bool {
+    sql_mode_flag("STRICT_TRANS_TABLES") || sql_mode_flag("STRICT_ALL_TABLES")
 }
 
 /// Current session `block_encryption_mode` (default `aes-128-ecb`).
@@ -289,6 +330,11 @@ thread_local! {
 thread_local! {
     /// `RAND([seed])` generator state: `(last seed, LCG state)`.
     static RAND_STATE: Cell<(i64, u64)> = const { Cell::new((0, 0)) };
+    /// Set when the expression just evaluated produced a *binary* string
+    /// (`UNHEX(...)`). `INSERT` reads it to pick TiDB's truncating charset
+    /// conversion for binary sources instead of the `?` substitution used for
+    /// character sources.
+    static BINARY_VALUE: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn with_strict_dml<T>(strict: bool, f: impl FnOnce() -> T) -> T {
@@ -303,6 +349,47 @@ pub fn with_strict_dml<T>(strict: bool, f: impl FnOnce() -> T) -> T {
 
 pub fn strict_dml() -> bool {
     STRICT_DML.with(Cell::get)
+}
+
+/// Run `f` under the session charset-check knobs (`tidb_skip_utf8_check`,
+/// `tidb_skip_ascii_check`, `@@GLOBAL.tidb_check_mb4_value_in_utf8`).
+pub fn with_charset_checks<T>(
+    skip_utf8: bool,
+    skip_ascii: bool,
+    check_mb4: bool,
+    f: impl FnOnce() -> T,
+) -> T {
+    CHARSET_CHECKS.with(|cell| {
+        let prev = cell.get();
+        cell.set((skip_utf8, skip_ascii, check_mb4));
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
+pub fn skip_utf8_check() -> bool {
+    CHARSET_CHECKS.with(|cell| cell.get().0)
+}
+
+/// Mark the value being produced as a binary string (`UNHEX`).
+pub fn note_binary_value() {
+    BINARY_VALUE.with(|cell| cell.set(true));
+}
+
+/// Take (and clear) the binary-string marker.
+pub fn take_binary_value() -> bool {
+    BINARY_VALUE.with(|cell| cell.replace(false))
+}
+
+pub fn skip_ascii_check() -> bool {
+    CHARSET_CHECKS.with(|cell| cell.get().1)
+}
+
+/// `@@GLOBAL.tidb_check_mb4_value_in_utf8`: `utf8` (utf8mb3) columns reject
+/// characters that need four bytes (default ON).
+pub fn check_mb4_value() -> bool {
+    CHARSET_CHECKS.with(|cell| cell.get().2)
 }
 
 /// Run `f` under the session `time_zone` (TiDB TIMESTAMP/DST).
@@ -411,12 +498,23 @@ pub fn collation_ci() -> bool {
     collation_mode().is_ci()
 }
 
+fn string_like_bytes(datum: &Datum) -> Option<&[u8]> {
+    match datum {
+        Datum::Bytes(bytes) => Some(bytes),
+        // A hex/bit literal is a binary string constant, so a comparison with
+        // a string column compares under the column's collation
+        // (`col1 <= 0xc3b3` on `utf8mb4_general_ci` uses the weight order).
+        Datum::Bit(bytes) => Some(bytes),
+        // ENUM/SET compare against a string by member label.
+        Datum::Enum(value) => Some(&value.label),
+        _ => None,
+    }
+}
+
 fn compare_datums(left: &Datum, right: &Datum) -> Result<std::cmp::Ordering> {
-    if matches!((left, right), (Datum::Bytes(_), Datum::Bytes(_))) {
-        let lb = left.as_bytes();
-        let rb = right.as_bytes();
-        let l_ok = std::str::from_utf8(&lb).is_ok();
-        let r_ok = std::str::from_utf8(&rb).is_ok();
+    if let (Some(lb), Some(rb)) = (string_like_bytes(left), string_like_bytes(right)) {
+        let l_ok = std::str::from_utf8(lb).is_ok();
+        let r_ok = std::str::from_utf8(rb).is_ok();
         // TiDB: comparing a utf8 string column with a binary literal that is
         // not valid utf8mb4 fails (select.test `a > 0x80`). Pure binary vs
         // binary stays byte-ordered.
@@ -555,6 +653,22 @@ fn compare_datums_for_op(left: &Datum, right: &Datum, op: Op) -> Result<std::cmp
 }
 
 /// Format invalid bytes like TiDB `formatInvalidChars` (`\x80`).
+/// Longest prefix of `bytes` that is valid UTF-8 (TiDB truncates a binary →
+/// char cast at the first invalid byte outside strict mode).
+fn utf8_valid_prefix(bytes: &[u8]) -> &[u8] {
+    if std::str::from_utf8(bytes).is_ok() {
+        return bytes;
+    }
+    let mut end = bytes.len().saturating_sub(1);
+    while end > 0 {
+        if std::str::from_utf8(&bytes[..end]).is_ok() {
+            return &bytes[..end];
+        }
+        end -= 1;
+    }
+    &bytes[..0]
+}
+
 fn format_invalid_chars(src: &[u8]) -> String {
     let mut out = String::new();
     for (i, b) in src.iter().enumerate() {
@@ -1384,6 +1498,9 @@ thread_local! {
     static SESSION_TIMESTAMP: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
     /// Value returned by `LAST_INSERT_ID()` for the session.
     static LAST_INSERT_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// Value returned by `ROW_COUNT()`: rows changed by the previous statement
+    /// (TiDB reports `-1` after a result-set statement such as `SELECT`).
+    static LAST_ROW_COUNT: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     /// Session user variables (`@v`), installed per statement so eval-time
     /// reads and `@v := expr` assignments share one store. `None` outside a
     /// statement (a bare `SELECT @v` goes through plan-time substitution).
@@ -1442,6 +1559,16 @@ pub fn current_last_insert_id() -> i64 {
     last_insert_id()
 }
 
+/// Record the row count `ROW_COUNT()` reports for the statement that just ran.
+pub fn set_row_count(value: i64) {
+    LAST_ROW_COUNT.with(|cell| cell.set(value));
+}
+
+/// `ROW_COUNT()`: rows changed by the previous statement.
+pub fn row_count() -> i64 {
+    LAST_ROW_COUNT.with(std::cell::Cell::get)
+}
+
 /// Freeze (or with `None`, unfreeze) the session clock at `secs` epoch seconds.
 pub fn set_session_timestamp(secs: Option<i64>) {
     SESSION_TIMESTAMP.with(|cell| cell.set(secs));
@@ -1477,6 +1604,53 @@ fn now_fsp(args: &[ExprNode]) -> i8 {
     }
 }
 
+/// Arguments of a function that may carry a leading hidden collation marker
+/// (`__FIELD_COLL(coll, …)`): returns the derived collation plus the visible
+/// arguments.
+fn collation_marker_args(func: &FuncCallExpr) -> (CollateMode, &[ExprNode]) {
+    if func.name.starts_with("__")
+        && let Some(ExprNode::Value(value)) = func.args.first()
+        && let Datum::Bytes(name) = &value.datum
+    {
+        return (
+            CollateMode::from_name(&String::from_utf8_lossy(name)),
+            &func.args[1..],
+        );
+    }
+    (collation_mode(), &func.args)
+}
+
+fn marker_collation(arg: &ExprNode) -> CollateMode {
+    match arg {
+        ExprNode::Value(value) => match &value.datum {
+            Datum::Bytes(name) => CollateMode::from_name(&String::from_utf8_lossy(name)),
+            _ => collation_mode(),
+        },
+        _ => collation_mode(),
+    }
+}
+
+/// Compare two datums under an explicit collation (string pairs use the
+/// collation weights; everything else keeps SQL numeric/temporal comparison).
+fn compare_under(mode: CollateMode, left: &Datum, right: &Datum) -> Result<std::cmp::Ordering> {
+    if let (Some(lb), Some(rb)) = (string_operand_bytes(left), string_operand_bytes(right)) {
+        return Ok(compare_bytes(mode, lb, rb));
+    }
+    Ok(left.compare(right))
+}
+
+/// Bytes of a string operand for an explicitly collated comparison: a binary
+/// literal is its string value, so `col1 >= 0xc484` compares `Ą` under the
+/// column's collation (general_ci maps the two to the same weight).
+fn string_operand_bytes(datum: &Datum) -> Option<&[u8]> {
+    match datum {
+        Datum::Bytes(bytes) => Some(bytes),
+        Datum::Bit(bytes) => Some(bytes),
+        Datum::Enum(value) => Some(&value.label),
+        _ => None,
+    }
+}
+
 fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     match func.name.to_ascii_uppercase().as_str() {
         // `expr COLLATE name` / `CONVERT(expr USING charset)`: metadata-only
@@ -1489,6 +1663,29 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 )
             })?;
             eval_expr_with_row(arg, schema, row)
+        }
+        // Hidden collation-aware key wrapper used by hash joins: string
+        // operands become their collation sort key so raw byte equality in the
+        // hash table matches SQL equality under the derived collation.
+        "__COLL_KEY" => {
+            let arg = func.args.first().ok_or_else(|| {
+                Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "__COLL_KEY requires an expression",
+                )
+            })?;
+            let mode = func
+                .args
+                .get(1)
+                .map(marker_collation)
+                .unwrap_or_else(collation_mode);
+            let value = eval_expr_with_row(arg, schema, row)?;
+            match &value {
+                Datum::Bytes(bytes) => Ok(Datum::Bytes(
+                    key_bytes(mode, bytes).unwrap_or_else(|| bytes.clone()),
+                )),
+                _ => Ok(value),
+            }
         }
         // `VALUES(col)` only has meaning inside `ON DUPLICATE KEY UPDATE`,
         // where the insert path rewrites it; elsewhere (a plain `SELECT`) it is
@@ -1520,6 +1717,17 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             let value = eval_expr_with_row(&func.args[1], schema, row)?;
             Ok(user_var_assign(&name, value))
         }
+        // User-variable value carrying the collation it was assigned with
+        // (`SET @v = 'a' COLLATE utf8mb4_bin`): metadata only, result is arg 0.
+        "__SEALDB_VARCOLL" => {
+            if func.args.len() != 3 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "__SEALDB_VARCOLL requires 3 arguments",
+                ));
+            }
+            eval_expr_with_row(&func.args[0], schema, row)
+        }
         "VALUES" => Ok(Datum::Null),
         // `CURRENT_USER()` / `USER()` / `SESSION_USER()`: the authenticated
         // identity as `user@host`.
@@ -1539,6 +1747,16 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             })
         }
         "UUID" => Ok(Datum::Bytes(new_uuid().into_bytes())),
+        // `ROW_COUNT()`: rows changed by the previous statement.
+        "ROW_COUNT" => {
+            if !func.args.is_empty() {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "ROW_COUNT() takes no arguments",
+                ));
+            }
+            Ok(Datum::I64(row_count()))
+        }
         // `LAST_INSERT_ID()` reads the session value; the one-argument form
         // sets it and returns the argument (MySQL semantics).
         "LAST_INSERT_ID" => {
@@ -1707,6 +1925,29 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             let v = eval_expr_with_row(&func.args[0], schema, row)?;
             Ok(bool_datum(v.is_null()))
         }
+        // TiDB folds `GREATEST`/`LEAST` with the collation derived from their
+        // arguments (`__greatest_coll(col, args…)`), which may differ from the
+        // session collation (`greatest(utf8_bin_col, utf8mb4_bin_col)`).
+        "__GREATEST_COLL" | "__LEAST_COLL" => {
+            let collation = match func.args.first() {
+                Some(ExprNode::Value(v)) => match &v.datum {
+                    Datum::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            let want_greatest = func.name.eq_ignore_ascii_case("__GREATEST_COLL");
+            let args = &func.args[1..];
+            if args.len() < 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("{} requires at least 2 arguments", func.name),
+                ));
+            }
+            with_collation(CollateMode::from_name(&collation), || {
+                eval_greatest_least(args, want_greatest, schema, row)
+            })
+        }
         "GREATEST" | "LEAST" => {
             if func.args.len() < 2 {
                 return Err(Error::new(
@@ -1715,42 +1956,7 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 ));
             }
             let want_greatest = func.name.eq_ignore_ascii_case("GREATEST");
-            let mut best: Option<Datum> = None;
-            // TiDB's duration result type keeps the widest fractional
-            // precision of its arguments (`greatest(time(5), cast(… as time))`
-            // prints five digits even when the chosen value is exact).
-            let mut time_fsp = 0i8;
-            for arg in &func.args {
-                let v = eval_expr_with_row(arg, schema, row)?;
-                if v.is_null() {
-                    return Ok(Datum::Null);
-                }
-                if let Datum::Time(t) = &v
-                    && t.tp == sealdb_types::time::TimeType::Time
-                {
-                    time_fsp = time_fsp.max(t.fsp.max(0));
-                }
-                best = Some(match best {
-                    None => v,
-                    Some(cur) => {
-                        let ord = compare_datums(&cur, &v)?;
-                        if want_greatest {
-                            if ord.is_lt() { v } else { cur }
-                        } else if ord.is_gt() {
-                            v
-                        } else {
-                            cur
-                        }
-                    }
-                });
-            }
-            match best {
-                Some(Datum::Time(mut t)) if t.tp == sealdb_types::time::TimeType::Time => {
-                    t.fsp = t.fsp.max(time_fsp);
-                    Ok(Datum::Time(t))
-                }
-                other => Ok(other.unwrap_or(Datum::Null)),
-            }
+            eval_greatest_least(&func.args, want_greatest, schema, row)
         }
         // TiDB `tidb_shard(x)` (shard index helper): the DES/null-key hash of
         // the argument modulo 256 buckets. Used by
@@ -1839,6 +2045,385 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             eval_expr_with_row(&func.args[index as usize], schema, row)
         }
+        // Hidden comparison markers rewritten by the planner with the
+        // collation derived from the operands (TiDB `deriveCollation`): a
+        // column collation or explicit `COLLATE` decides the comparison even
+        // when it differs from `collation_connection`.
+        "__STR_CMP" => {
+            if func.args.len() != 4 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "__STR_CMP requires 4 arguments",
+                ));
+            }
+            let mode = marker_collation(&func.args[0]);
+            let op = match eval_expr_with_row(&func.args[1], schema, row)? {
+                Datum::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                _ => String::new(),
+            };
+            let left = eval_expr_with_row(&func.args[2], schema, row)?;
+            let right = eval_expr_with_row(&func.args[3], schema, row)?;
+            if left.is_null() || right.is_null() {
+                return Ok(Datum::Null);
+            }
+            let ord = compare_under(mode, &left, &right)?;
+            use std::cmp::Ordering;
+            let matched = match op.as_str() {
+                "=" => ord == Ordering::Equal,
+                "!=" | "<>" => ord != Ordering::Equal,
+                "<" => ord == Ordering::Less,
+                "<=" => ord != Ordering::Greater,
+                ">" => ord == Ordering::Greater,
+                ">=" => ord != Ordering::Less,
+                _ => ord == Ordering::Equal,
+            };
+            Ok(bool_datum(matched))
+        }
+        "__STR_BETWEEN" => {
+            if func.args.len() != 4 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "__STR_BETWEEN requires 4 arguments",
+                ));
+            }
+            let mode = marker_collation(&func.args[0]);
+            let value = eval_expr_with_row(&func.args[1], schema, row)?;
+            let low = eval_expr_with_row(&func.args[2], schema, row)?;
+            let high = eval_expr_with_row(&func.args[3], schema, row)?;
+            if value.is_null() || low.is_null() || high.is_null() {
+                return Ok(Datum::Null);
+            }
+            use std::cmp::Ordering;
+            let above = compare_under(mode, &value, &low)? != Ordering::Less;
+            let below = compare_under(mode, &value, &high)? != Ordering::Greater;
+            Ok(bool_datum(above && below))
+        }
+        "__STR_LIKE" => {
+            if func.args.len() != 4 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "__STR_LIKE requires 4 arguments",
+                ));
+            }
+            let mode = marker_collation(&func.args[0]);
+            let value = eval_expr_with_row(&func.args[1], schema, row)?;
+            let pattern = eval_expr_with_row(&func.args[2], schema, row)?;
+            let not = matches!(
+                eval_expr_with_row(&func.args[3], schema, row)?,
+                Datum::I64(1) | Datum::U64(1)
+            );
+            if value.is_null() || pattern.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text: Vec<char> = String::from_utf8_lossy(&value.as_bytes()).chars().collect();
+            let pat: Vec<char> = String::from_utf8_lossy(&pattern.as_bytes())
+                .chars()
+                .collect();
+            let matched = like_at_chars(&text, 0, &pat, 0, mode);
+            Ok(bool_datum(if not { !matched } else { matched }))
+        }
+        // `FIELD(str, str1, str2, …)`: 1-based index of the first argument
+        // equal to `str`, or 0. `__FIELD_COLL(coll, …)` carries the collation
+        // derived from the compared arguments (a column collation or an
+        // explicit `COLLATE` wins over the session collation).
+        "__FIELD_COLL" | "FIELD" => {
+            let (mode, args) = collation_marker_args(func);
+            if args.is_empty() {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "FIELD requires at least 1 argument",
+                ));
+            }
+            let first = eval_expr_with_row(&args[0], schema, row)?;
+            if first.is_null() {
+                return Ok(Datum::I64(0));
+            }
+            // TiDB splits FIELD into int/real/string signatures: pick the
+            // integer compare only when every operand is an integer.
+            let all_int = matches!(first, Datum::I64(_) | Datum::U64(_) | Datum::Year(_))
+                && args[1..].iter().all(|arg| {
+                    matches!(
+                        arg,
+                        ExprNode::Value(ValueExpr {
+                            datum: Datum::I64(_) | Datum::U64(_) | Datum::Year(_),
+                        })
+                    )
+                });
+            for (i, arg) in args.iter().enumerate().skip(1) {
+                let value = eval_expr_with_row(arg, schema, row)?;
+                if value.is_null() {
+                    continue;
+                }
+                let equal = if all_int {
+                    first.as_i64()? == value.as_i64()?
+                } else if matches!(first, Datum::Bytes(_)) && matches!(value, Datum::Bytes(_)) {
+                    compare_bytes(mode, &first.as_bytes(), &value.as_bytes())
+                        == std::cmp::Ordering::Equal
+                } else {
+                    first.as_f64()? == value.as_f64()?
+                };
+                if equal {
+                    return Ok(Datum::I64(i as i64));
+                }
+            }
+            Ok(Datum::I64(0))
+        }
+        // `FIND_IN_SET(str, strlist)`: 1-based position in the comma-separated
+        // list, comparing under the derived collation.
+        "__FIND_IN_SET_COLL" | "FIND_IN_SET" => {
+            let (mode, args) = collation_marker_args(func);
+            if args.len() != 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "FIND_IN_SET requires 2 arguments",
+                ));
+            }
+            let needle = eval_expr_with_row(&args[0], schema, row)?;
+            if needle.is_null() {
+                return Ok(Datum::Null);
+            }
+            let haystack = eval_expr_with_row(&args[1], schema, row)?;
+            if haystack.is_null() {
+                return Ok(Datum::Null);
+            }
+            let haystack = String::from_utf8_lossy(&haystack.as_bytes()).into_owned();
+            if haystack.is_empty() {
+                return Ok(Datum::I64(0));
+            }
+            for (i, part) in haystack.split(',').enumerate() {
+                if compare_bytes(mode, &needle.as_bytes(), part.as_bytes())
+                    == std::cmp::Ordering::Equal
+                {
+                    return Ok(Datum::I64((i + 1) as i64));
+                }
+            }
+            Ok(Datum::I64(0))
+        }
+        // `SUBSTRING_INDEX(str, delim, count)`.
+        "SUBSTRING_INDEX" => {
+            if func.args.len() != 3 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "SUBSTRING_INDEX requires 3 arguments",
+                ));
+            }
+            let text = eval_expr_with_row(&func.args[0], schema, row)?;
+            if text.is_null() {
+                return Ok(Datum::Null);
+            }
+            let delim = eval_expr_with_row(&func.args[1], schema, row)?;
+            if delim.is_null() {
+                return Ok(Datum::Null);
+            }
+            let count = eval_expr_with_row(&func.args[2], schema, row)?;
+            if count.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text = String::from_utf8_lossy(&text.as_bytes()).into_owned();
+            let delim = String::from_utf8_lossy(&delim.as_bytes()).into_owned();
+            let count = count.as_i64()?;
+            if delim.is_empty() || count == 0 {
+                return Ok(Datum::Bytes(Vec::new()));
+            }
+            let matches: Vec<usize> = text.match_indices(&delim).map(|(i, _)| i).collect();
+            let out = if count > 0 {
+                let n = count as usize;
+                match matches.get(n - 1) {
+                    Some(&idx) => text[..idx].to_string(),
+                    None => text,
+                }
+            } else {
+                let n = count.unsigned_abs() as usize;
+                match matches.len().checked_sub(n) {
+                    Some(pos) => text[matches[pos] + delim.len()..].to_string(),
+                    None => text,
+                }
+            };
+            Ok(Datum::Bytes(out.into_bytes()))
+        }
+        // `MAKE_SET(bits, str1, str2, …)`: comma-joined strings whose bit is
+        // set; NULL strings are skipped.
+        "MAKE_SET" => {
+            if func.args.is_empty() {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "MAKE_SET requires at least 1 argument",
+                ));
+            }
+            let bits = eval_expr_with_row(&func.args[0], schema, row)?;
+            if bits.is_null() {
+                return Ok(Datum::Null);
+            }
+            let bits = bits.as_i64()? as u64;
+            let mut sets: Vec<Vec<u8>> = Vec::new();
+            for i in 1..func.args.len() {
+                if bits & (1u64 << (i - 1)) == 0 {
+                    continue;
+                }
+                let value = eval_expr_with_row(&func.args[i], schema, row)?;
+                if !value.is_null() {
+                    sets.push(value.as_bytes().to_vec());
+                }
+            }
+            let mut out: Vec<u8> = Vec::new();
+            for (i, set) in sets.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(set);
+            }
+            Ok(Datum::Bytes(out))
+        }
+        // `INSERT(str, pos, len, newstr)` (byte/character offsets are 1-based).
+        "INSERT" => {
+            if func.args.len() != 4 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "INSERT requires 4 arguments",
+                ));
+            }
+            let text = eval_expr_with_row(&func.args[0], schema, row)?;
+            if text.is_null() {
+                return Ok(Datum::Null);
+            }
+            let pos = eval_expr_with_row(&func.args[1], schema, row)?;
+            if pos.is_null() {
+                return Ok(Datum::Null);
+            }
+            let len = eval_expr_with_row(&func.args[2], schema, row)?;
+            if len.is_null() {
+                return Ok(Datum::Null);
+            }
+            let newstr = eval_expr_with_row(&func.args[3], schema, row)?;
+            if newstr.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text = String::from_utf8_lossy(&text.as_bytes()).into_owned();
+            let chars: Vec<char> = text.chars().collect();
+            let n = chars.len() as i64;
+            let pos = pos.as_i64()?;
+            if pos < 1 || pos > n {
+                return Ok(Datum::Bytes(text.into_bytes()));
+            }
+            let mut len = len.as_i64()?;
+            if len < 0 || len > n - pos + 1 {
+                len = n - pos + 1;
+            }
+            let mut out: String = chars[..(pos - 1) as usize].iter().collect();
+            out.push_str(&String::from_utf8_lossy(&newstr.as_bytes()));
+            out.extend(chars[(pos - 1 + len) as usize..].iter());
+            Ok(Datum::Bytes(out.into_bytes()))
+        }
+        // `EXPORT_SET(bits, on, off[, sep[, nbits]])`.
+        "EXPORT_SET" => {
+            if !(3..=5).contains(&func.args.len()) {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "EXPORT_SET requires 3 to 5 arguments",
+                ));
+            }
+            let bits = eval_expr_with_row(&func.args[0], schema, row)?;
+            if bits.is_null() {
+                return Ok(Datum::Null);
+            }
+            let bits = bits.as_i64()? as u64;
+            let on = eval_expr_with_row(&func.args[1], schema, row)?;
+            if on.is_null() {
+                return Ok(Datum::Null);
+            }
+            let off = eval_expr_with_row(&func.args[2], schema, row)?;
+            if off.is_null() {
+                return Ok(Datum::Null);
+            }
+            let sep = match func.args.get(3) {
+                Some(expr) => {
+                    let value = eval_expr_with_row(expr, schema, row)?;
+                    if value.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    value.as_bytes().to_vec()
+                }
+                None => b",".to_vec(),
+            };
+            let nbits = match func.args.get(4) {
+                Some(expr) => {
+                    let value = eval_expr_with_row(expr, schema, row)?;
+                    if value.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    value.as_i64()?.clamp(0, 64) as usize
+                }
+                None => 64,
+            };
+            let mut parts: Vec<Vec<u8>> = Vec::with_capacity(nbits);
+            for i in 0..nbits {
+                let bit = if i < 64 { (bits >> i) & 1 } else { 0 };
+                parts.push(if bit == 1 {
+                    on.as_bytes().to_vec()
+                } else {
+                    off.as_bytes().to_vec()
+                });
+            }
+            let mut out: Vec<u8> = Vec::new();
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(&sep);
+                }
+                out.extend_from_slice(part);
+            }
+            Ok(Datum::Bytes(out))
+        }
+        // `COMPRESS(str)`: DEFLATE payload prefixed with the raw length.
+        "COMPRESS" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "COMPRESS requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let bytes = value.as_bytes();
+            // MySQL stores empty strings uncompressed.
+            if bytes.is_empty() {
+                return Ok(Datum::Bytes(Vec::new()));
+            }
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(&bytes)
+                .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, e.to_string()))?;
+            let mut compressed = encoder
+                .finish()
+                .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, e.to_string()))?;
+            // The tail '.' keeps a trailing space from being lost in a CHAR
+            // column (TiDB `builtinCompressSig`).
+            if compressed.last() == Some(&b' ') {
+                compressed.push(b'.');
+            }
+            let mut out = Vec::with_capacity(4 + compressed.len());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&compressed);
+            Ok(Datum::Bytes(out))
+        }
+        // `TRIM(str)` (the `TRIM(BOTH … FROM …)` spellings lower to markers).
+        "TRIM" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "TRIM requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text = String::from_utf8_lossy(&value.as_bytes()).into_owned();
+            Ok(Datum::Bytes(text.trim_matches(' ').as_bytes().to_vec()))
+        }
         "HEX" => {
             if func.args.len() != 1 {
                 return Err(Error::new(
@@ -1882,6 +2467,41 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 Datum::Null => return Ok(Datum::Null),
             };
             Ok(Datum::Bytes(out.into_bytes()))
+        }
+        // MySQL `UNHEX(str)`: decode pairs of hex digits into a binary string.
+        // An odd digit count is read as if padded with a leading `0`; any
+        // non-hex digit makes the result NULL. The result is a *binary*
+        // string, so a character column stores it verbatim after charset
+        // decoding (invalid bytes truncate instead of becoming `?`).
+        "UNHEX" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "UNHEX requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text = String::from_utf8_lossy(&v.as_bytes()).into_owned();
+            let padded = if text.len() % 2 == 0 {
+                text
+            } else {
+                format!("0{text}")
+            };
+            let mut out = Vec::with_capacity(padded.len() / 2);
+            let bytes = padded.as_bytes();
+            for pair in bytes.chunks(2) {
+                let hi = (pair[0] as char).to_digit(16);
+                let lo = (pair[1] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(hi), Some(lo)) => out.push((hi * 16 + lo) as u8),
+                    _ => return Ok(Datum::Null),
+                }
+            }
+            note_binary_value();
+            Ok(Datum::Bytes(out))
         }
         "CONCAT" => {
             if func.args.is_empty() {
@@ -2005,10 +2625,36 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             Ok(Datum::Bytes(out.into_bytes()))
         }
+        // MySQL `CRC32(str)`: unsigned CRC-32 (IEEE) of the argument's bytes.
+        "CRC32" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "CRC32 requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            Ok(Datum::U64(u64::from(
+                sealdb_meta::model::key_hash::crc32_ieee(&v.as_bytes()),
+            )))
+        }
         // MySQL `LOWER(str)` / `UPPER(str)`: case-fold the text argument.
         "LOWER" | "LCASE" => eval_case_convert(func, schema, row, false),
         "UPPER" | "UCASE" => eval_case_convert(func, schema, row, true),
         "SUBSTRING" | "SUBSTR" | "MID" => eval_substring(func, schema, row),
+        "LEFT" => eval_left_right(func, schema, row, true),
+        "RIGHT" => eval_left_right(func, schema, row, false),
+        "__SEALDB_TRIM_BOTH" => eval_trim_string(func, schema, row, true, true),
+        "__SEALDB_TRIM_LEADING" => eval_trim_string(func, schema, row, true, false),
+        "__SEALDB_TRIM_TRAILING" => eval_trim_string(func, schema, row, false, true),
+        // `LOCATE(substr, str[, pos])` / `INSTR(str, substr)`.
+        "LOCATE" => eval_locate(func, schema, row, false),
+        "INSTR" => eval_locate(func, schema, row, true),
+        "__LOCATE_COLL" => eval_locate(func, schema, row, false),
+        "__INSTR_COLL" => eval_locate(func, schema, row, true),
         // MySQL regular-expression functions (ICU in MySQL, POSIX-ish here).
         "REGEXP_LIKE" => eval_regexp_like(func, schema, row),
         "REGEXP_SUBSTR" => eval_regexp_substr(func, schema, row),
@@ -2711,6 +3357,92 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         // TiDB `tidb_decode_plan(str)`: decode a base64 + snappy encoded text
         // plan into the pretty-printed tree. Malformed input is returned
         // unchanged (v8.5 behaviour), while the empty string decodes to empty.
+        // TiDB `tidb_encode_sql_digest(str)`: SHA-256 of the parser-normalized
+        // statement (`select `id` , `v` from `t` where `id` = ?`).
+        "TIDB_ENCODE_SQL_DIGEST" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+                    "Incorrect parameter count in the call to native function 'tidb_encode_sql_digest'",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let text = String::from_utf8_lossy(value.as_bytes().as_slice()).into_owned();
+            Ok(Datum::Bytes(
+                crate::sql_digest::sql_digest(&text).into_bytes(),
+            ))
+        }
+        // TiDB `tidb_decode_sql_digests(json[, max_len])`: resolves digests
+        // recorded by the statement summary to normalized SQL text.
+        "TIDB_DECODE_SQL_DIGESTS" => {
+            if func.args.len() != 1 && func.args.len() != 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+                    "Incorrect parameter count in the call to native function 'tidb_decode_sql_digests'",
+                ));
+            }
+            if !crate::sql_digest::has_process_privilege() {
+                return Err(Error::new(
+                    sealdb_errno::ERR_SPECIFIC_ACCESS_DENIED_ERROR,
+                    "Access denied; you need (at least one of) the PROCESS privilege(s) for this operation",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let raw = String::from_utf8_lossy(value.as_bytes().as_slice()).into_owned();
+            let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    push_warning(
+                        1210,
+                        format!("The argument can't be unmarshalled as JSON array: '{raw}'"),
+                    );
+                    return Ok(Datum::Null);
+                }
+            };
+            let serde_json::Value::Array(items) = parsed else {
+                push_warning(
+                    1210,
+                    format!("The argument can't be unmarshalled as JSON array: '{raw}'"),
+                );
+                return Ok(Datum::Null);
+            };
+            let max_len = match func.args.get(1) {
+                None => 0i64,
+                Some(arg) => {
+                    let length = eval_expr_with_row(arg, schema, row)?;
+                    if length.is_null() {
+                        0
+                    } else {
+                        length.as_i64()?
+                    }
+                }
+            };
+            let mut decoded: Vec<Option<String>> = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(digest) = item.as_str() else {
+                    decoded.push(None);
+                    continue;
+                };
+                let Some(normalized) = crate::sql_digest::lookup_normalized(digest) else {
+                    decoded.push(None);
+                    continue;
+                };
+                if max_len > 0 && normalized.chars().count() > max_len as usize {
+                    let truncated: String = normalized.chars().take(max_len as usize).collect();
+                    decoded.push(Some(format!("{truncated}...")));
+                } else {
+                    decoded.push(Some(normalized));
+                }
+            }
+            let text = serde_json::to_string(&decoded).unwrap_or_else(|_| "[]".to_string());
+            Ok(Datum::Bytes(text.into_bytes()))
+        }
         "TIDB_DECODE_PLAN" => {
             if func.args.len() != 1 {
                 return Err(Error::new(
@@ -4128,6 +4860,254 @@ fn mysql_base64_encode(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// MySQL `LEFT(str, len)` / `RIGHT(str, len)`: character-based; a
+/// non-positive length yields the empty string.
+fn eval_left_right(
+    func: &FuncCallExpr,
+    schema: &[String],
+    row: &[Datum],
+    left: bool,
+) -> Result<Datum> {
+    if func.args.len() != 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("{} requires 2 arguments", func.name),
+        ));
+    }
+    let src = eval_expr_with_row(&func.args[0], schema, row)?;
+    if src.is_null() {
+        return Ok(Datum::Null);
+    }
+    let len = eval_expr_with_row(&func.args[1], schema, row)?;
+    if len.is_null() {
+        return Ok(Datum::Null);
+    }
+    let len = len.as_i64()?;
+    let bytes = src.as_bytes();
+    let binary = expr_is_binary_charset(&func.args[0]) || matches!(&src, Datum::Bit(_));
+    if binary {
+        // Byte semantics on binary strings.
+        let n = len.max(0) as usize;
+        let out = if left {
+            bytes[..n.min(bytes.len())].to_vec()
+        } else {
+            bytes[bytes.len().saturating_sub(n)..].to_vec()
+        };
+        return Ok(Datum::Bytes(out));
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let chars: Vec<char> = text.chars().collect();
+    if len <= 0 {
+        return Ok(Datum::Bytes(Vec::new()));
+    }
+    let n = (len as usize).min(chars.len());
+    let out: String = if left {
+        chars[..n].iter().collect()
+    } else {
+        chars[chars.len() - n..].iter().collect()
+    };
+    Ok(Datum::Bytes(out.into_bytes()))
+}
+
+/// MySQL `TRIM(BOTH|LEADING|TRAILING remstr FROM str)`: removes the whole
+/// `remstr` repeatedly from the requested side(s).
+fn eval_trim_string(
+    func: &FuncCallExpr,
+    schema: &[String],
+    row: &[Datum],
+    leading: bool,
+    trailing: bool,
+) -> Result<Datum> {
+    if func.args.len() != 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("{} requires 2 arguments", func.name),
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let rem = eval_expr_with_row(&func.args[1], schema, row)?;
+    if rem.is_null() {
+        return Ok(Datum::Null);
+    }
+    let text = String::from_utf8_lossy(&value.as_bytes()).into_owned();
+    let rem = String::from_utf8_lossy(&rem.as_bytes()).into_owned();
+    if rem.is_empty() {
+        return Ok(Datum::Bytes(text.into_bytes()));
+    }
+    let ci = collation_ci() && !expr_is_binary_charset(&func.args[0]);
+    let (mut work, needle) = if ci {
+        (text.to_lowercase(), rem.to_lowercase())
+    } else {
+        (text.clone(), rem.clone())
+    };
+    let mut start = 0usize;
+    let mut end = work.len();
+    if leading {
+        while work[start..end].starts_with(&needle) {
+            start += needle.len();
+        }
+    }
+    if trailing {
+        while end > start && work[start..end].ends_with(&needle) {
+            end -= needle.len();
+        }
+    }
+    work = work[start..end].to_string();
+    if ci {
+        // Map the trimmed byte range back onto the original text.
+        let prefix = text.char_indices().take_while(|(i, _)| *i < start).count();
+        let _ = prefix;
+        let start_chars = text[..start.min(text.len())].chars().count();
+        let end_chars = text[..end.min(text.len())].chars().count();
+        let out: String = text
+            .chars()
+            .skip(start_chars)
+            .take(end_chars.saturating_sub(start_chars))
+            .collect();
+        return Ok(Datum::Bytes(out.into_bytes()));
+    }
+    Ok(Datum::Bytes(work.into_bytes()))
+}
+
+/// MySQL `LOCATE(substr, str[, pos])` (and `INSTR(str, substr)` when `swap`).
+/// Positions and the start offset are 1-based characters; case folding follows
+/// the current collation.
+fn eval_locate(func: &FuncCallExpr, schema: &[String], row: &[Datum], swap: bool) -> Result<Datum> {
+    let (mode, args) = collation_marker_args(func);
+    if !(2..=3).contains(&args.len()) {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("{} requires 2 or 3 arguments", func.name),
+        ));
+    }
+    let (hay_arg, needle_arg) = if swap {
+        (&args[0], &args[1])
+    } else {
+        (&args[1], &args[0])
+    };
+    let hay = eval_expr_with_row(hay_arg, schema, row)?;
+    if hay.is_null() {
+        return Ok(Datum::Null);
+    }
+    let needle = eval_expr_with_row(needle_arg, schema, row)?;
+    if needle.is_null() {
+        return Ok(Datum::Null);
+    }
+    let start = match args.get(2) {
+        Some(expr) if !swap => {
+            let value = eval_expr_with_row(expr, schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            value.as_i64()?
+        }
+        _ => 1,
+    };
+    if start < 1 {
+        return Ok(Datum::I64(0));
+    }
+    let hay_raw = String::from_utf8_lossy(&hay.as_bytes()).into_owned();
+    let needle_raw = String::from_utf8_lossy(&needle.as_bytes()).into_owned();
+    let binary_charset = expr_is_binary_charset(hay_arg) || expr_is_binary_charset(needle_arg);
+    let mode = if binary_charset {
+        CollateMode::Bin
+    } else {
+        mode
+    };
+    if needle_raw.is_empty() {
+        return Ok(Datum::I64(start));
+    }
+    let hay_chars: Vec<char> = hay_raw.chars().collect();
+    let start_idx = (start - 1) as usize;
+    if start_idx > hay_chars.len() {
+        return Ok(Datum::I64(0));
+    }
+    // `INSTR` uses TiDB's `Lowercase` path: only case is folded, no weight
+    // contractions, so `INSTR('ß', 's')` is 0 while `LOCATE('ß', 's')` is 1.
+    if swap {
+        let (hay, needle) = if mode.is_ci() {
+            (hay_raw.to_lowercase(), needle_raw.to_lowercase())
+        } else {
+            (hay_raw, needle_raw)
+        };
+        let hay_chars: Vec<char> = hay.chars().collect();
+        let needle_chars: Vec<char> = needle.chars().collect();
+        if needle_chars.len() > hay_chars.len() {
+            return Ok(Datum::I64(0));
+        }
+        let last = hay_chars.len() - needle_chars.len();
+        let mut i = start_idx;
+        while i <= last {
+            if hay_chars[i..i + needle_chars.len()] == needle_chars[..] {
+                return Ok(Datum::I64((i + 1) as i64));
+            }
+            i += 1;
+        }
+        return Ok(Datum::I64(0));
+    }
+    // `LOCATE` uses TiDB's collation-key search
+    // (`KeyWithoutTrimRightSpace`), which lets contractions match.
+    let Some(hay_key) = key_bytes_no_trim(mode, hay_raw.as_bytes()) else {
+        // Fall back to raw byte search when the weight table has no entry.
+        let hay_bytes = hay_raw.as_bytes();
+        let needle_bytes = needle_raw.as_bytes();
+        let skip = hay_raw
+            .char_indices()
+            .nth(start_idx)
+            .map(|(i, _)| i)
+            .unwrap_or(hay_bytes.len());
+        return Ok(Datum::I64(
+            hay_bytes[skip..]
+                .windows(needle_bytes.len())
+                .position(|w| w == needle_bytes)
+                .map(|pos| {
+                    let at = skip + pos;
+                    (hay_raw[..at].chars().count() + 1) as i64
+                })
+                .unwrap_or(0),
+        ));
+    };
+    let Some(needle_key) = key_bytes_no_trim(mode, needle_raw.as_bytes()) else {
+        return Ok(Datum::I64(0));
+    };
+    if needle_key.is_empty() {
+        return Ok(Datum::I64(start));
+    }
+    // Byte offset of the start character inside the haystack key.
+    let mut skip_key = 0usize;
+    for c in hay_raw.chars().take(start_idx) {
+        skip_key += key_bytes_no_trim(mode, c.to_string().as_bytes())
+            .map(|k| k.len())
+            .unwrap_or(c.len_utf8());
+    }
+    if skip_key > hay_key.len() || needle_key.len() > hay_key.len() - skip_key {
+        return Ok(Datum::I64(0));
+    }
+    let Some(pos) = hay_key[skip_key..]
+        .windows(needle_key.len())
+        .position(|w| w == needle_key.as_slice())
+    else {
+        return Ok(Datum::I64(0));
+    };
+    let at = skip_key + pos;
+    // Map the matched key offset back onto a 1-based character position.
+    let mut counted = 0usize;
+    let mut walked = 0usize;
+    for c in hay_raw.chars() {
+        if walked >= at {
+            break;
+        }
+        walked += key_bytes_no_trim(mode, c.to_string().as_bytes())
+            .map(|k| k.len())
+            .unwrap_or(c.len_utf8());
+        counted += 1;
+    }
+    Ok(Datum::I64((counted + 1) as i64))
+}
+
 fn eval_substring(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     if !(2..=3).contains(&func.args.len()) {
         return Err(Error::new(
@@ -4309,11 +5289,32 @@ fn regexp_find_nth(
 }
 
 fn eval_regexp_like(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
-    let Some(args) = regexp_args(func, schema, row, false)? else {
-        return Ok(Datum::Null);
-    };
-    let re = build_mysql_regexp(&args.pattern, &args.match_type)?;
-    Ok(Datum::I64(i64::from(re.is_match(&args.text))))
+    // `REGEXP_LIKE(expr, pat[, match_type])`: unlike the `REGEXP_*` functions
+    // the third argument is the match type, not a start position. TiDB's
+    // `REGEXP`/`RLIKE` rewrite appends `'c'` there for a case-sensitive
+    // comparison, so parsing it as `pos` would raise "truncated integer c".
+    if func.args.len() < 2 || func.args.len() > 3 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("Incorrect arguments to {}", func.name.to_ascii_uppercase()),
+        ));
+    }
+    let mut values = Vec::with_capacity(func.args.len());
+    for arg in &func.args {
+        let value = eval_expr_with_row(arg, schema, row)?;
+        if value.is_null() {
+            return Ok(Datum::Null);
+        }
+        values.push(value);
+    }
+    let text = String::from_utf8_lossy(&values[0].as_bytes()).into_owned();
+    let pattern = String::from_utf8_lossy(&values[1].as_bytes()).into_owned();
+    let match_type = values
+        .get(2)
+        .map(|value| String::from_utf8_lossy(&value.as_bytes()).into_owned())
+        .unwrap_or_default();
+    let re = build_mysql_regexp(&pattern, &match_type)?;
+    Ok(Datum::I64(i64::from(re.is_match(&text))))
 }
 
 fn eval_regexp_substr(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
@@ -6674,6 +7675,52 @@ fn eval_between(expr: &BetweenExpr, schema: &[String], row: &[Datum]) -> Result<
     Ok(bool_datum(if expr.not { !inside } else { inside }))
 }
 
+/// `GREATEST`/`LEAST` over the given arguments (the caller sets the
+/// comparison collation).
+fn eval_greatest_least(
+    args: &[ExprNode],
+    want_greatest: bool,
+    schema: &[String],
+    row: &[Datum],
+) -> Result<Datum> {
+    let mut best: Option<Datum> = None;
+    // TiDB's duration result type keeps the widest fractional precision of its
+    // arguments (`greatest(time(5), cast(… as time))` prints five digits even
+    // when the chosen value is exact).
+    let mut time_fsp = 0i8;
+    for arg in args {
+        let v = eval_expr_with_row(arg, schema, row)?;
+        if v.is_null() {
+            return Ok(Datum::Null);
+        }
+        if let Datum::Time(t) = &v
+            && t.tp == sealdb_types::time::TimeType::Time
+        {
+            time_fsp = time_fsp.max(t.fsp.max(0));
+        }
+        best = Some(match best {
+            None => v,
+            Some(cur) => {
+                let ord = compare_datums(&cur, &v)?;
+                if want_greatest {
+                    if ord.is_lt() { v } else { cur }
+                } else if ord.is_gt() {
+                    v
+                } else {
+                    cur
+                }
+            }
+        });
+    }
+    match best {
+        Some(Datum::Time(mut t)) if t.tp == sealdb_types::time::TimeType::Time => {
+            t.fsp = t.fsp.max(time_fsp);
+            Ok(Datum::Time(t))
+        }
+        other => Ok(other.unwrap_or(Datum::Null)),
+    }
+}
+
 /// MySQL `COERCIBILITY(expr)` (TiDB `GetCoercibility`): derived from the
 /// expression's collation source, not from the runtime value alone.
 fn coercibility_of(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<i64> {
@@ -6805,6 +7852,43 @@ fn bytes_eq(a: u8, b: u8, ci: bool) -> bool {
         a.eq_ignore_ascii_case(&b)
     } else {
         a == b
+    }
+}
+
+/// LIKE over characters with an explicit collation (`__STR_LIKE`).
+fn like_at_chars(text: &[char], ti: usize, pattern: &[char], pi: usize, mode: CollateMode) -> bool {
+    if pi == pattern.len() {
+        return ti == text.len();
+    }
+    match pattern[pi] {
+        '%' => {
+            like_at_chars(text, ti, pattern, pi + 1, mode)
+                || (ti < text.len() && like_at_chars(text, ti + 1, pattern, pi, mode))
+        }
+        '_' => ti < text.len() && like_at_chars(text, ti + 1, pattern, pi + 1, mode),
+        ch => {
+            ti < text.len()
+                && like_char_eq(mode, text[ti], ch)
+                && like_at_chars(text, ti + 1, pattern, pi + 1, mode)
+        }
+    }
+}
+
+/// TiDB `WildcardPattern` per-rune equality. Unlike full collation equality,
+/// `unicode_ci` pattern matching never collapses non-BMP runes (they must be
+/// identical) and long-rune weights stay exact.
+fn like_char_eq(mode: CollateMode, a: char, b: char) -> bool {
+    match mode {
+        CollateMode::Bin => a == b,
+        CollateMode::GeneralCi => {
+            sealdb_util::collate::general_ci::weight(a)
+                == sealdb_util::collate::general_ci::weight(b)
+        }
+        CollateMode::UnicodeCi => sealdb_util::collate::unicode_0400_ci_impl::like_eq(a, b),
+        _ => {
+            compare_bytes(mode, a.to_string().as_bytes(), b.to_string().as_bytes())
+                == std::cmp::Ordering::Equal
+        }
     }
 }
 
@@ -7041,7 +8125,14 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
                     format_invalid_chars(bytes)
                 ),
             );
-            return Ok(Datum::Null);
+            // In strict mode the invalid utf8mb4 string becomes NULL; outside
+            // it TiDB truncates at the first invalid byte and keeps the valid
+            // prefix (`cast(compress('b') as char)` → `\x01\x00\x00\x00x`).
+            return Ok(if strict_sql_mode() {
+                Datum::Null
+            } else {
+                Datum::Bytes(utf8_valid_prefix(bytes).to_vec())
+            });
         }
         if let Datum::Bit(bytes) = &value {
             let bytes = bytes.clone();
@@ -7062,7 +8153,11 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
                         format_invalid_chars(&bytes)
                     ),
                 );
-                return Ok(Datum::Null);
+                return Ok(if strict_sql_mode() {
+                    Datum::Null
+                } else {
+                    Datum::Bytes(utf8_valid_prefix(&bytes).to_vec())
+                });
             }
             return Ok(Datum::Bytes(bytes));
         }

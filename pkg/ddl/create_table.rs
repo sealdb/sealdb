@@ -2,14 +2,15 @@ use sealdb_errno::{
     ERR_AFFINITY, ERR_BAD_FIELD, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_CANNOT_ADD_FOREIGN,
     ERR_DUP_FIELDNAME, ERR_DUP_KEYNAME, ERR_DUPLICATED_VALUE_IN_TYPE, ERR_FK_DUP_NAME,
     ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED, ERR_GENERATED_COLUMN_REF_AUTO_INC,
-    ERR_INVALID_DEFAULT, ERR_INVALID_ON_UPDATE, ERR_M_BIGGER_THAN_D, ERR_MULTIPLE_PRI_KEY,
-    ERR_NO_SUCH_TABLE, ERR_OPT_ON_TEMPORARY_TABLE, ERR_PRIMARY_CANT_HAVE_NULL,
-    ERR_TABLE_MUST_HAVE_COLUMNS, ERR_TOO_BIG_DISPLAYWIDTH, ERR_TOO_BIG_PRECISION,
-    ERR_TOO_MANY_FIELDS, ERR_TOO_MANY_KEYS, ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE,
-    ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED_DDL_OPERATION, ERR_VIEW_WRONG_LIST,
-    ERR_WARN_TABLE_TYPE_NOT_SUPPORT_FULLTEXT, ERR_WRONG_AUTO_KEY, ERR_WRONG_COLUMN_NAME,
-    ERR_WRONG_DB_NAME, ERR_WRONG_FK_DEF, ERR_WRONG_NAME_FOR_INDEX,
-    ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, ERR_WRONG_TABLE_NAME, Error, Result,
+    ERR_INVALID_AUTO_RANDOM, ERR_INVALID_DEFAULT, ERR_INVALID_ON_UPDATE,
+    ERR_KEY_COLUMN_DOES_NOT_EXIST, ERR_M_BIGGER_THAN_D, ERR_MULTIPLE_PRI_KEY, ERR_NO_SUCH_TABLE,
+    ERR_OPT_ON_TEMPORARY_TABLE, ERR_PRIMARY_CANT_HAVE_NULL, ERR_TABLE_MUST_HAVE_COLUMNS,
+    ERR_TOO_BIG_DISPLAYWIDTH, ERR_TOO_BIG_PRECISION, ERR_TOO_MANY_FIELDS, ERR_TOO_MANY_KEYS,
+    ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE, ERR_UNKNOWN_ERROR,
+    ERR_UNSUPPORTED_DDL_OPERATION, ERR_VIEW_WRONG_LIST, ERR_WARN_TABLE_TYPE_NOT_SUPPORT_FULLTEXT,
+    ERR_WRONG_AUTO_KEY, ERR_WRONG_COLUMN_NAME, ERR_WRONG_DB_NAME, ERR_WRONG_FK_DEF,
+    ERR_WRONG_NAME_FOR_INDEX, ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, ERR_WRONG_TABLE_NAME, Error,
+    Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
@@ -1417,6 +1418,47 @@ pub(crate) fn resolve_qualified_column_name(
     Ok(column.to_string())
 }
 
+/// TiDB `setTableAutoRandomBits`: `AUTO_RANDOM(shard_bits, range_bits)`
+/// range bits must fall in `[32, 64]`, and the bits left for the incremental
+/// part (`range_bits - shard_bits`, minus the sign bit of a signed column)
+/// must be at least `AutoRandomIncBitsMin` (27). Without an explicit range the
+/// column type's width (64) is used.
+pub(crate) fn validate_auto_random_bits(
+    shard: Option<u32>,
+    range: Option<u32>,
+    field_type: &FieldType,
+) -> Result<()> {
+    let Some(shard) = shard else {
+        return Ok(());
+    };
+    if let Some(range) = range
+        && !(32..=64).contains(&range)
+    {
+        return Err(Error::new(
+            ERR_INVALID_AUTO_RANDOM,
+            format!(
+                "Invalid auto random: auto_random range bits must be between 32 and 64, but got {range}"
+            ),
+        ));
+    }
+    let incremental = match range {
+        Some(range) => range.saturating_sub(shard),
+        None => 64u32.saturating_sub(shard),
+    };
+    let incremental = if field_type.unsigned {
+        incremental
+    } else {
+        incremental.saturating_sub(1)
+    };
+    if incremental < 27 {
+        return Err(Error::new(
+            ERR_INVALID_AUTO_RANDOM,
+            "Invalid auto random: auto_random ID space is too small, please decrease the shard bits or increase the range bits",
+        ));
+    }
+    Ok(())
+}
+
 pub fn build_table_info_with_defaults(
     stmt: &CreateTableStmt,
     table_id: i64,
@@ -1428,6 +1470,16 @@ pub fn build_table_info_with_defaults(
         return Err(Error::new(
             ERR_OPT_ON_TEMPORARY_TABLE,
             "`PLACEMENT` is unsupported on temporary tables.",
+        ));
+    }
+    // TiDB `checkCreateTableGrammar`: temporary tables cannot carry an
+    // `auto_random` column (8006).
+    if (stmt.temporary || stmt.on_commit_delete_rows)
+        && stmt.cols.iter().any(|col| col.auto_random.is_some())
+    {
+        return Err(Error::new(
+            ERR_OPT_ON_TEMPORARY_TABLE,
+            "`auto_random` is unsupported on temporary tables.",
         ));
     }
     if stmt.cols.is_empty() {
@@ -1484,11 +1536,26 @@ pub fn build_table_info_with_defaults(
             info.field_type.charset = charset.clone();
             info.field_type.collate = collate.clone();
         }
+        // TiDB `OverwriteCollationWithBinaryFlag`: the MySQL `BINARY` column
+        // attribute pins the charset's `_bin` collation, unless an explicit
+        // charset and collation already chose one.
+        let has_binary_attr = col.comment.as_deref()
+            == Some(sealdb_parser::sqlparser_bridge::lower::BINARY_ATTR_COMMENT_MARKER);
+        if has_binary_attr
+            && !(col.charset.is_some() && col.collate.is_some())
+            && info.field_type.is_character_type()
+        {
+            let charset = info.field_type.charset.clone();
+            info.field_type.collate =
+                sealdb_parser::charset::Collation::default_for_charset(&charset).name;
+        }
         if let Some(generated) = &col.generated {
             validate_generated_expr(&col.name, &generated.expr)?;
             info.generated_expr = Some(generated.expr.clone());
             info.generated_stored = generated.stored;
-        }
+        } // TiDB `decodeEnumSetBinaryLiteralToUTF8`: hex/bit member literals are
+        // raw bytes in the column charset; rewrite them to UTF-8.
+        decode_enum_set_binary_literals(&mut info.field_type);
         validate_enum_set_members(&info.name.o().to_string(), &info.field_type)?;
         let default = col.default.as_deref().map(|default| {
             normalize_expression_default(&normalize_default(&info.field_type, default))
@@ -1499,7 +1566,11 @@ pub fn build_table_info_with_defaults(
             .as_deref()
             .and_then(|default| origin_default_for(&info.field_type, default));
         info.auto_increment = col.auto_increment;
+        if col.auto_random.is_some() {
+            validate_auto_random_bits(col.auto_random, col.auto_random_range, &info.field_type)?;
+        }
         info.auto_random = col.auto_random;
+        info.auto_random_range = col.auto_random_range;
         // Parser rewrites `ZEROFILL` → UNSIGNED + marker comment.
         if col.comment.as_deref()
             == Some(sealdb_parser::sqlparser_bridge::lower::ZEROFILL_COMMENT_MARKER)
@@ -1507,6 +1578,10 @@ pub fn build_table_info_with_defaults(
             info.field_type.flag |= 64; // MySQL zerofillFlag
             info.field_type.unsigned = true;
             info.field_type.flag |= 32;
+            info.comment = None;
+        } else if col.comment.as_deref()
+            == Some(sealdb_parser::sqlparser_bridge::lower::BINARY_ATTR_COMMENT_MARKER)
+        {
             info.comment = None;
         } else {
             info.comment = col.comment.clone();
@@ -1838,7 +1913,13 @@ pub(crate) fn add_foreign_key(
                 .find(|c| c.name.o().eq_ignore_ascii_case(col_name))
                 .map(|c| (c.name.o().to_string(), c.offset))
                 .ok_or_else(|| {
-                    Error::new(ERR_CANNOT_ADD_FOREIGN, "Cannot add foreign key constraint")
+                    // TiDB `buildTableInfoWithCheck` -> `findCol` reports a
+                    // missing local FK column as `ErrKeyColumnDoesNotExits`
+                    // (1072), not a generic 1215.
+                    Error::new(
+                        ERR_KEY_COLUMN_DOES_NOT_EXIST,
+                        format!("Key column '{col_name}' doesn't exist in table"),
+                    )
                 })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1858,11 +1939,21 @@ pub(crate) fn add_foreign_key(
         name,
         cols: cols.iter().map(|(col, _)| col.clone()).collect(),
         ref_table: fk.ref_table.clone(),
+        ref_schema: fk.ref_schema.clone(),
         ref_cols: fk.ref_columns.clone(),
         on_update_cascade: fk.on_update_cascade,
         on_delete_cascade: fk.on_delete_cascade,
     });
     Ok(())
+}
+
+/// Schema a foreign key's parent table lives in: an explicit
+/// `REFERENCES db.t` names it, otherwise the child table's own schema.
+pub(crate) fn fk_ref_schema<'a>(
+    child_schema: &'a str,
+    fk: &'a sealdb_meta::ForeignKeyInfo,
+) -> &'a str {
+    fk.ref_schema.as_deref().unwrap_or(child_schema)
 }
 
 /// Whether an index (or the integer row handle) already covers the FK columns
@@ -2034,6 +2125,7 @@ fn push_select_column(
         generated: None,
         auto_increment: false,
         auto_random: None,
+        auto_random_range: None,
         not_null,
         explicit_null: false,
         inline_primary_key: false,
@@ -2295,18 +2387,26 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
         },
         // ENUM/SET store their member labels as text; comparisons keep the
         // label until numeric-vs-enum coercion lands (TiDB numeric path).
-        "ENUM" => FieldType {
-            tp: TYPE_ENUM,
-            flen: -1,
-            elems: Some(parse_elems(type_name)?),
-            ..string_ft()
-        },
-        "SET" => FieldType {
-            tp: TYPE_SET,
-            flen: -1,
-            elems: Some(parse_elems(type_name)?),
-            ..string_ft()
-        },
+        "ENUM" => {
+            let (elems, binary) = parse_elems_with_binary(type_name)?;
+            FieldType {
+                tp: TYPE_ENUM,
+                flen: -1,
+                elems: Some(elems),
+                elem_is_binary_lit: binary,
+                ..string_ft()
+            }
+        }
+        "SET" => {
+            let (elems, binary) = parse_elems_with_binary(type_name)?;
+            FieldType {
+                tp: TYPE_SET,
+                flen: -1,
+                elems: Some(elems),
+                elem_is_binary_lit: binary,
+                ..string_ft()
+            }
+        }
         "BIT" => FieldType {
             tp: TYPE_BIT,
             // BIT(n) is an unsigned big-endian bit field (TiDB unsignedFlag).
@@ -2515,7 +2615,11 @@ fn validate_enum_set_members(col_name: &str, ft: &FieldType) -> Result<()> {
 
 /// Parse the member list of `ENUM('a','b')` / `SET('a','b')`, preserving case.
 /// Members are stored unquoted; `''` and `\'` both decode to a quote.
-fn parse_elems(type_name: &str) -> Result<Vec<String>> {
+///
+/// Members rewritten from binary literals (`0xBAEC`, `b'101'`) keep their raw
+/// bytes as Latin-1 characters and are flagged for
+/// `decode_enum_set_binary_literals`; TiDB `FieldType.ElemIsBinaryLit`.
+fn parse_elems_with_binary(type_name: &str) -> Result<(Vec<String>, Vec<bool>)> {
     let start = type_name
         .find('(')
         .ok_or_else(|| Error::unsupported(format!("column type {type_name}")))?;
@@ -2524,6 +2628,7 @@ fn parse_elems(type_name: &str) -> Result<Vec<String>> {
         .ok_or_else(|| Error::unsupported(format!("column type {type_name}")))?;
     let inner = &type_name[start + 1..end];
     let mut out = Vec::new();
+    let mut binary = Vec::new();
     let mut chars = inner.chars().peekable();
     loop {
         while matches!(chars.peek(), Some(c) if c.is_whitespace() || *c == ',') {
@@ -2544,7 +2649,12 @@ fn parse_elems(type_name: &str) -> Result<Vec<String>> {
             if raw.is_empty() {
                 continue;
             }
-            out.push(hex_literal_to_string(raw).unwrap_or_else(|| raw.to_string()));
+            let (member, is_binary) = match raw_bytes(raw) {
+                Some(bytes) => (latin1_string(&bytes), true),
+                None => (raw.to_string(), false),
+            };
+            out.push(member);
+            binary.push(is_binary);
             continue;
         }
         chars.next();
@@ -2569,13 +2679,24 @@ fn parse_elems(type_name: &str) -> Result<Vec<String>> {
                 Some(c) => member.push(c),
             }
         }
+        let is_binary =
+            member.starts_with(sealdb_parser::sqlparser_bridge::lower::BINARY_ELEM_MARKER);
+        if is_binary {
+            member.remove(0);
+        }
         out.push(member);
+        binary.push(is_binary);
     }
-    Ok(out)
+    Ok((out, binary))
 }
 
-/// `0x6162` / `X'6162'` member literal → decoded UTF-8 text.
-fn hex_literal_to_string(raw: &str) -> Option<String> {
+/// Raw bytes → a string whose chars are the byte values (TiDB binary literal).
+fn latin1_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// `0x6162` / `X'6162'` member literal → its raw bytes.
+fn raw_bytes(raw: &str) -> Option<Vec<u8>> {
     let hex = raw
         .strip_prefix("0x")
         .or_else(|| raw.strip_prefix("0X"))
@@ -2590,7 +2711,70 @@ fn hex_literal_to_string(raw: &str) -> Option<String> {
         bytes.push((hi * 16 + lo) as u8);
         i += 2;
     }
-    String::from_utf8(bytes).ok()
+    Some(bytes)
+}
+
+/// Inverse of `latin1_string` for the binary-literal member representation.
+fn latin1_bytes(text: &str) -> Option<Vec<u8>> {
+    text.chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect()
+}
+
+/// Decode charset bytes to UTF-8 the way TiDB `OpDecodeReplace` does: each
+/// invalid unit becomes `?` (not `U+FFFD`).
+fn decode_charset_replace(bytes: &[u8], charset: &str) -> String {
+    match charset.to_ascii_lowercase().as_str() {
+        "gbk" => sealdb_parser::charset::encoding_gbk::decode(bytes),
+        "latin1" | "binary" | "ascii" if bytes.iter().all(u8::is_ascii) => latin1_string(bytes),
+        _ => decode_utf8_replace(bytes),
+    }
+}
+
+fn decode_utf8_replace(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                out.push_str(text);
+                break;
+            }
+            Err(err) => {
+                let valid = err.valid_up_to();
+                if valid > 0 {
+                    out.push_str(std::str::from_utf8(&rest[..valid]).expect("valid prefix"));
+                }
+                let bad = err.error_len().unwrap_or(rest.len() - valid);
+                for _ in 0..bad {
+                    out.push('?');
+                }
+                rest = &rest[valid + bad..];
+            }
+        }
+    }
+    out
+}
+
+/// TiDB `decodeEnumSetBinaryLiteralToUTF8`: rewrite binary-literal ENUM/SET
+/// members from the column charset to UTF-8 (`enum(0xBAEC)` under `gbk_bin` is
+/// `'红'`, under `utf8mb4` the bytes are decoded with `?` replacements).
+pub(crate) fn decode_enum_set_binary_literals(ft: &mut FieldType) {
+    if !matches!(ft.tp, TYPE_ENUM | TYPE_SET) || ft.elem_is_binary_lit.is_empty() {
+        return;
+    }
+    if let Some(elems) = ft.elems.as_mut() {
+        let charset = ft.charset.clone();
+        for (elem, is_binary) in elems.iter_mut().zip(ft.elem_is_binary_lit.iter()) {
+            if !*is_binary {
+                continue;
+            }
+            if let Some(bytes) = latin1_bytes(elem) {
+                *elem = decode_charset_replace(&bytes, &charset);
+            }
+        }
+    }
+    ft.elem_is_binary_lit.clear();
 }
 
 /// `FLOAT(M)` / `DOUBLE(M)` carry a display width only: without a second
@@ -2647,6 +2831,67 @@ mod precise_type_tests {
         assert_eq!(d.decimal, 1);
         let u2 = field_type_from_name("BIGINT").unwrap();
         assert!(!u2.is_unsigned());
+    }
+
+    #[test]
+    fn scratch_binary_json_columns() {
+        use sealdb_parser::Parser;
+        use sealdb_parser::ast::Statement;
+        let parsed = Parser::new()
+            .parse_one_stmt("CREATE TABLE t(a binary, b json, c char charset gbk)")
+            .unwrap();
+        let Statement::CreateTable(stmt) = parsed else {
+            panic!()
+        };
+        let info = super::build_table_info(&stmt, 1).unwrap();
+        for col in &info.columns {
+            println!(
+                "{} tp={} charset={} collate={} eval={:?}",
+                col.name.o(),
+                col.field_type.tp,
+                col.field_type.charset,
+                col.field_type.collate,
+                col.field_type.eval_type()
+            );
+        }
+    }
+
+    #[test]
+    fn enum_set_binary_literals_decode_from_column_charset() {
+        use sealdb_parser::Parser;
+        use sealdb_parser::ast::Statement;
+        // TiDB `decodeEnumSetBinaryLiteralToUTF8`: a hex member is raw bytes in
+        // the column charset, rewritten to UTF-8 at DDL time.
+        let parsed = Parser::new()
+            .parse_one_stmt(
+                "CREATE TABLE t(f set(0xD2BB, 0xC8FD), e enum(0xBAEC,0x6A59)) COLLATE gbk_bin",
+            )
+            .unwrap();
+        let Statement::CreateTable(stmt) = parsed else {
+            panic!("not a CREATE TABLE");
+        };
+        let info = super::build_table_info(&stmt, 1).unwrap();
+        assert_eq!(
+            info.columns[0].field_type.elems.as_deref(),
+            Some(["一".to_string(), "三".to_string()].as_slice())
+        );
+        assert_eq!(
+            info.columns[1].field_type.elems.as_deref(),
+            Some(["红".to_string(), "jY".to_string()].as_slice())
+        );
+        // Under utf8mb4 the same bytes are invalid UTF-8: TiDB substitutes one
+        // `?` per bad byte instead of failing.
+        let parsed = Parser::new()
+            .parse_one_stmt("CREATE TABLE t2(e enum(0xBAEC,0x6A59))")
+            .unwrap();
+        let Statement::CreateTable(stmt) = parsed else {
+            panic!("not a CREATE TABLE");
+        };
+        let info = super::build_table_info(&stmt, 1).unwrap();
+        assert_eq!(
+            info.columns[0].field_type.elems.as_deref(),
+            Some(["??".to_string(), "jY".to_string()].as_slice())
+        );
     }
 }
 

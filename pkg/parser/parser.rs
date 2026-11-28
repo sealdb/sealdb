@@ -113,6 +113,18 @@ impl Parser {
             .pop()
             .ok_or_else(|| sealdb_errno::Error::new(sealdb_errno::ERR_PARSE_ERROR, "empty SQL"))
     }
+
+    /// Parse `sql` but take `SelectField::orig_text` (projection naming) from
+    /// `name_sql`. TiDB plans the prepared statement's original AST, so an
+    /// EXECUTE result column is named with the template's `?` markers
+    /// (`SUM(COL1+?)`), not the parameter values.
+    pub fn parse_one_stmt_named(&self, sql: &str, name_sql: &str) -> Result<Statement> {
+        let mut stmts =
+            sqlparser_bridge::with_projection_text_source(name_sql, || self.parse_sql(sql))?;
+        stmts
+            .pop()
+            .ok_or_else(|| sealdb_errno::Error::new(sealdb_errno::ERR_PARSE_ERROR, "empty SQL"))
+    }
 }
 
 impl Default for Parser {
@@ -2076,6 +2088,58 @@ mod tests {
                     grant.privs[0].cols,
                     vec!["id".to_string(), "name".to_string()]
                 );
+            }
+            other => panic!("expected GrantStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_grant_identified_and_require() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("GRANT ALL PRIVILEGES ON *.* to 'test'@'%' IDENTIFIED BY 'xxx'")
+            .unwrap()
+        {
+            crate::ast::Statement::Grant(grant) => {
+                assert_eq!(grant.auth.as_deref(), Some("xxx"));
+            }
+            other => panic!("expected GrantStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt(
+                "GRANT ALL ON *.* TO 'u1'@'%' require issuer '/CN=a' and subject '/CN=b'",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::Grant(grant) => {
+                let require = grant.require.expect("require clause");
+                assert_eq!(require.issuer.as_deref(), Some("/CN=a"));
+                assert_eq!(require.subject.as_deref(), Some("/CN=b"));
+            }
+            other => panic!("expected GrantStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt("CREATE USER 'u9'@'%' require ssl ssl")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_PARSE_ERROR);
+        let err = parser
+            .parse_one_stmt("CREATE USER 'u9'@'%' require issuer '/CN=a' issuer '/CN=b'")
+            .unwrap_err();
+        assert!(err.message.contains("Duplicate require ISSUER clause"));
+        match parser
+            .parse_one_stmt(
+                "GRANT select ON executor__grant.* TO 'testWithGrant'@'localhost' WITH GRANT OPTION",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::Grant(grant) => {
+                assert_eq!(
+                    grant.level.level,
+                    crate::ast::GrantLevelType::DB,
+                    "{grant:?}"
+                );
+                assert_eq!(grant.level.db_name, "executor__grant");
+                assert!(grant.with_grant);
             }
             other => panic!("expected GrantStmt, got {other:?}"),
         }

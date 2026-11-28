@@ -51,7 +51,12 @@ pub fn compare(a: &str, b: &str) -> Ordering {
 
 /// Sort key under `gbk_bin` (GBK bytes, trailing spaces trimmed).
 pub fn key(s: &str) -> Vec<u8> {
-    let s = truncate_trailing_space(s);
+    key_no_trim(truncate_trailing_space(s))
+}
+
+/// TiDB `KeyWithoutTrimRightSpace`: GBK bytes of every rune, trailing spaces
+/// kept.
+pub fn key_no_trim(s: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(s.len());
     let mut rest = s;
     while !rest.is_empty() {

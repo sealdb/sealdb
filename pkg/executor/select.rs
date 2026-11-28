@@ -271,6 +271,8 @@ pub struct DistinctExec {
     keys: Vec<String>,
     fields: Vec<ExprNode>,
     names: Vec<String>,
+    /// Collation of each projected output position (`fields` order).
+    collations: Vec<sealdb_util::collate::CollateMode>,
     child: Box<dyn Executor>,
     schema: Vec<String>,
     rows: Vec<Vec<sealdb_types::Datum>>,
@@ -288,11 +290,17 @@ impl DistinctExec {
             keys,
             fields,
             names,
+            collations: Vec::new(),
             child,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
         }
+    }
+
+    pub fn with_collations(mut self, collations: Vec<sealdb_util::collate::CollateMode>) -> Self {
+        self.collations = collations;
+        self
     }
 }
 
@@ -334,9 +342,9 @@ impl Executor for DistinctExec {
                     row.clone()
                 };
                 let key = if project || idxs.is_empty() {
-                    row_key(&out, &(0..out.len()).collect::<Vec<_>>())
+                    row_key(&out, &(0..out.len()).collect::<Vec<_>>(), &self.collations)
                 } else {
-                    row_key(&out, &idxs)
+                    row_key(&out, &idxs, &self.collations)
                 };
                 if seen.insert(key) {
                     self.rows.push(out);
@@ -367,9 +375,28 @@ impl Executor for DistinctExec {
     }
 }
 
-fn row_key(row: &[sealdb_types::Datum], idxs: &[usize]) -> Vec<u8> {
+fn row_key(
+    row: &[sealdb_types::Datum],
+    idxs: &[usize],
+    collations: &[sealdb_util::collate::CollateMode],
+) -> Vec<u8> {
     let mut out = Vec::new();
     for idx in idxs {
+        // DISTINCT groups by the collation sort key (TiDB HashAgg on
+        // `collator.Key`), so `'a'`/`'A'` dedup under `utf8mb4_general_ci`.
+        let collated = match row.get(*idx) {
+            Some(sealdb_types::Datum::Bytes(b)) => collations
+                .get(*idx)
+                .and_then(|mode| sealdb_util::collate::key_bytes(*mode, b)),
+            _ => None,
+        };
+        if let Some(key) = collated {
+            out.push(4);
+            out.extend((key.len() as u32).to_le_bytes());
+            out.extend(key);
+            out.push(0xff);
+            continue;
+        }
         match row.get(*idx).unwrap_or(&sealdb_types::Datum::Null) {
             sealdb_types::Datum::Null => out.push(0),
             sealdb_types::Datum::I64(v) => {

@@ -61,6 +61,15 @@ impl Time {
         Self::from_unix_secs(secs, TimeType::Date).year as i32
     }
 
+    /// Unix epoch microseconds for a UTC wall clock (inverse of
+    /// [`Time::from_unix_secs`], keeping the sub-second part).
+    pub fn to_unix_micros(&self) -> i64 {
+        let days = days_from_civil(self.year as i64, self.month as i64, self.day as i64);
+        let secs =
+            days * 86_400 + self.hour as i64 * 3_600 + self.minute as i64 * 60 + self.second as i64;
+        secs * 1_000_000 + self.micro as i64
+    }
+
     /// Build a `Time` from Unix seconds interpreted as a UTC wall clock.
     pub fn from_unix_secs(secs: i64, tp: TimeType) -> Self {
         let days = secs.div_euclid(86_400);
@@ -558,7 +567,18 @@ pub fn parse_duration_string_truncated(s: &str) -> Option<(Time, bool)> {
 }
 
 /// Howard Hinnant's civil-from-days: days since 1970-01-01 → (y, m, d).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+/// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm).
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;

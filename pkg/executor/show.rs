@@ -216,6 +216,24 @@ impl Executor for ShowExec {
                     Datum::Bytes(create.into_bytes()),
                 ]];
             }
+            ShowStmtKind::CreateUser => {
+                let user = match self.stmt.user.clone() {
+                    Some(user) if !user.username.is_empty() => user,
+                    _ => sealdb_privilege::thread_user()
+                        .unwrap_or_else(sealdb_parser::ast::UserIdentity::root),
+                };
+                let Some(create) = self.domain.privilege().show_create_user(&user) else {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_CANNOT_USER,
+                        format!(
+                            "Operation SHOW CREATE USER failed for '{}'@'{}'",
+                            user.username, user.hostname
+                        ),
+                    ));
+                };
+                self.schema = vec![format!("CREATE USER for {}", user.display())];
+                self.rows = vec![vec![Datum::Bytes(create.into_bytes())]];
+            }
             ShowStmtKind::CreateTable => {
                 let table = self
                     .stmt
@@ -1038,8 +1056,13 @@ fn render_create_table(info: &TableInfo, next_auto_id: Option<i64>) -> String {
             } else {
                 "NONCLUSTERED"
             };
+            let primary_global = if idx.global {
+                " /*T![global_index] GLOBAL */"
+            } else {
+                ""
+            };
             primary_line = Some(format!(
-                "  PRIMARY KEY ({parts}) /*T![clustered_index] {stored} */"
+                "  PRIMARY KEY ({parts}) /*T![clustered_index] {stored} */{primary_global}"
             ));
             continue;
         }

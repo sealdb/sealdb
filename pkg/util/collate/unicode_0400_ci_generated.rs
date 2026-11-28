@@ -75,6 +75,30 @@ pub fn equal(a: &str, b: &str) -> bool {
     compare(a, b) == Ordering::Equal
 }
 
+/// TiDB `unicodeCICollator.Key`: preprocess (trim trailing spaces), then emit
+/// every 16-bit weight big-endian.
+pub fn key(s: &str) -> Vec<u8> {
+    key_no_trim(preprocess(s))
+}
+
+/// TiDB `KeyWithoutTrimRightSpace`: weights of every rune, trailing spaces
+/// included.
+pub fn key_no_trim(s: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(s.len() * 2);
+    for r in s.chars() {
+        let (mut sn, mut ss) = get_weight(r);
+        while sn != 0 {
+            buf.extend_from_slice(&((sn & 0xFFFF) as u16).to_be_bytes());
+            sn >>= 16;
+        }
+        while ss != 0 {
+            buf.extend_from_slice(&((ss & 0xFFFF) as u16).to_be_bytes());
+            ss >>= 16;
+        }
+    }
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
