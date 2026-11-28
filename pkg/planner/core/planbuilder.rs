@@ -961,6 +961,15 @@ impl PlanBuilder {
             Statement::UnlockStats(_) => Ok(PhysicalPlan::Simple {
                 kind: "UnlockStats".to_string(),
             }),
+            Statement::AddStatsExtended(_) => Ok(PhysicalPlan::Simple {
+                kind: "AddStatsExtended".to_string(),
+            }),
+            Statement::DropStatsExtended(_) => Ok(PhysicalPlan::Simple {
+                kind: "DropStatsExtended".to_string(),
+            }),
+            Statement::AdminReloadStatsExtended(_) => Ok(PhysicalPlan::Simple {
+                kind: "AdminReloadStatsExtended".to_string(),
+            }),
             Statement::Trace(_) => Ok(PhysicalPlan::Simple {
                 kind: "Trace".to_string(),
             }),
@@ -3555,6 +3564,7 @@ fn is_mysql_mem_table(from: &TableName, current_db: &str) -> bool {
                 | "stats_histograms"
                 | "stats_buckets"
                 | "stats_top_n"
+                | "stats_fm_sketch"
                 | "stats_table_locked"
                 | "bind_info"
                 | "tables_priv"

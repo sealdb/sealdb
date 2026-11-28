@@ -1543,6 +1543,63 @@ impl UnlockStatsStmt {
     }
 }
 
+/// TiDB `AddStatsExtendedStmt`: `ALTER TABLE t ADD STATS_EXTENDED name
+/// correlation(col, …)`.
+#[derive(Clone, Debug)]
+pub struct AddStatsExtendedStmt {
+    pub table: TableName,
+    pub name: String,
+    /// TiDB `StatsTypeCorrelation` is the only supported kind; the columns
+    /// keep their written order (duplicates are rejected at execution time).
+    pub columns: Vec<String>,
+}
+
+impl AddStatsExtendedStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ALTER TABLE ");
+        self.table.restore(ctx)?;
+        ctx.write_str(" ADD STATS_EXTENDED ");
+        ctx.write_str(&self.name);
+        ctx.write_str(" correlation(");
+        for (i, column) in self.columns.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            ctx.write_str(column);
+        }
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
+/// TiDB `DropStatsExtendedStmt`: `ALTER TABLE t DROP STATS_EXTENDED name`.
+#[derive(Clone, Debug)]
+pub struct DropStatsExtendedStmt {
+    pub table: TableName,
+    pub name: String,
+}
+
+impl DropStatsExtendedStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ALTER TABLE ");
+        self.table.restore(ctx)?;
+        ctx.write_str(" DROP STATS_EXTENDED ");
+        ctx.write_str(&self.name);
+        Ok(())
+    }
+}
+
+/// TiDB `AdminReloadStatsExtendedStmt`: `ADMIN RELOAD STATS_EXTENDED`.
+#[derive(Clone, Debug)]
+pub struct AdminReloadStatsExtendedStmt;
+
+impl AdminReloadStatsExtendedStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ADMIN RELOAD STATS_EXTENDED");
+        Ok(())
+    }
+}
+
 /// `OPTIMIZE TABLE t[, …]` (TiDB `OptimizeTableStmt`) — MVB status-row no-op.
 #[derive(Clone, Debug)]
 pub struct OptimizeTableStmt {

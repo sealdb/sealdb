@@ -11,6 +11,15 @@ use std::sync::Mutex;
 
 pub const STATS_STORAGE_KEY: &[u8] = b"mstats";
 
+/// One registered extended statistics object (TiDB `mysql.stats_extended`).
+#[derive(Clone, Debug)]
+pub struct ExtendedStats {
+    pub name: String,
+    /// TiDB `StatsTypeCorrelation`; only that kind is accepted at DDL time.
+    pub kind: String,
+    pub columns: Vec<String>,
+}
+
 pub struct Handle {
     inner: Mutex<HashMap<(String, String), Table>>,
     /// Soft-deleted stats (TiDB `DROP STATS`): `mysql.stats_meta` /
@@ -22,6 +31,11 @@ pub struct Handle {
     /// `SHOW STATS_LOCKED`. Explicit/auto `ANALYZE` does not consult the set
     /// yet (see the `statistics/lock_table_stats` entry in progress.md).
     locked: Mutex<HashSet<i64>>,
+    /// Extended statistics per table id (TiDB `mysql.stats_extended`), in
+    /// creation order so duplicate-column-set checks match TiDB.
+    extended: Mutex<HashMap<i64, Vec<ExtendedStats>>>,
+    /// `mysql.stats_fm_sketch` rows as `(table_id, partition_id, hist_id)`.
+    fm_sketches: Mutex<HashSet<(i64, i64, i64)>>,
 }
 
 impl Handle {
@@ -30,7 +44,70 @@ impl Handle {
             inner: Mutex::new(HashMap::new()),
             dropped: Mutex::new(HashMap::new()),
             locked: Mutex::new(HashSet::new()),
+            extended: Mutex::new(HashMap::new()),
+            fm_sketches: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Extended statistics registered on `table_id`, in creation order.
+    pub fn extended_stats(&self, table_id: i64) -> Vec<ExtendedStats> {
+        self.extended
+            .lock()
+            .expect("stats lock")
+            .get(&table_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Register one extended statistics object (the caller validated names,
+    /// duplicate columns and column-set uniqueness).
+    pub fn add_extended_stats(&self, table_id: i64, stats: ExtendedStats) {
+        self.extended
+            .lock()
+            .expect("stats lock")
+            .entry(table_id)
+            .or_default()
+            .push(stats);
+    }
+
+    /// Drop the extended statistics called `name`; returns whether a row was
+    /// removed.
+    pub fn drop_extended_stats(&self, table_id: i64, name: &str) -> bool {
+        let mut extended = self.extended.lock().expect("stats lock");
+        let Some(stats) = extended.get_mut(&table_id) else {
+            return false;
+        };
+        let before = stats.len();
+        stats.retain(|s| !s.name.eq_ignore_ascii_case(name));
+        before != stats.len()
+    }
+
+    /// Record the FM sketch rows an `ANALYZE` produced. TiDB keys them by
+    /// table, partition and histogram id, so re-analyzing the same table keeps
+    /// the row count stable.
+    pub fn record_fm_sketches(&self, rows: impl IntoIterator<Item = (i64, i64, i64)>) {
+        let mut fm = self.fm_sketches.lock().expect("stats lock");
+        for row in rows {
+            fm.insert(row);
+        }
+    }
+
+    /// `TRUNCATE TABLE mysql.stats_fm_sketch`.
+    pub fn clear_fm_sketches(&self) {
+        self.fm_sketches.lock().expect("stats lock").clear();
+    }
+
+    /// `mysql.stats_fm_sketch` rows in a stable order.
+    pub fn fm_sketch_ids(&self) -> Vec<(i64, i64, i64)> {
+        let mut rows: Vec<(i64, i64, i64)> = self
+            .fm_sketches
+            .lock()
+            .expect("stats lock")
+            .iter()
+            .copied()
+            .collect();
+        rows.sort_unstable();
+        rows
     }
 
     /// Lock statistics collection for `ids`; returns the ids that were already

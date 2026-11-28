@@ -5631,3 +5631,24 @@ SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t exe
   补齐 `4723fa2` 之后 15 套转绿的全部代码与文档（此前逐轮漏提交）。
 - 流程回正：**每套 suite 转绿即单独提交**（代码 + manifest + status-report +
   progress 同提交），不再积压；提交信息走 `project/scripts/check_commit_msg.sh`。
+
+## 2026-11-28 12:05 — `statistics/handle` 转绿（R6 24/35）
+
+### 本轮落地
+| 方向 | 实现 |
+|---|---|
+| 扩展统计 DDL | 解析桥在 `extract_misc_allowlist` 与 `rewrite_admin_show_ddl` 中识别 `ALTER TABLE … [IF EXISTS] t ADD STATS_EXTENDED n correlation(c1, c2)` / `DROP STATS_EXTENDED n` / `ADMIN RELOAD STATS_EXTENDED`，落成 `Statement::AddStatsExtended` / `DropStatsExtended` / `AdminReloadStatsExtended`（`AdminOp::ReloadStatsExtended`），`ALTER TABLE` 分支只在看到 `STATS_EXTENDED` 时接管，其余语句仍走原 lowering |
+| 元数据与校验 | `statistics::Handle` 新增 `extended` 表（table id → 按创建序的 `ExtendedStats{name, kind, columns}`）；`add_stats_extended` 依次校验：`tidb_enable_extended_stats` 开关（默认 OFF，关闭时任何一条语句都是 1105 `Extended statistics feature is not generally available now, and tidb_enable_extended_stats is OFF`）→ 表存在 → 分区表 1105 `Extended statistics on partitioned tables are not supported now` → 重复列名 1105 `Cannot create extended statistics on duplicate column names 'a'` → 同名已存在 1105 → 同类型同列集合已存在 1105（按集合比较，`correlation(b,a)` 与 `correlation(a,b)` 冲突） |
+| `mysql.stats_fm_sketch` | 新增虚拟表（`table_id, partition_id, hist_id, sketch`，由统计 Handle 的键集合生成并按 `(table, partition, hist)` 排序）；`ANALYZE` 对分区表按「分区 × 直方图（分析列 + 索引）」登记键，重分析键集不变，普通表不登记（对齐金样 `count(*)` 0/6 的差异）；`TRUNCATE TABLE mysql.stats_fm_sketch` 在会话层拦截并清空键集 |
+| 列名与默认值口径 | `SELECT @@var LIKE '…'` 的投影名改用 `SelectField.orig_text`（保留源码里 `like` 的小写拼写，替换变量后不再回落到大写 restore）；`validate_default_literal` 对 TIMESTAMP 默认值做会话时区换算并校验 UTC 范围 `1970-01-01 00:00:01 .. 2038-01-19 03:14:07`，越界报 1067 `Invalid default value for 'ts'` |
+
+### 验证
+```text
+SEALDB_ITEST_RUN_PENDING=1 ./tests/integrationtest/run-tests.sh -s memory -t statistics/handle  → PASS
+./tests/integrationtest/run-tests.sh -s tikv -k -t statistics/handle                       → PASS: memory=0 tikv=1
+./tests/integrationtest/run-tests.sh -s memory                                             → PASS: memory=162 tikv=0 skipped=92
+```
+
+### 状态
+- manifest：`statistics/handle` → `green`，green 155 / pending 81（counts 同步）
+- 下一刀：`executor/split_table` / `globalindex/mem_index_reader`（计划算子 ID 与 `Selection(in(_tidb_tid,…))` 口径）以及 `planner/core/cbo`（cost model v1/v2 的 `cost_trace` 渲染）等 R7/R3 长尾。

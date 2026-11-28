@@ -211,6 +211,7 @@ impl AnalyzeExec {
         let columns = analyzed_columns.clone();
         let index_stats =
             collect_index_stats(&info, &rows, buckets, topn_size, effective_version == 1);
+        let analyzed_index_count = index_stats.len();
         // Per-partition statistics (TiDB `GetPartitionStats`): only partition
         // results are reported under their partition name by
         // `SHOW STATS_HISTOGRAMS`.
@@ -343,6 +344,19 @@ impl AnalyzeExec {
             }
         };
         self.domain.stats().update(&schema, &name, stats);
+        // TiDB persists FM sketches per partition histogram (`mysql.stats_fm_sketch`
+        // keys on table / partition / hist id). Plain tables contribute no rows
+        // in the golden output, and re-analyzing rewrites the same keys.
+        if let Some(partition) = info.partition.as_ref() {
+            let per_partition = analyzed_columns.len() + analyzed_index_count;
+            let mut rows = Vec::new();
+            for definition in &partition.definitions {
+                for hist_id in 1..=per_partition {
+                    rows.push((info.id, definition.id, hist_id as i64));
+                }
+            }
+            self.domain.stats().record_fm_sketches(rows);
+        }
         self.domain.persist_stats()?;
         match stored_version {
             // A full ANALYZE can migrate a table to version 2; an existing

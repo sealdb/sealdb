@@ -7,7 +7,7 @@ pub mod pseudo;
 pub mod range_est;
 pub mod table;
 
-pub use handle::{Handle, STATS_STORAGE_KEY};
+pub use handle::{ExtendedStats, Handle, STATS_STORAGE_KEY};
 pub use json::table_from_tidb_json;
 pub use range_est::{HistValueKind, StatsRange, kind_of};
 pub use table::{

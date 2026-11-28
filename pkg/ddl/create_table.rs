@@ -902,6 +902,24 @@ pub(crate) fn validate_default_literal(
             format!("Invalid default value for '{name}'"),
         ));
     }
+    // TIMESTAMP stores the wall clock after converting it through the session
+    // time zone, and only 1970-01-01 00:00:01 .. 2038-01-19 03:14:07 UTC is
+    // representable (`GetColDefaultValue` reports 1067 outside that range).
+    if field_type.tp == TYPE_TIMESTAMP
+        && let Ok(time) = sealdb_types::parse_datetime_literal(text)
+            .or_else(|_| sealdb_types::parse_datetime_literal(&format!("{text} 00:00:00")))
+        && let Ok(utc) = sealdb_expression::session_local_to_utc(time)
+    {
+        let stamp = (
+            utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second,
+        );
+        if stamp <= (1970, 1, 1, 0, 0, 0) || stamp > (2038, 1, 19, 3, 14, 7) {
+            return Err(Error::new(
+                ERR_INVALID_DEFAULT,
+                format!("Invalid default value for '{name}'"),
+            ));
+        }
+    }
     Ok(())
 }
 

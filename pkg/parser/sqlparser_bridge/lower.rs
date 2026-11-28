@@ -19,12 +19,13 @@ use crate::ast::expressions::{
     WindowSpec,
 };
 use crate::ast::misc::{
-    AddQueryWatchStmt, AlterInstanceStmt, AlterResourceGroupStmt, AlterUserStmt, AnalyzeTableStmt,
+    AddQueryWatchStmt, AddStatsExtendedStmt, AdminReloadStatsExtendedStmt, AlterInstanceStmt, AlterResourceGroupStmt, AlterUserStmt, AnalyzeTableStmt,
     BRIEStmt, BeginStmt, BinlogStmt, CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt,
     CommitStmt, CompactTableStmt, CreateBindingStmt, CreatePlacementPolicyStmt,
     CreateResourceGroupStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt,
     DoStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt, DropResourceGroupStmt,
-    DropRoleStmt, DropStatsStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt,
+    DropRoleStmt, DropStatsExtendedStmt, DropStatsStmt, DropUserStmt, ExecuteStmt,
+    FlashBackDatabaseStmt,
     FlashBackTableStmt, FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel,
     GrantLevelType, GrantRoleStmt, GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt,
     LoadStatsStmt, LockStatsStmt, LockTablesStmt, OptimizeTableStmt, PasswordExpireOption,
@@ -147,6 +148,8 @@ pub enum AdminOp {
     },
     /// `ADMIN CHECKSUM TABLE <table>[, …]`.
     ChecksumTable { tables: Vec<TableName> },
+    /// `ADMIN RELOAD STATS_EXTENDED`: gated by `tidb_enable_extended_stats`.
+    ReloadStatsExtended,
     /// Any other `ADMIN` command (SUPER-gated no-op until implemented).
     Other,
 }
@@ -3644,6 +3647,18 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
                 let mut j = after_admin + "RELOAD".len();
                 let mut kind = AdminReloadKind::Other;
                 let after_reload = skip_ws(bytes, j);
+                if keyword_at(bytes, after_reload, "STATS_EXTENDED") {
+                    let mut j = after_reload + "STATS_EXTENDED".len();
+                    while j < bytes.len() && bytes[j] != b';' {
+                        j += 1;
+                    }
+                    PENDING_ADMIN_OP.with(|cell| {
+                        *cell.borrow_mut() = Some(AdminOp::ReloadStatsExtended);
+                    });
+                    out.push_str("DO 0");
+                    i = j;
+                    continue;
+                }
                 for (keyword, target) in [
                     ("OPT_RULE_BLACKLIST", AdminReloadKind::OptRuleBlacklist),
                     (
@@ -8512,6 +8527,33 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                 i = end;
                 continue;
             }
+            if keyword_at(bytes, after, "RELOAD") {
+                let after_reload = skip_ws(bytes, after + "RELOAD".len());
+                if keyword_at(bytes, after_reload, "STATS_EXTENDED") {
+                    out.push_str("SET NAMES '__sealdb_misc__'");
+                    ops.push(Some(Statement::AdminReloadStatsExtended(
+                        AdminReloadStatsExtendedStmt,
+                    )));
+                    i = skip_ws(bytes, after_reload + "STATS_EXTENDED".len());
+                    continue;
+                }
+            }
+        }
+        // `ALTER TABLE t ADD|DROP STATS_EXTENDED …` — sqlparser has no extended
+        // statistics clause, so the statement is captured here and lowered to a
+        // dedicated node.
+        if keyword_at(bytes, i, "ALTER") {
+            let after_alter = skip_ws(bytes, i + "ALTER".len());
+            if keyword_at(bytes, after_alter, "TABLE") {
+                if let Some((stmt, end)) =
+                    try_parse_alter_stats_extended(bytes, after_alter + "TABLE".len())?
+                {
+                    out.push_str("SET NAMES '__sealdb_misc__'");
+                    ops.push(Some(stmt));
+                    i = end;
+                    continue;
+                }
+            }
         }
         if keyword_at(bytes, i, "SET") {
             let after = skip_ws(bytes, i + "SET".len());
@@ -9204,6 +9246,127 @@ fn parse_admin_cleanup_table_lock(bytes: &[u8], mut i: usize) -> Result<(Stateme
         Statement::CleanupTableLock(CleanupTableLockStmt { tables }),
         end,
     ))
+}
+
+/// `ALTER TABLE t ADD STATS_EXTENDED n correlation(a, b)` /
+/// `ALTER TABLE t DROP STATS_EXTENDED n`. Returns `None` when the statement is
+/// an ordinary `ALTER TABLE` so the regular lowering still handles it.
+fn try_parse_alter_stats_extended(
+    bytes: &[u8],
+    mut i: usize,
+) -> Result<Option<(Statement, usize)>> {
+    i = skip_ws(bytes, i);
+    if keyword_at(bytes, i, "IF") {
+        let after_if = skip_ws(bytes, i + "IF".len());
+        if keyword_at(bytes, after_if, "EXISTS") {
+            i = skip_ws(bytes, after_if + "EXISTS".len());
+        }
+    }
+    let (table, after_table) = parse_table_name(bytes, i)?;
+    // Scan the clause list at paren depth 0 for `STATS_EXTENDED`; remember the
+    // keyword in front of it to tell ADD from DROP.
+    let mut j = after_table;
+    let mut prev_word = String::new();
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b == b';' {
+            return Ok(None);
+        }
+        if b == b'\'' || b == b'"' || b == b'`' {
+            let quote = b;
+            j += 1;
+            while j < bytes.len() && bytes[j] != quote {
+                j += 1;
+            }
+            j += 1;
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let word = String::from_utf8_lossy(&bytes[start..j]).to_ascii_uppercase();
+            if word == "STATS_EXTENDED" {
+                if prev_word == "ADD" {
+                    let (name, after_name) = read_ident(bytes, skip_ws(bytes, j));
+                    let after_name = skip_ws(bytes, after_name);
+                    if !keyword_at(bytes, after_name, "correlation") {
+                        return Ok(None);
+                    }
+                    let mut k = skip_ws(bytes, after_name + "correlation".len());
+                    if bytes.get(k) != Some(&b'(') {
+                        return Ok(None);
+                    }
+                    k += 1;
+                    let mut columns = Vec::new();
+                    loop {
+                        k = skip_ws(bytes, k);
+                        let (column, after_column) = read_ident(bytes, k);
+                        if column.is_empty() {
+                            break;
+                        }
+                        columns.push(column);
+                        k = skip_ws(bytes, after_column);
+                        if bytes.get(k) == Some(&b',') {
+                            k += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    if bytes.get(k) != Some(&b')') {
+                        return Ok(None);
+                    }
+                    k += 1;
+                    let end = skip_to_stmt_end(bytes, k);
+                    return Ok(Some((
+                        Statement::AddStatsExtended(AddStatsExtendedStmt {
+                            table,
+                            name,
+                            columns,
+                        }),
+                        end,
+                    )));
+                }
+                if prev_word == "DROP" {
+                    let (name, after_name) = read_ident(bytes, skip_ws(bytes, j));
+                    let end = skip_to_stmt_end(bytes, after_name);
+                    return Ok(Some((
+                        Statement::DropStatsExtended(DropStatsExtendedStmt { table, name }),
+                        end,
+                    )));
+                }
+                return Ok(None);
+            }
+            prev_word = word;
+            continue;
+        }
+        j += 1;
+    }
+    Ok(None)
+}
+
+/// Position of the `;` (or EOF) ending the current statement, ignoring
+/// semicolons inside quotes or parens.
+fn skip_to_stmt_end(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
 }
 
 fn parse_rename_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {

@@ -1418,6 +1418,13 @@ impl Session {
                 .expect("session current_db lock")
                 .clone();
             let (schema, table) = truncate.table.qualified(&current_db);
+            // `mysql.stats_fm_sketch` is a virtual table over the statistics
+            // handle, so its TRUNCATE clears the recorded FM sketches.
+            if schema.eq_ignore_ascii_case("mysql") && table.eq_ignore_ascii_case("stats_fm_sketch")
+            {
+                self.domain.stats().clear_fm_sketches();
+                return Ok(empty_result());
+            }
             if !schema.is_empty() {
                 let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
                 let info = self
@@ -1707,6 +1714,9 @@ impl Session {
                                 info: String::new(),
                             });
                         }
+                        AdminOp::ReloadStatsExtended => {
+                            self.require_extended_stats_enabled()?;
+                        }
                         AdminOp::Other => {}
                     }
                     return Ok(empty_result());
@@ -1823,6 +1833,18 @@ impl Session {
                     .lock()
                     .expect("session last_warnings lock") = result.warnings.clone();
                 return Ok(result);
+            }
+            Statement::AddStatsExtended(stmt) => {
+                self.add_stats_extended(&stmt.table, &stmt.name, &stmt.columns)?;
+                return Ok(empty_result());
+            }
+            Statement::DropStatsExtended(stmt) => {
+                self.drop_stats_extended(&stmt.table, &stmt.name)?;
+                return Ok(empty_result());
+            }
+            Statement::AdminReloadStatsExtended(_) => {
+                self.require_extended_stats_enabled()?;
+                return Ok(empty_result());
             }
             // `TRACE PLAN TARGET='estimation'` re-plans the inner statement with
             // CE tracing on and returns the collected records (TiDB `TraceExec`).
@@ -4547,6 +4569,129 @@ impl Session {
         self.domain.stats().update(database, table, stats);
         self.domain.persist_stats()?;
         Ok(())
+    }
+
+    /// `tidb_enable_extended_stats` gate (TiDB `ErrExtendedStatsNotAvailable`).
+    fn extended_stats_enabled(&self) -> bool {
+        read_session_sysvar(self, "tidb_enable_extended_stats").is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "on" | "true"
+            )
+        })
+    }
+
+    fn require_extended_stats_enabled(&self) -> Result<()> {
+        if self.extended_stats_enabled() {
+            return Ok(());
+        }
+        Err(Error::new(
+            ERR_UNKNOWN_ERROR,
+            "Extended statistics feature is not generally available now, \
+             and tidb_enable_extended_stats is OFF",
+        ))
+    }
+
+    /// `ALTER TABLE t ADD STATS_EXTENDED name correlation(…)` (TiDB
+    /// `handle.InsertExtendedStats`): the feature gate, the partitioned-table
+    /// restriction, duplicate column names, and name / column-set uniqueness
+    /// all surface as 1105 errors.
+    fn add_stats_extended(
+        &self,
+        table: &sealdb_parser::ast::TableName,
+        name: &str,
+        columns: &[String],
+    ) -> Result<()> {
+        self.require_extended_stats_enabled()?;
+        let info = self.stats_extended_table(table)?;
+        if info.partition.is_some() {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                "Extended statistics on partitioned tables are not supported now",
+            ));
+        }
+        for (pos, column) in columns.iter().enumerate() {
+            if columns[..pos]
+                .iter()
+                .any(|earlier| earlier.eq_ignore_ascii_case(column))
+            {
+                return Err(Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    format!("Cannot create extended statistics on duplicate column names '{column}'"),
+                ));
+            }
+        }
+        let existing = self.domain.stats().extended_stats(info.id);
+        if existing
+            .iter()
+            .any(|stats| stats.name.eq_ignore_ascii_case(name))
+        {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!("extended statistics '{name}' for the specified table already exists"),
+            ));
+        }
+        // TiDB compares the column set, not the written order, so
+        // `correlation(b, a)` collides with `correlation(a, b)`.
+        let same_columns = |stats: &sealdb_statistics::ExtendedStats| {
+            stats.kind.eq_ignore_ascii_case("correlation")
+                && stats.columns.len() == columns.len()
+                && columns
+                    .iter()
+                    .all(|column| stats.columns.iter().any(|other| other.eq_ignore_ascii_case(column)))
+        };
+        if existing.iter().any(same_columns) {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!(
+                    "extended statistics '{name}' with same type on same columns already exists"
+                ),
+            ));
+        }
+        self.domain
+            .stats()
+            .add_extended_stats(info.id, sealdb_statistics::ExtendedStats {
+                name: name.to_string(),
+                kind: "correlation".to_string(),
+                columns: columns.to_vec(),
+            });
+        Ok(())
+    }
+
+    /// `ALTER TABLE t DROP STATS_EXTENDED name` (TiDB
+    /// `handle.DeleteExtendedStats`). Dropping a name that does not exist is a
+    /// no-op, as in TiDB's `DELETE … WHERE` statement.
+    fn drop_stats_extended(
+        &self,
+        table: &sealdb_parser::ast::TableName,
+        name: &str,
+    ) -> Result<()> {
+        self.require_extended_stats_enabled()?;
+        let info = self.stats_extended_table(table)?;
+        self.domain.stats().drop_extended_stats(info.id, name);
+        Ok(())
+    }
+
+    fn stats_extended_table(
+        &self,
+        table: &sealdb_parser::ast::TableName,
+    ) -> Result<sealdb_meta::TableInfo> {
+        let current_db = self
+            .current_db
+            .lock()
+            .expect("session current_db lock")
+            .clone();
+        let (db, name) = table.qualified(&current_db);
+        self.domain
+            .infoschema()
+            .table_by_name(&db, &name)
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    ERR_NO_SUCH_TABLE,
+                    format!("Table '{db}.{name}' doesn't exist"),
+                )
+            })
     }
 
     /// `LOCK STATS` / `UNLOCK STATS` (TiDB `lockstats.AddLockedTables` /
@@ -7714,7 +7859,13 @@ fn subst_select_user_vars(session: &Session, select: &mut sealdb_parser::ast::Se
         // substituting vars to Values for evaluation.
         if field.as_name.as_ref().is_none_or(|s| s.is_empty()) && expr_has_session_var(&field.expr)
         {
-            field.as_name = Some(session_var_field_name(&field.expr));
+            // TiDB names the column from `SelectField.Text()`, i.e. the source
+            // spelling (`@@tidb_config like '%x%'` keeps the lowercase `like`);
+            // fall back to the canonical rendering when the text was dropped.
+            field.as_name = Some(field.orig_text.as_deref().map_or_else(
+                || session_var_field_name(&field.expr),
+                |text| sealdb_parser::sqlparser_bridge::trim_field_comment(text.trim()),
+            ));
         }
         field.expr = subst_user_vars_in_expr(session, &field.expr);
     }
@@ -15069,6 +15220,7 @@ mod tests {
         ERR_DATA_OUT_OF_RANGE, ERR_DB_CREATE_EXISTS, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS,
     };
     use sealdb_types::Datum;
+
 
     #[test]
     fn test_timestamp_literal_header() {
